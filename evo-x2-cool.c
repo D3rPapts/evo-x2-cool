@@ -83,7 +83,9 @@ static unsigned load_settings(void)
             "; evo-x2-cool settings, re-read within 5 s after a change\r\n"
             "[Regler]\r\nZiel=80\r\nMinProzent=30\r\nMaxProzent=70\r\nSpitze=88\r\nSicherMHz=3600\r\nSprache=de\r\n\r\n"
             "; 1 = on, 0 = off. The emergency (fan 100 % when overheating) always stays on.\r\n"
-            "[Funktionen]\r\nLuefter=1\r\nTaktbremse=1\r\nEcLeise=1\r\nLernen=1\r\nVorhersage=1\r\n";
+            "[Funktionen]\r\nLuefter=1\r\nTaktbremse=1\r\nEcLeise=1\r\nLernen=1\r\nVorhersage=1\r\n\r\n"
+            "; window: Thema = system / hell / dunkel; UpdatePruefen = 1: ask GitHub once a day for a newer version (only shown, nothing installed)\r\n"
+            "[Anzeige]\r\nThema=system\r\nUpdatePruefen=1\r\n";
         SECURITY_ATTRIBUTES sa = { sizeof sa }; DWORD w;
         ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFW;;;IU)", SDDL_REVISION_1, &sa.lpSecurityDescriptor, 0);
         HANDLE f = CreateFileW(iniFile, GENERIC_WRITE, 0, &sa, CREATE_NEW, 0, 0);
@@ -302,8 +304,13 @@ static void csv_line(const char *line)
 
 // ---------- learned model ----------
 // A table over heat power (10-W steps) x fan duty (10-% steps); each cell keeps how much warmer or cooler it really got
-// than the prior (end temperature = 37 + P * (1.2 - 0.3 * duty / 100), P = 1.1 * core W + 0.6 * GPU W, measured on a 64 GB EVO-X2).
+// than the prior. Prior, fitted on the logs of two EVO-X2 (64 and 128 GB):
+//   end temperature = 34 + P * (0.58 - 0.30 * duty / 100) + 6 * M
+// P = power of the whole chip (ADL ASIC power, else the package counter), M = power of the hottest core: a hot spot inside
+// the chip that adds about 6 °C per watt whatever the fan does. (Up to 0.2.0 P was 1.1 * cores + 0.6 * GPU; under GPU
+// inference that saw ~20-30 W of the real ~85 W, because memory and fabric did not count, issue #3.)
 // Cells without enough experience borrow the nearest learned duty at the same power, then one overall offset.
+#define SKALA 2   // model scale in modell.txt; cells learned on another scale are dropped
 #define NP 40
 #define ND 11
 static struct { float r; int n; } cell[NP][ND];
@@ -327,20 +334,20 @@ static int wartezeit(int fehl) { return fehl <= 0 ? 600 : fehl == 1 ? 3600 : 864
 
 static int pk(float p) { int k = (int)lroundf(p / 10); return k < 0 ? 0 : k >= NP ? NP - 1 : k; }
 static int dk(float d) { int k = (int)lroundf(d / 10); return k < 0 ? 0 : k >= ND ? ND - 1 : k; }
-static float prior(float p, float d) { return 37 + p * (1.2f - 0.3f * d / 100); }
+static float prior(float p, float d, float m) { return 34 + p * (0.58f - 0.30f * d / 100) + 6 * m; }
 
-static float predict(float p, float d)
+static float predict(float p, float d, float m)
 {
     int a = pk(p), b = dk(d);
-    if (cell[a][b].n >= 20) return prior(p, d) + cell[a][b].r;
+    if (cell[a][b].n >= 20) return prior(p, d, m) + cell[a][b].r;
     int best = -1; float bd = 1e9f;
     for (int j = 0; j < ND; j++) if (cell[a][j].n >= 20 && fabsf(j * 10 - d) < bd) { bd = fabsf(j * 10 - d); best = j; }
-    return prior(p, d) + (best >= 0 ? cell[a][best].r : versatz);
+    return prior(p, d, m) + (best >= 0 ? cell[a][best].r : versatz);
 }
 
-static void learn(float p, float d, float y)
+static void learn(float p, float d, float m, float y)
 {
-    float res = y - prior(p, d);
+    float res = y - prior(p, d, m);
     versatz += (res - versatz) / 60;
     int a = pk(p), b = dk(d);
     if (cell[a][b].n == 0) cell[a][b].r = versatz;
@@ -359,13 +366,16 @@ static void load_model(void)
     swprintf(p, MAX_PATH, L"%s\\modell.txt", dataDir);
     FILE *f = _wfopen(p, L"r");
     if (!f) return;
+    int skala = 1;   // files without the line come from 0.1/0.2 (old heat estimate)
     while (fgets(line, sizeof line, f)) {
-        if (sscanf(line, "versatz %f", &r) == 1) versatz = r;
-        else if (sscanf(line, "feld %d %d %f %d", &a, &b, &r, &n) == 4 && a >= 0 && a < NP && b >= 0 && b < ND) { cell[a][b].r = r; cell[a][b].n = n; }
+        if (sscanf(line, "skala %d", &m) == 1) skala = m;
+        else if (sscanf(line, "versatz %f", &r) == 1) { if (skala == SKALA) versatz = r; }
+        else if (sscanf(line, "feld %d %d %f %d", &a, &b, &r, &n) == 4 && a >= 0 && a < NP && b >= 0 && b < ND) { if (skala == SKALA) { cell[a][b].r = r; cell[a][b].n = n; } }
         else if (sscanf(line, "deckel %15s %d", name, &m) == 2) { for (int i = 0; i < 3; i++) if (!strcmp(name, lageName[i])) lage[i].stufe = stufe_von(m); }
         else if (sscanf(line, "fehl %15s %d %d", name, &m, &n) == 3) { for (int i = 0; i < 3; i++) if (!strcmp(name, lageName[i])) lage[i].fehl[stufe_von(m)] = n; }
     }
     fclose(f);
+    if (skala != SKALA) event(L_("skala", "Neues Wärmemodell (ganze Chipleistung): Lüfter-Erfahrung wird neu gelernt, Taktgrenzen bleiben"));
 }
 
 static void save_model(void)
@@ -374,7 +384,7 @@ static void save_model(void)
     swprintf(p, MAX_PATH, L"%s\\modell.txt", dataDir); swprintf(tmp, MAX_PATH, L"%s\\modell.tmp", dataDir);
     FILE *f = _wfopen(tmp, L"w");
     if (!f) return;
-    fprintf(f, "versatz %.2f\n", versatz);
+    fprintf(f, "skala %d\nversatz %.2f\n", SKALA, versatz);
     for (int i = 0; i < 3; i++) fprintf(f, "deckel %s %d\n", lageName[i], stufen[lage[i].stufe]);
     for (int i = 0; i < 3; i++) for (int s = 0; s < NSTUFEN; s++) if (lage[i].fehl[s]) fprintf(f, "fehl %s %d %d\n", lageName[i], stufen[s], lage[i].fehl[s]);
     for (int a = 0; a < NP; a++) for (int b = 0; b < ND; b++) if (cell[a][b].n) fprintf(f, "feld %d %d %.2f %d\n", a, b, cell[a][b].r, cell[a][b].n);
@@ -501,7 +511,7 @@ static int run(void)
 
     // controller state
     float hist[10]; int nHist = 0;
-    float emaT = 0, slope = 0, pFast = 0, pSlow = 0, emaTe = 0, d = (float)(minP > 40 ? minP : 40), boost = 0;
+    float emaT = 0, slope = 0, pFast = 0, pSlow = 0, mFast = 0, mSlow = 0, emaTe = 0, d = (float)(minP > 40 ? minP : 40), boost = 0;
     int capNow = read_cap(), sicherBis = 0, grafikSeit = -1, nachlauf = 0, lageNow = -1, hot = 0, lowSince = -1, warNotfall = 0;
     int ec[8] = { -1, -1, -1, -1, -1, -1, -1, -1 };
     static const uint8_t regs[8] = { 0x70, 0x35, 0x36, 0x31, 0x37, 0x38, 0x28, 0x29 };
@@ -581,15 +591,18 @@ static int run(void)
         if (T < 0) T = emaT;
 
         // --- smoothing: Tctl with a 10-s median against boost spikes, then EMA; heat power fast (3 s) and slow (20 s) ---
-        float heat = (float)(1.1 * sumW + 0.6 * G);
+        // heat power: the whole chip as the GPU driver reports it (ADL ASIC power), else the package counter, else the old
+        // estimate from cores and GPU plus a SoC base; the hottest core counts separately in the prior (M)
+        float heat = aW > 0 ? (float)aW : pkgW > 0 ? (float)pkgW : (float)(1.1 * sumW + 0.6 * G + 15);
         if (nHist < 10) hist[nHist++] = T; else { memmove(hist, hist + 1, 9 * sizeof *hist); hist[9] = T; }
         float sorted[10]; memcpy(sorted, hist, nHist * sizeof *hist); qsort(sorted, nHist, sizeof *sorted, cmp_float);
         float med = sorted[nHist / 2];
-        if (k == 1) { emaT = T; pFast = pSlow = heat; emaTe = (float)Te; }   // start from real values, a gap would look like a rise
+        if (k == 1) { emaT = T; pFast = pSlow = heat; mFast = mSlow = (float)maxW; emaTe = (float)Te; }   // start from real values, a gap would look like a rise
         float prevT = emaT;
         emaT += (med - emaT) / 8;
         slope += ((emaT - prevT) - slope) / 10;
         pFast += (heat - pFast) / 3; pSlow += (heat - pSlow) / 20;
+        mFast += ((float)maxW - mFast) / 3; mSlow += ((float)maxW - mSlow) / 20;
         if (Te >= 0) emaTe += (Te - emaTe) / 10;   // the EC temperature jumps by 15 °C within seconds; the anchor follows slowly
 
         // --- settings file changed? (checked every 5 s, a cheap time stamp compare) ---
@@ -647,13 +660,13 @@ static int run(void)
 
         // --- learn: only when calm (power steady, temperature hardly moving) and not during boost hot spots (>= 90 °C:
         //     those come from one core inside the chip, more fan does not change them). End temperature = T + tau * slope ---
-        if (!nurLesen && (fn & F_LERNEN) && k > 30 && T < 90 && emaT < 90 && fabsf(pFast - pSlow) < 4 && fabsf(slope) < 0.08f && curveD >= 0)
-            learn(pSlow, (float)curveD, emaT + tau * slope);
+        if (!nurLesen && (fn & F_LERNEN) && k > 30 && T < 90 && emaT < 90 && fabsf(pFast - pSlow) < 5 && fabsf(slope) < 0.08f && curveD >= 0)
+            learn(pSlow, (float)curveD, mSlow, emaT + tau * slope);
 
         // --- predict: rising power counts ahead (fast EMA plus its lead over the slow one); switched off: current power only ---
         float pv = fmaxf(pFast, pSlow) + (fn & F_VORHERSAGE ? fmaxf(0, pFast - pSlow) : 0);
         int need = maxP;
-        for (int x = minP; x <= maxP; x += 5) if (predict(pv, (float)x) <= ziel - 1) { need = x; break; }
+        for (int x = minP; x <= maxP; x += 5) if (predict(pv, (float)x, mFast) <= ziel - 1) { need = x; break; }
         // feedback: warmer than the target anyway -> add more; let it go again slowly (not in the first seconds: median not full)
         if (k >= 15) { if (emaT > ziel + 1) boost = fminf(40, boost + 1); else if (emaT < ziel - 3) boost = fmaxf(0, boost - 1); }
         float wantD = fminf((float)maxP, need + boost);
@@ -677,7 +690,7 @@ static int run(void)
 
         // --- record ---
         int r1 = ec[1] < 0 || ec[2] < 0 ? -1 : ec[1] << 8 | ec[2], r2 = ec[4] < 0 || ec[5] < 0 ? -1 : ec[4] << 8 | ec[5], r3 = ec[6] < 0 || ec[7] < 0 ? -1 : ec[6] << 8 | ec[7];
-        float vorh = predict(pv, (float)(curveD >= 0 ? curveD : di));
+        float vorh = predict(pv, (float)(curveD >= 0 ? curveD : di), mFast);
         static const char *grundName[] = { "modell", "vorhersage", "nachregeln", "NOTFALL", "nur-lesen" };
         if (sh) {
             EvoSample *s = &sh->s[sh->nSample % EVO_N];

@@ -5,6 +5,8 @@
 #include <stdint.h>
 #include <wchar.h>
 
+#define EVO_VERSION   "0.3.0"   // also AppVer in installer\evo-x2-cool.iss and the git tag v0.3.0
+#define EVO_VERSION_W L"0.3.0"
 #define EVO_SHM    L"Global\\evo-x2-cool"
 #define EVO_STOPP  L"Global\\evo-x2-cool-stopp"   // set it and the controller restores everything and ends (service too)
 #define EVO_MAGIC  0x45564F32u   // "EVO2"
@@ -39,7 +41,7 @@ static void evo_conv_sig(const wchar_t *s, char *out, int n)
 typedef struct {
     int64_t t;                          // unix time, seconds
     float tctl, tglatt, vorhersage;     // °C; vorhersage = predicted end temperature at the current fan duty
-    float pkgW, coreW, maxCoreW, gpuW, apuW, heatW, pVorher;   // W; heatW = 1.1 * cores + 0.6 * GPU, pVorher = predicted heatW
+    float pkgW, coreW, maxCoreW, gpuW, apuW, heatW, pVorher;   // W; heatW = whole chip (ADL ASIC power or package), pVorher = predicted heatW
     float mhz, load;                    // highest effective clock, CPU load %
     int16_t ecT, busy, gpuLoad, gpuT, fan, cap, rpm[3];   // fan = duty % the controller asked for
     uint8_t lage, modus, grund, leise;  // modus = EC power mode register 0x31

@@ -13,6 +13,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <shellapi.h>
+#include <winhttp.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
@@ -22,19 +23,24 @@
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "winhttp.lib")
 #define WM_TRAY   (WM_APP + 1)   // mouse on the tray icon
 #define WM_ZEIGEN (WM_APP + 2)   // sent by a second start: show the window
+#define WM_UPDATE (WM_APP + 3)   // the update check found a newer version
+#define RELEASES L"https://github.com/D3rPapts/evo-x2-cool/releases"
 
 static const EvoShared *sh;
 static HANDLE map;
 static int spanIdx = 1, mouseX = -1, mouseY = -1, dpi = 96;
 static const int spans[4] = { 300, 900, 3600, 7200 };
 static const wchar_t *spanText[4] = { L"5 min", L"15 min", L"1 h", L"2 h" };
-static RECT btn[4], btnThema, btnSprache;
+static RECT btn[4], btnThema, btnSprache, btnUpdate;
+static wchar_t updVer[16];   // newer version on GitHub, empty = none (or check switched off)
+static void open_releases(void);
 static HFONT fValue, fText, fSmall, fBold;
 static wchar_t langs[8][16], langCode[16]; static int nLangs;   // available sprache-<code>.ini next to the exe
 static int thema, dark;   // thema: 0 system, 1 light, 2 dark
-static COLORREF C_CARD, C_TEXT;
+static COLORREF C_CARD, C_TEXT, C_OK;
 static int S(int v);
 static void fill(HDC dc, RECT r, COLORREF c, int round);
 static int text(HDC dc, HFONT f, int x, int y, COLORREF c, int align, const wchar_t *fmt, ...);
@@ -90,11 +96,19 @@ static int top_buttons(HDC dc, int right, int y)
         text(dc, fText, (rb[i]->left + rb[i]->right) / 2, y + S(3), C_TEXT, 2, L"%s", lb[i]);
         right = rb[i]->left - S(6);
     }
+    if (updVer[0]) {   // newer version on GitHub: one more button, opens the release page
+        wchar_t ul[48]; swprintf(ul, 48, T(L"upd_knopf", L"⬆ Version %s"), updVer);
+        SelectObject(dc, fText); SIZE sz; GetTextExtentPoint32W(dc, ul, (int)wcslen(ul), &sz);
+        btnUpdate = (RECT){ right - sz.cx - S(20), y, right, y + S(22) };
+        fill(dc, btnUpdate, C_OK, S(8));
+        text(dc, fText, (btnUpdate.left + btnUpdate.right) / 2, y + S(3), RGB(255, 255, 255), 2, L"%s", ul);
+        right = btnUpdate.left - S(6);
+    } else SetRectEmpty(&btnUpdate);
     return right;
 }
 
 // ---------- colours: dark or light, chosen in einstellungen.ini [Anzeige] Thema=system|hell|dunkel ----------
-static COLORREF C_BG, C_GRID, C_DIM, C_HOT, C_WARM, C_OK, C_GRAFIK, C_VIELE, C_TIP, C_OFF, C_RAW, C_PKG, C_RPM, C_FAN, C_MHZ, C_CAP;
+static COLORREF C_BG, C_GRID, C_DIM, C_HOT, C_WARM, C_GRAFIK, C_VIELE, C_TIP, C_OFF, C_RAW, C_PKG, C_RPM, C_FAN, C_MHZ, C_CAP;
 static const wchar_t *themaKey[3] = { L"system", L"hell", L"dunkel" };
 
 static void apply_theme(HWND w)
@@ -468,7 +482,7 @@ static void tray_update(void)   // once per second; talks to explorer only when 
     else {
         if (c->gpuT > 0) swprintf(l1, 48, T(L"t_tip1", L"CPU %.0f °C · Grafik %d °C"), c->tctl, c->gpuT);
         else swprintf(l1, 48, T(L"t_tip1b", L"CPU %.0f °C"), c->tctl);
-        if (c->cap) swprintf(cap, 48, T(L"t_cap", L"Taktbremse %d MHz"), c->cap); else wcscpy(cap, T(L"t_capaus", L"Taktbremse aus"));
+        if (c->cap) swprintf(cap, 48, T(L"tr_cap", L"Taktbremse %d MHz"), c->cap); else wcscpy(cap, T(L"t_capaus", L"Taktbremse aus"));
         n += swprintf(tip + n, 128 - n, L"%s\n", l1);
         swprintf(tip + n, 128 - n, T(L"t_tip2", L"Lüfter %d %% · %s"), c->fan, cap);
         if (c->grund == GRUND_NOTFALL || c->tctl >= sh->spitze) ico = icoHeiss;
@@ -500,6 +514,9 @@ static void tray_menu(HWND w)
 {
     int visible = IsWindowVisible(w) && !IsIconic(w);
     HMENU m = CreatePopupMenu();
+    AppendMenuW(m, MF_STRING | MF_GRAYED, 0, L"EVO-X2-COOL " EVO_VERSION_W);
+    if (updVer[0]) { wchar_t ul[64]; swprintf(ul, 64, T(L"upd_menu", L"⬆ Version %s herunterladen …"), updVer); AppendMenuW(m, MF_STRING, 103, ul); }
+    AppendMenuW(m, MF_SEPARATOR, 0, 0);
     AppendMenuW(m, MF_STRING, 100, visible ? T(L"m_verstecken", L"Fenster verstecken") : T(L"m_oeffnen", L"Fenster öffnen"));
     AppendMenuW(m, MF_SEPARATOR, 0, 0);
     unsigned on = cur_funk(), off = !sh || sh->nurLesen ? MF_GRAYED : 0;
@@ -515,15 +532,56 @@ static void tray_menu(HWND w)
     if (id == 100) show_window(w, !visible);
     else if (id == 101) DestroyWindow(w);
     else if (id == 102) stop_all(w);
+    else if (id == 103) open_releases();
     else if (id >= 200) toggle_funk(w, id - 200);
 }
 
 static void set_title(HWND w)
 {
-    wchar_t cur[100]; const wchar_t *t = T(L"titel", L"EVO-X2-COOL");
+    wchar_t cur[100], t[100]; swprintf(t, 100, L"%s %s", T(L"titel", L"EVO-X2-COOL"), EVO_VERSION_W);
     GetWindowTextW(w, cur, 100);
     if (wcscmp(cur, t)) SetWindowTextW(w, t);
 }
+
+// ---------- update check: once a day the window asks GitHub for the newest release (prereleases too) and only SHOWS
+// a newer version (button, tray menu, one balloon per version). Nothing is downloaded or installed: the setup is
+// unsigned and brings a driver, so a person decides. [Anzeige] UpdatePruefen=0 switches it off. The controller service
+// itself never goes online. ----------
+static int ver_num(const char *s) { int a = 0, b = 0, c = 0; sscanf(s, "%d.%d.%d", &a, &b, &c); return a * 10000 + b * 100 + c; }
+
+static int fetch_latest(char tag[16])
+{
+    int ok = 0;
+    HINTERNET s = WinHttpOpen(L"evo-x2-cool/" EVO_VERSION_W, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0), c = 0, r = 0;
+    if (s) { WinHttpSetTimeouts(s, 10000, 10000, 10000, 10000); c = WinHttpConnect(s, L"api.github.com", INTERNET_DEFAULT_HTTPS_PORT, 0); }
+    if (c) r = WinHttpOpenRequest(c, L"GET", L"/repos/D3rPapts/evo-x2-cool/releases?per_page=1", 0, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    if (r && WinHttpSendRequest(r, L"Accept: application/vnd.github+json\r\n", (DWORD)-1, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) && WinHttpReceiveResponse(r, 0)) {
+        static char buf[8192]; DWORD got = 0, total = 0;   // tag_name comes early in the answer
+        while (total < sizeof buf - 1 && WinHttpReadData(r, buf + total, sizeof buf - 1 - total, &got) && got) total += got;
+        buf[total] = 0;
+        char *p = strstr(buf, "\"tag_name\"");
+        if (p && (p = strchr(p + 10, '"')) && sscanf(p + 1, "v%15[0-9.]", tag) == 1) ok = 1;
+    }
+    if (r) WinHttpCloseHandle(r);
+    if (c) WinHttpCloseHandle(c);
+    if (s) WinHttpCloseHandle(s);
+    return ok;
+}
+
+static char updTag[16];
+static DWORD WINAPI update_thread(void *w)
+{
+    Sleep(60000);   // not during logon
+    for (;;) {
+        char tag[16];
+        if (GetPrivateProfileIntW(L"Anzeige", L"UpdatePruefen", 1, iniFile) && fetch_latest(tag) && ver_num(tag) > ver_num(EVO_VERSION)) {
+            memcpy(updTag, tag, sizeof tag); PostMessageW(w, WM_UPDATE, 0, 0);
+        }
+        Sleep(24 * 3600 * 1000);
+    }
+}
+
+static void open_releases(void) { ShellExecuteW(0, L"open", RELEASES, 0, 0, SW_SHOWNORMAL); }
 
 static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp)
 {
@@ -554,6 +612,7 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp)
     case WM_LBUTTONDOWN: {
         POINT p = { (short)LOWORD(lp), (short)HIWORD(lp) };
         for (int i = 0; i < 4; i++) if (PtInRect(&btn[i], p)) { spanIdx = i; InvalidateRect(w, 0, FALSE); }
+        if (PtInRect(&btnUpdate, p)) open_releases();
         if (PtInRect(&btnThema, p) || PtInRect(&btnSprache, p)) {
             int ok;
             if (PtInRect(&btnThema, p)) { thema = (thema + 1) % 3; ok = WritePrivateProfileStringW(L"Anzeige", L"Thema", themaKey[thema], iniFile); apply_theme(w); }
@@ -588,6 +647,19 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         else if (lp == WM_RBUTTONUP) tray_menu(w);
         return 0;
     case WM_ZEIGEN: show_window(w, 1); return 0;
+    case WM_UPDATE: {   // newer version: button and menu entry; a balloon only once per version
+        wchar_t was[16];
+        MultiByteToWideChar(CP_UTF8, 0, updTag, -1, updVer, 16);
+        GetPrivateProfileStringW(L"Anzeige", L"UpdateGemeldet", L"", was, 16, iniFile);
+        if (wcscmp(was, updVer)) {
+            NOTIFYICONDATAW n = tray; n.uFlags = NIF_INFO; n.dwInfoFlags = NIIF_INFO;
+            wcscpy(n.szInfoTitle, L"EVO-X2-COOL");
+            swprintf(n.szInfo, 256, T(L"upd_info", L"Version %s ist verfügbar. Rechtsklick auf das Symbol → herunterladen."), updVer);
+            Shell_NotifyIconW(NIM_MODIFY, &n);
+            WritePrivateProfileStringW(L"Anzeige", L"UpdateGemeldet", updVer, iniFile);
+        }
+        InvalidateRect(w, 0, FALSE); return 0;
+    }
     case WM_CLOSE: show_window(w, 0); return 0;   // only hide; "Beenden" in the tray menu really ends
     case WM_DESTROY: Shell_NotifyIconW(NIM_DELETE, &tray); PostQuitMessage(0); return 0;
     }
@@ -608,6 +680,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     RegisterClassW(&wc);
     HWND w = CreateWindowW(L"evo-x2-cool-front", T(L"titel", L"EVO-X2-COOL"), WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, S(1280), S(860), 0, 0, inst, 0);
     dpi = (int)GetDpiForWindow(w);
+    set_title(w);
     SendMessageW(w, WM_APP, 0, 0);
     apply_theme(w);
     int cx = GetSystemMetrics(SM_CXSMICON), cy = GetSystemMetrics(SM_CYSMICON);
@@ -619,6 +692,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     tray_add(w);
     if (!(cmd && wcsstr(cmd, L"--leiste"))) ShowWindow(w, show);
     tray_update();
+    CloseHandle(CreateThread(0, 0, update_thread, w, 0, 0));
     SetTimer(w, 1, 1000, 0);
     MSG msg;
     while (GetMessageW(&msg, 0, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessageW(&msg); }

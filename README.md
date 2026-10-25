@@ -30,7 +30,7 @@ EVO-X2-COOL watches the chip every second, predicts where the temperature is hea
 
 - **controls the fans** through the fan curve inside the EC: as quiet as possible while the predicted end temperature stays below the target (default 80 °C);
 - **brakes the clock** depending on the load type (few cores / many cores / GPU busy). After a hot spot it drops to a safe clock for 30 s and remembers a lower limit for that load type. It tries the next higher step again only after a calm run with a core really at the limit: 10 minutes, then 1 hour, then 1 day after every further hot spot on that step;
-- **learns** how warm the machine really gets at a given heat power and fan duty, and corrects its own model;
+- **learns** how warm the machine really gets at a given chip power and fan duty, and corrects its own model. The starting model (end temperature = 34 + P × (0.58 − 0.30 × fan) + 6 × hottest core W, P = whole chip power) was fitted on the logs of two EVO-X2;
 - **switches the EC to the quiet power mode** (54 W) while many cores are busy and the GPU is idle;
 - has an **emergency mode** (fan to full) that cannot be switched off.
 
@@ -50,8 +50,8 @@ So the single-core performance drops by about 7 %, the fans stay quiet, and the 
 
 | File | What it does | Size |
 |---|---|---|
-| `evo-x2-cool.exe` | Controller. Runs in a console or as the Windows service `evo-x2-cool`. | ~57 KB, ~2 MB RAM, < 1 % of one core |
-| `evo-x2-cool-front.exe` | Window with tiles, curves, events and on/off switches, plus a tray icon (tooltip with current values, red when hot). Reads the controller's shared memory, no network. | ~65 KB, ~2 MB RAM |
+| `evo-x2-cool.exe` | Controller. Runs in a console or as the Windows service `evo-x2-cool`. | ~58 KB, ~2 MB RAM, < 1 % of one core, never goes online |
+| `evo-x2-cool-front.exe` | Window with tiles, curves, events and on/off switches, plus a tray icon (tooltip with current values, red when hot). Reads the controller's shared memory. Once a day it asks GitHub whether a newer version exists (see below). | ~70 KB, ~2 MB RAM |
 
 ## Requirements
 
@@ -100,9 +100,14 @@ Vorhersage=1
 
 [Anzeige]
 Thema=system     ; system / hell / dunkel
+UpdatePruefen=1  ; 0 = never ask GitHub for a newer version
 ```
 
 Data in the same folder: `modell.txt` (learned model), `regler-<date>.csv` (one line per second), `ereignisse.txt` (decisions).
+
+## Update check
+
+Once a day, starting a minute after logon, the window asks the GitHub API for the newest release of this repository. If it is newer, a button and a tray menu entry appear, plus one notification per version. Nothing is downloaded or installed automatically: the setup is unsigned and brings a driver, so you decide. This request only tells GitHub your IP address and the program version. The controller service never goes online. Switch it off with `UpdatePruefen=0`.
 
 ## Build
 
