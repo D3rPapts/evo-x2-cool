@@ -1,0 +1,12 @@
+﻿EVO-X2-COOL - learning fan and clock controller for the GMKtec EVO-X2
+
+Please read before installing:
+
+- Unofficial community tool. Not made, endorsed or supported by GMKtec, Sixunited or AMD.
+- The program writes to the embedded controller (fan curve, power mode) and limits the CPU clock through the Windows power plan. Use it at your own risk.
+- It only controls with EC firmware 1.10. With any other version it only measures and changes nothing.
+- It needs the PawnIO driver (by namazso). If it is missing, this setup installs it.
+- On exit and uninstall the BIOS fan curve comes back. The emergency mode (fan to full when overheating) cannot be switched off.
+- Written with AI assistance (Claude Code), tested on real hardware.
+
+License: GPL-3.0-or-later. Source code: https://github.com/D3rPapts/evo-x2-cool

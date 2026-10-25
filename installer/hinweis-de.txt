@@ -1,0 +1,12 @@
+﻿EVO-X2-COOL - lernende Lüfter- und Taktsteuerung für die GMKtec EVO-X2
+
+Bitte vor der Installation lesen:
+
+- Inoffizielles Community-Werkzeug. Nicht von GMKtec, Sixunited oder AMD und von ihnen nicht unterstützt.
+- Das Programm schreibt in den Embedded Controller (Lüfterkurve, Leistungsmodus) und begrenzt den CPU-Takt über die Windows-Energieoptionen. Benutzung auf eigene Gefahr.
+- Es steuert nur bei EC-Firmware 1.10. Bei jeder anderen Version misst es nur und ändert nichts.
+- Es braucht den Treiber PawnIO (von namazso). Fehlt er, installiert dieses Setup ihn mit.
+- Beim Beenden und Deinstallieren kommt die BIOS-Lüfterkurve zurück. Den Notfall (Lüfter auf voll bei Überhitzung) kann man nicht abschalten.
+- Mit KI-Unterstützung (Claude Code) geschrieben und auf echter Hardware getestet.
+
+Lizenz: GPL-3.0-or-later. Quellcode: https://github.com/D3rPapts/evo-x2-cool

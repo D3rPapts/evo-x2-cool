@@ -1,0 +1,13 @@
+﻿Third-party components shipped with the EVO-X2-COOL installer
+
+PawnIO driver setup (PawnIO_setup.exe 2.2.0, only run when PawnIO is not installed yet)
+  Copyright namazso, GPL-2.0
+  Source: https://github.com/namazso/PawnIO  and  https://github.com/namazso/PawnIO.Setup
+  Unchanged official release: https://github.com/namazso/PawnIO.Setup/releases/tag/2.2.0
+
+PawnIO modules AMDFamily17.bin and LpcACPIEC.bin (folder pawnio\)
+  Copyright namazso and contributors, LGPL-2.1 (see pawnio\COPYING-LGPL-2.1.txt)
+  Source: https://github.com/namazso/PawnIO.Modules
+  Unchanged official release: https://github.com/namazso/PawnIO.Modules/releases/tag/0.2.11
+
+EVO-X2-COOL itself: GPL-3.0-or-later (LICENSE.txt), https://github.com/D3rPapts/evo-x2-cool

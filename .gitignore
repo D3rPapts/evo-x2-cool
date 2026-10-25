@@ -1,0 +1,6 @@
+*.obj
+*.exe
+snapshot-*/
+*.res
+installer/drittanbieter/
+installer/Output/
