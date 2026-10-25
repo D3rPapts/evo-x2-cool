@@ -321,7 +321,7 @@ static void paint(HWND w, HDC dc)
 
     // ---- charts ----
     float pmax = 40;
-    for (uint32_t i = 0; i < count; i++) if (sample(i)->pkgW > pmax) pmax = sample(i)->pkgW;
+    for (uint32_t i = 0; i < count; i++) if (sample(i)->pkgW > pmax && sample(i)->pkgW < 400) pmax = sample(i)->pkgW;   // < 400: old 65000-W misreads (issue #2)
     pmax = (float)((int)(pmax / 40) + 1) * 40;
     // temperature axis grows when a value goes beyond it (one pass over the samples, nothing measurable)
     float tmin = 30, tmax = 100;

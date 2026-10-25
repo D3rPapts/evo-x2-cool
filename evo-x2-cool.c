@@ -320,7 +320,10 @@ static const char *funk_text(int i)
     }
 }
 static const char *lage_text(int i) { return i == LAGE_WENIGE ? L_("lage0", "wenige Kerne aktiv") : i == LAGE_VIELE ? L_("lage1", "viele Kerne aktiv") : L_("lage2", "Grafik arbeitet (oder kühlt danach ab)"); }
-static struct { int stufe, ruhig, spitze; } lage[3];
+// per situation: current cap step, calm seconds earned at that cap, highest temperature since, and how many hot spots
+// each step has caused. A step that caused hot spots is tried again only after a longer calm run: 10 min, 1 h, 1 day.
+static struct { int stufe, ruhig, spitze, fehl[NSTUFEN]; } lage[3];
+static int wartezeit(int fehl) { return fehl <= 0 ? 600 : fehl == 1 ? 3600 : 86400; }
 
 static int pk(float p) { int k = (int)lroundf(p / 10); return k < 0 ? 0 : k >= NP ? NP - 1 : k; }
 static int dk(float d) { int k = (int)lroundf(d / 10); return k < 0 ? 0 : k >= ND ? ND - 1 : k; }
@@ -359,7 +362,8 @@ static void load_model(void)
     while (fgets(line, sizeof line, f)) {
         if (sscanf(line, "versatz %f", &r) == 1) versatz = r;
         else if (sscanf(line, "feld %d %d %f %d", &a, &b, &r, &n) == 4 && a >= 0 && a < NP && b >= 0 && b < ND) { cell[a][b].r = r; cell[a][b].n = n; }
-        else if (sscanf(line, "deckel %15s %d", name, &m) == 2) for (int i = 0; i < 3; i++) if (!strcmp(name, lageName[i])) lage[i].stufe = stufe_von(m);
+        else if (sscanf(line, "deckel %15s %d", name, &m) == 2) { for (int i = 0; i < 3; i++) if (!strcmp(name, lageName[i])) lage[i].stufe = stufe_von(m); }
+        else if (sscanf(line, "fehl %15s %d %d", name, &m, &n) == 3) { for (int i = 0; i < 3; i++) if (!strcmp(name, lageName[i])) lage[i].fehl[stufe_von(m)] = n; }
     }
     fclose(f);
 }
@@ -372,6 +376,7 @@ static void save_model(void)
     if (!f) return;
     fprintf(f, "versatz %.2f\n", versatz);
     for (int i = 0; i < 3; i++) fprintf(f, "deckel %s %d\n", lageName[i], stufen[lage[i].stufe]);
+    for (int i = 0; i < 3; i++) for (int s = 0; s < NSTUFEN; s++) if (lage[i].fehl[s]) fprintf(f, "fehl %s %d %d\n", lageName[i], stufen[s], lage[i].fehl[s]);
     for (int a = 0; a < NP; a++) for (int b = 0; b < ND; b++) if (cell[a][b].n) fprintf(f, "feld %d %d %.2f %d\n", a, b, cell[a][b].r, cell[a][b].n);
     fclose(f);
     MoveFileExW(tmp, p, MOVEFILE_REPLACE_EXISTING);
@@ -491,7 +496,8 @@ static int run(void)
     LARGE_INTEGER tSeen[MAXCPU] = { 0 }; unsigned seen[MAXCPU] = { 0 };
     static ProcPerf pp[MAXCPU], pp0[MAXCPU];
     static AdlPmLog gl;
-    LARGE_INTEGER f, t0, t1; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0);
+    LARGE_INTEGER f, tPkg = { 0 }; QueryPerformanceFrequency(&f);
+    double pkgW = 0;
 
     // controller state
     float hist[10]; int nHist = 0;
@@ -522,8 +528,6 @@ static int run(void)
         // thread of each core is visited (the clock shown is that thread's), and idle cores are skipped; their counters are
         // simply read over a longer span later (each core at least every 10 s), which keeps the averages exact.
         double maxMhz = 0;
-        QueryPerformanceCounter(&t1);
-        double dt = (double)(t1.QuadPart - t0.QuadPart) / f.QuadPart; t0 = t1;
         for (int c = 0; c < nThreads; c++) {
             if (!firstOfCore[c] || (k && coreBusy[coreOf[c]] <= 0.03 && k - seen[c] < 10)) continue;
             SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)1 << c);
@@ -534,9 +538,17 @@ static int run(void)
             if (msr(0xC001029A, &e)) { if (k) coreW[coreOf[c]] = (uint32_t)((uint32_t)e - eCore[c]) * joule / span; eCore[c] = (uint32_t)e; }
             tSeen[c] = now; seen[c] = k;
         }
+        // package energy always on CPU 0 and timed right at the read (issue #2). Read on whatever CPU the thread was on and
+        // timed before the core loop, it jumped between 40 and 130 W at a steady 85 W, and a counter standing a little
+        // behind the previous read wrapped to ~65000 W. A step backwards or an implausible value keeps the last reading.
+        SetThreadAffinityMask(GetCurrentThread(), 1);
+        uint64_t e = 0; LARGE_INTEGER tp; QueryPerformanceCounter(&tp);
+        if (msr(0xC001029B, &e)) {
+            uint32_t de = (uint32_t)e - ePkg; double sp = (double)(tp.QuadPart - tPkg.QuadPart) / f.QuadPart;
+            if (k && de < 0x80000000u && sp > 0.2 && de * joule / sp < 400) pkgW = de * joule / sp;
+            ePkg = (uint32_t)e; tPkg = tp;
+        }
         SetThreadAffinityMask(GetCurrentThread(), ((DWORD_PTR)1 << nThreads) - 1);
-        uint64_t e = 0; double pkgW = 0;
-        if (msr(0xC001029B, &e)) { if (k) pkgW = (uint32_t)((uint32_t)e - ePkg) * joule / dt; ePkg = (uint32_t)e; }
         double sumW = 0, maxW = 0;
         for (int i = 0; i < nCores; i++) { sumW += coreW[i]; if (coreW[i] > maxW) maxW = coreW[i]; }
 
@@ -602,19 +614,27 @@ static int run(void)
         else if (T > lage[lg].spitze) lage[lg].spitze = (int)T;
         if (!nurLesen && (fn & F_TAKT)) {
             if (T >= spitze) {
-                // hot spot: lowest step at once; this situation loses one step for good (learned from danger)
+                // hot spot: lowest step at once; this situation loses one step (learned from danger), and the step that
+                // caused it is tried again only after a longer calm run each time
                 if (k > sicherBis && lage[lg].stufe > 0 && capNow > stufen[0]) {
+                    int s = lage[lg].stufe;
+                    if (lage[lg].fehl[s] < 9) lage[lg].fehl[s]++;
                     lage[lg].stufe--;
                     event2(1, L_("spitze_runter", "Spitze %.0f °C bei „%s“: 30 s Taktbremse %d MHz, für diese Lastart künftig %d MHz"), T, lage_text(lg), stufen[0], stufen[lage[lg].stufe]);
+                    event(L_("spitze_warte", "%d MHz erst wieder nach %d min Last ohne Spitze"), stufen[s], wartezeit(lage[lg].fehl[s]) / 60);
                 } else if (k > sicherBis)
                     event2(1, L_("spitze_unten", "Spitze %.0f °C bei „%s“, Taktbremse stand schon auf %d MHz"), T, lage_text(lg), capNow);
                 sicherBis = k + 30; lage[lg].ruhig = 0;
             }
-            if (k > sicherBis) {   // calm long enough at this step: may try the next one
-                if (lage[lg].spitze < 80) lage[lg].ruhig++; else { lage[lg].ruhig = 0; lage[lg].spitze = (int)T; }
-                if (lage[lg].ruhig >= 600 && lage[lg].stufe < NSTUFEN - 1) {
-                    lage[lg].stufe++; lage[lg].ruhig = 0;
-                    event(L_("ruhig", "10 min ruhig bei „%s“: probiert mehr Takt, %d MHz"), lage_text(lg), stufen[lage[lg].stufe]);
+            // calm long enough at this step: may try the next one. Only seconds in which a core really runs at the cap count
+            // (idle time says nothing about whether more clock is safe), and a step with hot spots behind it waits longer.
+            if (k > sicherBis && lage[lg].stufe < NSTUFEN - 1) {
+                if (lage[lg].spitze >= 80) { lage[lg].ruhig = 0; lage[lg].spitze = (int)T; }
+                else if (capNow > 0 && maxMhz >= capNow - 250) lage[lg].ruhig++;
+                int s = lage[lg].stufe + 1, w = wartezeit(lage[lg].fehl[s]);
+                if (lage[lg].ruhig >= w) {
+                    lage[lg].stufe = s; lage[lg].ruhig = 0;
+                    event(L_("ruhig", "%d min am Limit ohne Spitze bei „%s“: probiert %d MHz"), w / 60, lage_text(lg), stufen[s]);
                 }
             }
             int want = k <= sicherBis ? stufen[0] : stufen[lage[lg].stufe];
