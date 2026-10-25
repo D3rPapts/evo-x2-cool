@@ -11,9 +11,22 @@ Learning fan and clock controller for the **GMKtec EVO-X2** mini PC (AMD Ryzen A
 
 *Deutsch: siehe [unten](#deutsch).*
 
-## Why
+## The problem
 
-Under single-core boost the EVO-X2 can jump from 40 °C to almost 100 °C in a few seconds. The stock fan curve reacts too late, which led to thermal hard freezes on our machine. EVO-X2-COOL watches the chip every second, predicts where the temperature is heading, and:
+We run two EVO-X2 side by side: one with 64 GB, one with 128 GB, both with the same BIOS (1.12) and EC firmware (1.10). The 128 GB machine runs fine. The 64 GB machine **froze completely three times under heavy load**. No blue screen, no log entry, only the power button helped.
+
+What we found:
+
+- **Single-core boost is the killer, not full load.** One core boosting to ~4.5 GHz (e.g. the Windows search indexer) pushes the chip from 40 °C to almost **100 °C within 3–4 seconds**. The highest value we logged before a freeze was 99.8 °C. All cores at 100 % produce less of a hot spot than one core at full boost.
+- **The stock fan control is too slow for that.** The EC ramps the fans up by only about 60 rpm per second, so the fans are still slow when the spike has already happened.
+- **The fan curve set in the BIOS is ignored** unless the fan mode is "Manual PWM". In automatic mode the EC uses its own built-in curve.
+- Cleaning the fans did not make the spikes go away.
+
+There was no way to control the fans of this machine under Windows, so we built one.
+
+## What it does
+
+EVO-X2-COOL watches the chip every second, predicts where the temperature is heading, and:
 
 - **controls the fans** through the fan curve inside the EC: as quiet as possible while the predicted end temperature stays below the target (default 80 °C);
 - **brakes the clock** depending on the load type (few cores / many cores / GPU busy). After a hot spot it drops to a safe clock for 30 s and remembers a lower limit for that load type;
@@ -22,6 +35,16 @@ Under single-core boost the EVO-X2 can jump from 40 °C to almost 100 °C in a f
 - has an **emergency mode** (fan to full) that cannot be switched off.
 
 If the program crashes, the EC keeps regulating with the last (rising) curve. On a normal stop the BIOS fan curve is written back.
+
+**Measured on the 64 GB machine**, one core at 100 % for 3 minutes:
+
+| | Clock | Temperature | Fan |
+|---|---|---|---|
+| Learned limit too high (4.5 GHz) | 4450 MHz | 44 → **88 °C in 4 s** | – |
+| Controller brakes for 30 s | 3300 MHz | ~56 °C | 30 % |
+| Then the newly learned limit | 4150 MHz | **78–80 °C steady** | 30 % (quiet) |
+
+So the single-core performance drops by about 7 %, the fans stay quiet, and the hot spot is gone.
 
 ## Programs
 
@@ -103,6 +126,10 @@ GPL-3.0-or-later, see [LICENSE](LICENSE).
 ## Deutsch
 
 Lernende Lüfter- und Taktsteuerung für die GMKtec EVO-X2 unter Windows. Inoffizielles Community-Werkzeug, nicht von GMKtec. Benutzung auf eigene Gefahr. Mit KI-Unterstützung (Claude Code) geschrieben und auf echter Hardware getestet.
+
+**Warum es das gibt:** Wir haben zwei EVO-X2 nebeneinander, 64 GB und 128 GB, mit gleichem BIOS (1.12) und gleicher EC-Firmware (1.10). Die 64-GB-Maschine ist unter schwerer Last dreimal komplett eingefroren, ohne Bluescreen und ohne Logeintrag. Ursache: Boostet ein einzelner Kern, springt der Chip in 3–4 Sekunden von 40 auf fast 100 °C (gemessen bis 99,8 °C). Die Lüfter drehen nur etwa 60 U/min pro Sekunde hoch und kommen zu spät. Die Lüfterkurve aus dem BIOS wirkt nur im Modus „Manual PWM“. Unter Windows gab es keine Möglichkeit, die Lüfter dieser Maschine zu steuern, also haben wir eine gebaut.
+
+**Ergebnis** bei einem Kern auf 100 %: Vorher 88 °C nach 4 Sekunden. Mit der gelernten Taktgrenze (etwa 7 % weniger Ein-Kern-Takt) bleibt die CPU stabil bei 78–80 °C, und die Lüfter laufen leise mit 30 %.
 
 - Regelt die Lüfter so leise wie möglich unter einer Zieltemperatur (Standard 80 °C) und sagt den Temperaturverlauf voraus.
 - Bremst den Takt je nach Lastart, nach einer Hitzespitze 30 s stark, und merkt sich eine sichere Grenze.
