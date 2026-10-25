@@ -76,7 +76,7 @@ evo-x2-cool.exe --entfernen         stop and remove the service
 evo-x2-cool.exe --stopp             stop a console run, with restore
 ```
 
-Start `evo-x2-cool-front.exe` as a normal user. `--leiste` starts it hidden in the tray. Closing the window only hides it. The tray menu has **Exit** (window only) and **Exit all** (also stops the controller and gives the fans back to the BIOS curve).
+Start `evo-x2-cool-front.exe` as a normal user. The target temperature can be changed with − / + in the window or in the tray menu (60 °C up to 3 °C below the hot-spot limit); a higher target means less fan. `--leiste` starts it hidden in the tray. Closing the window only hides it. The tray menu has **Exit** (window only) and **Exit all** (also stops the controller and gives the fans back to the BIOS curve).
 
 ## Settings
 

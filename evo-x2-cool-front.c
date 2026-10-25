@@ -46,6 +46,7 @@ static void fill(HDC dc, RECT r, COLORREF c, int round);
 static int text(HDC dc, HFONT f, int x, int y, COLORREF c, int align, const wchar_t *fmt, ...);
 static RECT sw[EVO_NFUNK];                  // switch rectangles
 static unsigned swWant; static ULONGLONG swUntil, swErrUntil;   // clicked state shown until the controller has taken it over
+static RECT zielMinus, zielPlus; static float zielWant; static ULONGLONG zielUntil;   // target temperature - / +
 
 // ---------- texts: section [Anzeige] of sprache-<code>.ini (UTF-16), built-in German as fallback ----------
 static wchar_t iniFile[MAX_PATH], langFile[MAX_PATH];
@@ -400,13 +401,24 @@ static void paint(HWND w, HDC dc)
     }
 
     // ---- switches: single functions on/off (a click writes einstellungen.ini) ----
-    RECT sc = { rc.right - pad - evW, pad + tileH + gap, rc.right - pad, pad + tileH + gap + S(40) + EVO_NFUNK * S(28) + S(28) };
+    RECT sc = { rc.right - pad - evW, pad + tileH + gap, rc.right - pad, pad + tileH + gap + S(74) + EVO_NFUNK * S(28) + S(28) };
     fill(dc, sc, C_CARD, S(10));
     text(dc, fBold, sc.left + S(14), sc.top + S(12), C_TEXT, 0, L"%s", T(L"funktionen", L"Funktionen"));
     ULONGLONG now = GetTickCount64();
     unsigned on = now < swUntil ? swWant : sh->funktionen;
+    // target temperature, 1 °C per click (written to [Regler] Ziel, the controller takes it over within 5 s)
+    {
+        int zy = sc.top + S(40); COLORREF bc = sh->nurLesen ? C_GRID : C_OFF;
+        text(dc, fText, sc.left + S(14), zy + S(2), C_TEXT, 0, L"%s", T(L"z_ziel", L"Zieltemperatur"));
+        zielPlus = (RECT){ sc.right - S(38), zy, sc.right - S(14), zy + S(24) };
+        zielMinus = (RECT){ zielPlus.left - S(94), zy, zielPlus.left - S(70), zy + S(24) };
+        fill(dc, zielMinus, bc, S(8)); fill(dc, zielPlus, bc, S(8));
+        text(dc, fBold, (zielMinus.left + zielMinus.right) / 2, zy + S(2), C_TEXT, 2, L"−");
+        text(dc, fBold, (zielPlus.left + zielPlus.right) / 2, zy + S(2), C_TEXT, 2, L"+");
+        text(dc, fBold, (zielMinus.right + zielPlus.left) / 2, zy + S(2), now < zielUntil ? C_WARM : C_TEXT, 2, L"%.0f °C", now < zielUntil ? zielWant : sh->ziel);
+    }
     for (int i = 0; i < EVO_NFUNK; i++) {
-        int y = sc.top + S(40) + i * S(28), isOn = on >> i & 1;
+        int y = sc.top + S(74) + i * S(28), isOn = on >> i & 1;
         sw[i] = (RECT){ sc.left + S(14), y, sc.left + S(50), y + S(20) };
         fill(dc, sw[i], sh->nurLesen ? C_GRID : isOn ? C_OK : C_OFF, S(20));
         RECT knob = { isOn ? sw[i].right - S(18) : sw[i].left + S(2), y + S(2), isOn ? sw[i].right - S(2) : sw[i].left + S(18), y + S(18) };
@@ -458,6 +470,20 @@ static void toggle_funk(HWND w, int i)
     else swErrUntil = now + 5000;
     InvalidateRect(w, 0, FALSE);
 }
+
+// target temperature: 60 °C up to 3 °C below the hot-spot limit (above that the clock brake would fight the fan)
+static void set_ziel(HWND w, float z)
+{
+    if (!sh || sh->nurLesen) return;
+    ULONGLONG now = GetTickCount64();
+    float hi = (float)(sh->spitze - 3 < 90 ? sh->spitze - 3 : 90);
+    z = z < 60 ? 60 : z > hi ? hi : z;
+    wchar_t v[8]; swprintf(v, 8, L"%.0f", z);
+    if (WritePrivateProfileStringW(L"Regler", L"Ziel", v, iniFile)) { zielWant = z; zielUntil = now + 8000; }
+    else swErrUntil = now + 5000;
+    InvalidateRect(w, 0, FALSE);
+}
+static float cur_ziel(void) { return GetTickCount64() < zielUntil ? zielWant : sh ? sh->ziel : 80; }
 
 // ---------- tray icon ----------
 static NOTIFYICONDATAW tray;
@@ -521,6 +547,11 @@ static void tray_menu(HWND w)
     AppendMenuW(m, MF_SEPARATOR, 0, 0);
     unsigned on = cur_funk(), off = !sh || sh->nurLesen ? MF_GRAYED : 0;
     for (int i = 0; i < EVO_NFUNK; i++) AppendMenuW(m, MF_STRING | off | (on >> i & 1 ? MF_CHECKED : 0), 200 + i, funkText(i));
+    HMENU zm = CreatePopupMenu();   // target temperature presets
+    static const int zv[5] = { 75, 78, 80, 82, 85 };
+    for (int i = 0; i < 5; i++) { wchar_t zl[16]; swprintf(zl, 16, L"%d °C", zv[i]); AppendMenuW(zm, MF_STRING | ((int)(cur_ziel() + 0.5f) == zv[i] ? MF_CHECKED : 0), 300 + zv[i], zl); }
+    wchar_t zt[48]; swprintf(zt, 48, T(L"z_menu", L"Zieltemperatur (%.0f °C)"), cur_ziel());
+    AppendMenuW(m, MF_POPUP | off, (UINT_PTR)zm, zt);
     AppendMenuW(m, MF_SEPARATOR, 0, 0);
     AppendMenuW(m, MF_STRING, 101, T(L"m_ende", L"Beenden (Regler läuft weiter)"));
     AppendMenuW(m, MF_STRING | (sh ? 0 : MF_GRAYED), 102, T(L"m_alles", L"Alles beenden (auch den Regler)"));
@@ -533,6 +564,7 @@ static void tray_menu(HWND w)
     else if (id == 101) DestroyWindow(w);
     else if (id == 102) stop_all(w);
     else if (id == 103) open_releases();
+    else if (id >= 300) set_ziel(w, (float)(id - 300));
     else if (id >= 200) toggle_funk(w, id - 200);
 }
 
@@ -624,6 +656,8 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp)
             load_lang(); set_title(w); InvalidateRect(w, 0, FALSE);
         }
         for (int i = 0; i < EVO_NFUNK; i++) if (PtInRect(&sw[i], p)) toggle_funk(w, i);
+        if (PtInRect(&zielMinus, p)) set_ziel(w, cur_ziel() - 1);
+        if (PtInRect(&zielPlus, p)) set_ziel(w, cur_ziel() + 1);
         return 0;
     }
     case WM_KEYDOWN: if (wp >= '1' && wp <= '4') { spanIdx = (int)(wp - '1'); InvalidateRect(w, 0, FALSE); } return 0;
