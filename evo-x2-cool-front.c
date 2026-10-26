@@ -305,8 +305,11 @@ static void chart(HDC dc, RECT r, const Chart *c)
 {
     // title row with legend on the right
     int x = r.right;
+    SelectObject(dc, fBold); SIZE tsz; GetTextExtentPoint32W(dc, c->title, (int)wcslen(c->title), &tsz);
     for (int k = 3; k >= 0; k--) {
         if (!c->s[k].g) continue;
+        SelectObject(dc, fSmall); SIZE lsz; GetTextExtentPoint32W(dc, c->s[k].name, (int)wcslen(c->s[k].name), &lsz);
+        if (x - lsz.cx - S(34) < r.left + tsz.cx + S(12)) break;   // narrow window: no room left next to the title
         x -= text(dc, fSmall, x, r.top, C_DIM, 1, L"%s", c->s[k].name) + S(6);
         line(dc, x - S(14), r.top + S(8), x, r.top + S(8), c->s[k].c, S(2), PS_SOLID);
         x -= S(28);
@@ -421,11 +424,17 @@ static void paint(HWND w, HDC dc)
     }
     const wchar_t *status = stale ? T(L"stale", L"Keine neuen Werte – läuft der Regler?") : sh->nurLesen ? T(L"nurlesen", L"Nur lesen – es wird nichts gesteuert") : 0;
     int sx = top_buttons(dc, charts.right, by) - S(10);
-    if (status) text(dc, fSmall, sx, by + S(4), C_HOT, 1, L"%s", status);
-    else {
-        struct tm lt; time_t tt = (time_t)at->t; localtime_s(&lt, &tt);
-        text(dc, fSmall, sx, by + S(4), C_DIM, 1, T(L"status", L"%s%02d:%02d:%02d · Taktbremse gelernt – wenige %d · viele %d · Grafik %d MHz"),
-             hover >= 0 ? T(L"maus", L"Mauszeiger ") : L"", lt.tm_hour, lt.tm_min, lt.tm_sec, sh->deckel[0], sh->deckel[1], sh->deckel[2]);
+    {   // status right of the span buttons, cut with … when the window is narrow instead of running over them
+        wchar_t st[200];
+        if (status) wcsncpy(st, status, 199), st[199] = 0;
+        else {
+            struct tm lt; time_t tt = (time_t)at->t; localtime_s(&lt, &tt);
+            swprintf(st, 200, T(L"status", L"%s%02d:%02d:%02d · Taktbremse gelernt – wenige %d · viele %d · Grafik %d MHz"),
+                     hover >= 0 ? T(L"maus", L"Mauszeiger ") : L"", lt.tm_hour, lt.tm_min, lt.tm_sec, sh->deckel[0], sh->deckel[1], sh->deckel[2]);
+        }
+        RECT sr = { bx + S(6), by + S(4), sx, by + S(22) };
+        SelectObject(dc, fSmall); SetTextColor(dc, status ? C_HOT : C_DIM);
+        if (sr.right > sr.left) DrawTextW(dc, st, -1, &sr, DT_RIGHT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
     }
 
     // ---- charts ----
@@ -768,6 +777,9 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         InvalidateRect(w, 0, FALSE); return 0;
     }
     case WM_MOUSELEAVE: mouseX = mouseY = -1; InvalidateRect(w, 0, FALSE); return 0;
+    case WM_GETMINMAXINFO: {   // below this the charts get too narrow next to the fixed right column
+        MINMAXINFO *mm = (MINMAXINFO *)lp; mm->ptMinTrackSize.x = S(900); mm->ptMinTrackSize.y = S(700); return 0;
+    }
     case WM_LBUTTONDOWN: {
         POINT p = { (short)LOWORD(lp), (short)HIWORD(lp) };
         for (int i = 0; i < 4; i++) if (PtInRect(&btn[i], p)) { spanIdx = i; InvalidateRect(w, 0, FALSE); }

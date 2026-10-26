@@ -530,8 +530,8 @@ static int run(void)
     }
     if (nurLesen) event(L_("start_nurlesen", "Start: nur lesen, es wird nichts gesteuert"));
     else {
-        event(L_("start", "Start: Ziel %.0f °C, Lüfter %d–%d %%, Spitze ab %d °C, gelernt: %d Bereiche, %+.1f °C"),
-              ziel, minP, maxP, spitze, felder(), versatz);
+        event(L_("start", "Start: Ziel %.0f °C, Achtung %d °C, Alarm %d °C, Lüfter %d–%d %%, Taktbremse ab %d °C, gelernt: %d Bereiche, %+.1f °C"),
+              ziel, achtung, alarm, minP, maxP, spitze, felder(), versatz);
         for (int i = 0; i < EVO_NFUNK; i++) if (!(fn >> i & 1)) event(L_("f_aus", "%s ist ausgeschaltet"), funk_text(i));
         event(L_("bios", "BIOS-Lüfterkurve gesichert (%d/%d/%d °C), kommt beim Beenden zurück"),
               orig[1], orig[2], orig[3]);
@@ -655,7 +655,7 @@ static int run(void)
                 unsigned old = load_settings();
                 for (int i = 0; i < EVO_NFUNK; i++)
                     if ((old ^ fn) >> i & 1) event(fn >> i & 1 ? L_("f_an", "%s eingeschaltet") : L_("f_aus", "%s ist ausgeschaltet"), funk_text(i));
-                if (old == fn) event(L_("ini", "Einstellungen neu gelesen: Ziel %.0f °C, Lüfter %d–%d %%, Spitze ab %d °C"), ziel, minP, maxP, spitze);
+                if (old == fn) event(L_("ini", "Einstellungen neu gelesen: Ziel %.0f °C, Achtung %d °C, Alarm %d °C, Lüfter %d–%d %%, Taktbremse ab %d °C"), ziel, achtung, alarm, minP, maxP, spitze);
                 if (!nurLesen && (old & F_TAKT) && !(fn & F_TAKT) && write_cap(0)) capNow = 0;   // off = no clock limit at all
             }
         }
