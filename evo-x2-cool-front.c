@@ -35,7 +35,8 @@ static HANDLE map;
 static int spanIdx = 1, mouseX = -1, mouseY = -1, dpi = 96;
 static const int spans[4] = { 300, 900, 3600, 7200 };
 static const wchar_t *spanText[4] = { L"5 min", L"15 min", L"1 h", L"2 h" };
-static RECT btn[4], btnThema, btnSprache, btnUpdate;
+static RECT btn[4], btnThema, btnSprache, btnUpdate, btnZoom;
+static int zoom;   // 1 = every chart zooms on the values of the newest quarter of the shown time ([Anzeige] Zoom)
 static wchar_t updVer[16];   // newer version on GitHub, empty = none (or check switched off)
 static void open_releases(void);
 static HFONT fValue, fText, fSmall, fBold;
@@ -88,6 +89,7 @@ static void load_lang(void)
     }
     wchar_t t[16]; GetPrivateProfileStringW(L"Anzeige", L"Thema", L"system", t, 16, iniFile);
     thema = !wcscmp(t, L"hell") ? 1 : !wcscmp(t, L"dunkel") ? 2 : 0;
+    zoom = GetPrivateProfileIntW(L"Anzeige", L"Zoom", 0, iniFile) != 0;
 }
 
 // theme and language buttons at the right end of a row; returns their left edge
@@ -227,11 +229,41 @@ static float gCap(const EvoSample *s) { return s->cap > 0 ? (float)s->cap : -1; 
 static float gMhz(const EvoSample *s) { return s->mhz; }
 
 typedef struct { Getter g; COLORREF c; int w; const wchar_t *name; } Series;
-typedef struct { const wchar_t *title; float lo, hi, step; Series s[4]; } Chart;
+typedef struct { const wchar_t *title; float lo, hi, step; Series s[4]; float minW, za, zb; int z; } Chart;   // za..zb = zoomed band
 
 static uint32_t first, count, span;
 static int xOf(RECT r, uint32_t i) { return r.left + (int)((int64_t)(r.right - r.left) * (int)(span - (count - 1 - i)) / (int)span); }
 static const EvoSample *sample(uint32_t i) { return &sh->s[(first + i) % EVO_N]; }
+
+// height 0..1 of value v in a chart. Zoom: the band za..zb gets the middle 70 % of the height, values below or above it
+// are squeezed logarithmically into the 15 % at either edge, so they stay visible without taking the room
+static float yfrac(const Chart *c, float v)
+{
+    float f;
+    if (!c->z) f = (v - c->lo) / (c->hi - c->lo);
+    else if (v < c->za) f = 0.15f * logf(1 + fmaxf(0, v - c->lo)) / logf(1 + fmaxf(c->za - c->lo, 0.001f));
+    else if (v > c->zb) f = 0.85f + 0.15f * logf(1 + (v - c->zb)) / logf(1 + fmaxf(c->hi - c->zb, 0.001f));
+    else f = 0.15f + 0.7f * (v - c->za) / (c->zb - c->za);
+    return f < 0 ? 0 : f > 1 ? 1 : f;
+}
+
+// zoomed band: range of all lines in the newest quarter of the shown samples, at least minW wide, plus a fifth margin
+static void zoom_setup(Chart *c)
+{
+    c->z = 0;
+    if (!zoom || count < 8) return;
+    float a = 1e9f, b = -1e9f;
+    for (uint32_t i = count - count / 4; i < count; i++)
+        for (int k = 0; k < 4; k++) {
+            if (!c->s[k].g) continue;
+            float v = c->s[k].g(sample(i));
+            if (v >= 0) { if (v < a) a = v; if (v > b) b = v; }
+        }
+    if (a > b) return;
+    float w = fmaxf(b - a, c->minW) * 1.4f, m = (a + b) / 2;
+    c->za = fmaxf(c->lo, m - w / 2); c->zb = fminf(c->hi, m + w / 2);
+    c->z = c->zb - c->za < (c->hi - c->lo) * 0.9f;   // nearly the whole range anyway: stay linear
+}
 
 static void chart(HDC dc, RECT r, const Chart *c)
 {
@@ -246,10 +278,23 @@ static void chart(HDC dc, RECT r, const Chart *c)
     text(dc, fBold, r.left, r.top - S(1), C_TEXT, 0, L"%s", c->title);
     RECT p = { r.left + S(34), r.top + S(20), r.right, r.bottom };
     fill(dc, p, C_CARD, 0);
-    for (float v = c->lo; v <= c->hi + 0.01f; v += c->step) {
-        int y = p.bottom - (int)((v - c->lo) / (c->hi - c->lo) * (p.bottom - p.top - 1)) - 1;
+    float st = c->step, v0 = c->lo, v1 = c->hi;
+    if (c->z) {   // zoomed: round steps inside the band, plus the chart's ends if their labels have room
+        float raw = (c->zb - c->za) / 4, p10 = powf(10, floorf(log10f(raw))), q = raw / p10;
+        st = (q > 5 ? 10 : q > 2 ? 5 : q > 1 ? 2 : 1) * p10; v0 = ceilf(c->za / st) * st; v1 = c->zb;
+    }
+    int yLo = 99999, yHi = -99999;
+    for (float v = v0; v <= v1 + 0.01f; v += st) {
+        int y = p.bottom - (int)(yfrac(c, v) * (p.bottom - p.top - 1)) - 1;
         line(dc, p.left, y, p.right, y, C_GRID, 1, PS_SOLID);
         text(dc, fSmall, p.left - S(6), y - S(7), C_DIM, 1, L"%g", v);
+        if (y < yLo) yLo = y; if (y > yHi) yHi = y;
+    }
+    if (c->z) {
+        int yb = p.bottom - 1, yt = p.top;
+        line(dc, p.left, yb, p.right, yb, C_GRID, 1, PS_SOLID); line(dc, p.left, yt, p.right, yt, C_GRID, 1, PS_SOLID);
+        if (yb - yHi > S(12)) text(dc, fSmall, p.left - S(6), yb - S(7), C_DIM, 1, L"%g", c->lo);
+        if (yLo - yt > S(12)) text(dc, fSmall, p.left - S(6), yt - S(7), C_DIM, 1, L"%g", c->hi);
     }
     for (int k = 0; k < 4; k++) {
         if (!c->s[k].g) continue;
@@ -260,7 +305,7 @@ static void chart(HDC dc, RECT r, const Chart *c)
             if (v < 0) { down = 0; continue; }   // -1 = no value
             int px = xOf(p, i);
             if (down && px == lastX && i + 1 < count) continue;   // more samples than pixels: one point per column is enough
-            float f = (v - c->lo) / (c->hi - c->lo); f = f < 0 ? 0 : f > 1 ? 1 : f;
+            float f = yfrac(c, v);
             int py = p.bottom - 1 - (int)(f * (p.bottom - p.top - 2));
             if (down) LineTo(dc, px, py); else MoveToEx(dc, px, py, 0);
             down = 1; lastX = px;
@@ -367,6 +412,8 @@ static void paint(HWND w, HDC dc)
         { T(L"c_fan2", L"CPU-Lüfter 2 %"), 0, 100, 50, { { gRpm2, C_RPM, 1, lIst }, { gEcFan, C_WARM, 1, lEc }, { gFan, C_FAN, S(2), lSoll } } },
         { T(L"c_fan3", L"Systemlüfter (SSD, WLAN) %"), 0, 100, 50, { { gRpm3, C_RPM, 1, lIst }, { gSysEc, C_WARM, 1, lEc }, { gSysFan, C_FAN, S(2), lSoll } } },
     };
+    const float minW[6] = { 8, pmax / 6, 800, 15, 15, 15 };   // narrowest zoomed band: °C, W, MHz, %
+    for (int i = 0; i < 6; i++) { cs[i].minW = minW[i]; zoom_setup(&cs[i]); }
     static const int weight[6] = { 3, 3, 3, 2, 2, 2 };   // the three fan charts get 2/3 of the height of the others
     int unit = (charts.bottom - charts.top - 5 * gap) / 15, cy = charts.top;
     for (int i = 0; i < 6; i++) {
@@ -380,7 +427,7 @@ static void paint(HWND w, HDC dc)
             const wchar_t *lname[4] = { T(L"ziel", L"Ziel"), T(L"spitze", L"Taktbremse"), T(L"l_achtung", L"Achtung"), T(L"l_alarm", L"Alarm") };
             int lx = p.left + S(4);
             for (int j = 0; j < 4; j++) {
-                int yy = p.bottom - (int)((lv[j] - tmin) / (tmax - tmin) * (p.bottom - p.top));
+                int yy = p.bottom - 1 - (int)(yfrac(&cs[0], lv[j]) * (p.bottom - p.top - 2));
                 line(dc, p.left, yy, p.right, yy, lcol[j], 1, PS_DASH);
                 lx += text(dc, fSmall, lx, yy - S(15), lcol[j], 0, L"%s", lname[j]) + S(10);
             }
@@ -487,6 +534,14 @@ static void paint(HWND w, HDC dc)
         if (i == 2) { lx2 = ev.left + S(14); ly += S(16); }
         RECT q = { lx2, ly + S(3), lx2 + S(10), ly + S(13) }; fill(dc, q, lc[i], 0);
         lx2 += S(16) + text(dc, fSmall, lx2 + S(14), ly, C_DIM, 0, L"%s", ln[i]) + S(10);
+    }
+    // zoom switch, bottom right
+    {
+        const wchar_t *zl = T(L"zoom", L"🔍 Zoom");
+        SelectObject(dc, fSmall); SIZE sz; GetTextExtentPoint32W(dc, zl, (int)wcslen(zl), &sz);
+        btnZoom = (RECT){ ev.right - S(14) - sz.cx - S(16), ly - S(2), ev.right - S(14), ly + S(16) };
+        fill(dc, btnZoom, zoom ? RGB(58, 92, 160) : C_GRID, S(8));
+        text(dc, fSmall, (btnZoom.left + btnZoom.right) / 2, ly, zoom ? C_TEXT : C_DIM, 2, L"%s", zl);
     }
 }
 
@@ -681,6 +736,7 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         POINT p = { (short)LOWORD(lp), (short)HIWORD(lp) };
         for (int i = 0; i < 4; i++) if (PtInRect(&btn[i], p)) { spanIdx = i; InvalidateRect(w, 0, FALSE); }
         if (PtInRect(&btnUpdate, p)) open_releases();
+        if (PtInRect(&btnZoom, p)) { zoom = !zoom; WritePrivateProfileStringW(L"Anzeige", L"Zoom", zoom ? L"1" : L"0", iniFile); InvalidateRect(w, 0, FALSE); }
         if (PtInRect(&btnThema, p) || PtInRect(&btnSprache, p)) {
             int ok;
             if (PtInRect(&btnThema, p)) { thema = (thema + 1) % 3; ok = WritePrivateProfileStringW(L"Anzeige", L"Thema", themaKey[thema], iniFile); apply_theme(w); }
