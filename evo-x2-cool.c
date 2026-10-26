@@ -512,7 +512,7 @@ static int run(void)
     // controller state
     float hist[10]; int nHist = 0;
     float emaT = 0, slope = 0, pFast = 0, pSlow = 0, mFast = 0, mSlow = 0, emaTe = 0, d = (float)(minP > 40 ? minP : 40), boost = 0;
-    int capNow = read_cap(), sicherBis = 0, grafikSeit = -1, nachlauf = 0, lageNow = -1, hot = 0, lowSince = -1, warNotfall = 0;
+    int capNow = read_cap(), sicherBis = 0, grafikSeit = -1, nachlauf = 0, lageNow = -1, locker = 0, hot = 0, lowSince = -1, warNotfall = 0;
     int ec[8] = { -1, -1, -1, -1, -1, -1, -1, -1 };
     static const uint8_t regs[8] = { 0x70, 0x35, 0x36, 0x31, 0x37, 0x38, 0x28, 0x29 };
     int console = GetConsoleWindow() != 0;
@@ -623,6 +623,10 @@ static int run(void)
         else if (grafikSeit >= 0) { if (k - grafikSeit >= 30) nachlauf = 1; grafikSeit = -1; }
         if (nachlauf && emaT < 65) nachlauf = 0;   // the heat of the GPU phase is gone
         int lg = G > 20 || nachlauf ? LAGE_GRAFIK : busy > 4 ? LAGE_VIELE : LAGE_WENIGE;
+        // a situation with a lower cap counts at once, one with a higher cap only after 10 s: a few busy threads that
+        // come and go must not flip the cap (and the EC mode) every second
+        if (lageNow >= 0 && lg != lageNow && lage[lg].stufe > lage[lageNow].stufe && ++locker < 10) lg = lageNow;
+        else locker = 0;
         if (lg != lageNow) { lage[lg].spitze = (int)T; if (lageNow >= 0 && !nurLesen) event(L_("lastart", "Lastart jetzt: %s"), lage_text(lg)); lageNow = lg; }
         else if (T > lage[lg].spitze) lage[lg].spitze = (int)T;
         if (!nurLesen && (fn & F_TAKT)) {
