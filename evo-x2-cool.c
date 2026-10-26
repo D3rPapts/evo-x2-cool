@@ -26,6 +26,7 @@
 #define UNICODE
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
+#include <winioctl.h>
 #include <powrprof.h>
 #include <sddl.h>
 #include <stdio.h>
@@ -411,12 +412,33 @@ static int read_bios_fan(uint8_t orig[12])
     return 1;
 }
 
+// hottest SSD in °C from the storage driver (NVMe reports it without any extra driver), -1 = unknown
+static int ssd_temp(void)
+{
+    int best = -1;
+    for (int i = 0; i < 8; i++) {
+        wchar_t p[32]; swprintf(p, 32, L"\\\\.\\PhysicalDrive%d", i);
+        HANDLE h = CreateFileW(p, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, 0, OPEN_EXISTING, 0, 0);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        STORAGE_PROPERTY_QUERY q = { StorageDeviceTemperatureProperty, PropertyStandardQuery };
+        union { STORAGE_TEMPERATURE_DATA_DESCRIPTOR d; BYTE b[256]; } o; DWORD n;
+        if (DeviceIoControl(h, IOCTL_STORAGE_QUERY_PROPERTY, &q, sizeof q, &o, sizeof o, &n, 0) && n >= sizeof o.d && o.d.InfoCount > 0) {
+            int t = o.d.TemperatureInfo[0].Temperature;
+            if (t > best && t < 120) best = t;
+        }
+        CloseHandle(h);
+    }
+    return best;
+}
+
 // fan curve anchored 3 °C below the smoothed EC temperature: today's temperature lies on the rising part,
-// duty there = d, +2 % per °C above. Both CPU fan blocks (0x60, 0x66), mode 1 = curve active.
+// duty there = d, +2 % per °C above. Block 0x60 drives both CPU fans (blowers on the chip's heatsink), block 0x66 the
+// 120 mm system fan on the back of the board; mode 1 = curve active. The system fan gets sysWant (-1 = same as the CPU
+// fans); 0 = off, written as a curve that starts only at 85 °C, so the EC still turns it on if the controller dies.
 // Each EC write costs a write plus a read-back (~2 ms of spinning), so only registers that change are written (usually
 // start/full/pwm). check = 1 reads every register first instead of trusting the cache (done once a minute, in case the
 // EC was reset, e.g. after sleep).
-static int curveD = -1; static float curveAnchor = -1;
+static int curveD = -1, sysWant = -1, curveSys = -1; static float curveAnchor = -1;
 static int curveReg[12] = { -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 };
 static void write_curve(int d, float teSmooth, int check)
 {
@@ -424,22 +446,24 @@ static void write_curve(int d, float teSmooth, int check)
     int pwm = d - 6 < 0 ? 0 : d - 6;
     int full = start + (100 - pwm + 1) / 2 + 1; if (full > 105) full = 105;
     static const int order[6] = { 1, 2, 3, 4, 5, 0 };   // the mode byte (curve on) last
-    int val[6] = { 1, 20, start, full, pwm, 2 };
+    int s = sysWant < 0 ? d : sysWant, spwm = s - 6 < 0 ? 0 : s - 6;
+    int sfull = start + (100 - spwm + 1) / 2 + 1; if (sfull > 105) sfull = 105;
+    int val[12] = { 1, 20, start, full, pwm, 2, 1, 20, s ? start : 85, s ? sfull : 105, s ? spwm : 0, 2 };
     for (int b = 0; b <= 6; b += 6)
         for (int j = 0; j < 6; j++) {
             int i = b + order[j];
-            if ((check ? ec_read((uint8_t)(0x60 + i)) : curveReg[i]) != val[order[j]])
-                curveReg[i] = ec_write((uint8_t)(0x60 + i), (uint8_t)val[order[j]]) ? val[order[j]] : -1;
-            else curveReg[i] = val[order[j]];
+            if ((check ? ec_read((uint8_t)(0x60 + i)) : curveReg[i]) != val[i])
+                curveReg[i] = ec_write((uint8_t)(0x60 + i), (uint8_t)val[i]) ? val[i] : -1;
+            else curveReg[i] = val[i];
         }
-    curveD = d; curveAnchor = teSmooth;
+    curveD = d; curveSys = s; curveAnchor = teSmooth;
 }
 
 static int restore_bios(const uint8_t orig[12])
 {
     int ok = 1;
     for (int i = 11; i >= 0; i--) { ok &= ec_write((uint8_t)(0x60 + i), orig[i]); curveReg[i] = -1; }
-    curveD = -1; curveAnchor = -1;
+    curveD = curveSys = -1; curveAnchor = -1;
     return ok;
 }
 
@@ -698,8 +722,19 @@ static int run(void)
         else { if (lowSince < 0) lowSince = k; if (k - lowSince >= 10) d = fmaxf(wantD, d - 3); }
         warNotfall = grund == GRUND_NOTFALL;
         int di = (int)lroundf(d);
+        // system fan: the 120 mm fan on the back of the board cools the SSDs, the WLAN card and the board under the
+        // chip, not the chip itself. Idle with cool SSDs: off, like the BIOS does; otherwise with the CPU fans;
+        // warm SSDs (loading a big model): at least 30 %, +5 % per °C above 55. SSD unknown: as before, with the CPU fans
+        static int ssdT = -1, sysAus;
+        if (k % 10 == 1) ssdT = ssd_temp();
+        int aus = leer && grund != GRUND_NOTFALL && ssdT >= 0 && ssdT < (sysAus ? 50 : 47);
+        if (aus != sysAus && !nurLesen && (fn & F_LUEFTER)) event(aus ? L_("sys_aus", "Systemlüfter aus (Leerlauf, SSD %d °C)") : L_("sys_an", "Systemlüfter wieder an (SSD %d °C)"), ssdT);
+        sysAus = aus;
+        int sw = aus ? 0 : di;
+        if (ssdT >= 55) { int m = 30 + 5 * (ssdT - 55); sw = sw > m ? sw : m > 100 ? 100 : m; }
+        sysWant = sw;
         int fanOn = !nurLesen && ((fn & F_LUEFTER) || grund == GRUND_NOTFALL || nachNotfall);   // the emergency takes over even when switched off
-        if (fanOn && (abs(di - curveD) >= 2 || fabsf(emaTe - curveAnchor) > 3)) write_curve(di, emaTe, 0);
+        if (fanOn && (abs(di - curveD) >= 2 || abs(sysWant - curveSys) >= 2 || fabsf(emaTe - curveAnchor) > 3)) write_curve(di, emaTe, 0);
         else if (fanOn && k % 60 == 30 && curveD >= 0) write_curve(curveD, curveAnchor, 1);
         else if (!fanOn && curveD >= 0) restore_bios(orig);
         if (nurLesen) grund = GRUND_NUR_LESEN;
