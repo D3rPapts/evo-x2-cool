@@ -45,7 +45,7 @@
 #define SVC L"evo-x2-cool"
 
 // ---------- settings (einstellungen.ini) ----------
-static float ziel = 80; static int minP = 30, maxP = 70, spitze = 88, sicherMhz = 3600, nurLesen;
+static float ziel = 80; static int minP = 30, minLeer = 10, maxP = 70, spitze = 88, sicherMhz = 3600, nurLesen;
 static unsigned fn = F_ALLE;   // functions switched on
 static const int stufen[] = { 3300, 3600, 3900, 4200, 4500 };   // clock cap steps, MHz; the first one is taken after a hot spot
 #define NSTUFEN 5
@@ -81,7 +81,7 @@ static unsigned load_settings(void)
     if (GetFileAttributesW(iniFile) == INVALID_FILE_ATTRIBUTES) {
         static const char def[] =
             "; evo-x2-cool settings, re-read within 5 s after a change\r\n"
-            "[Regler]\r\nZiel=80\r\nMinProzent=30\r\nMaxProzent=70\r\nSpitze=88\r\nSicherMHz=3600\r\nSprache=de\r\n\r\n"
+            "[Regler]\r\nZiel=80\r\nMinProzent=30\r\nMinLeerlauf=10\r\nMaxProzent=70\r\nSpitze=88\r\nSicherMHz=3600\r\nSprache=de\r\n\r\n"
             "; 1 = on, 0 = off. The emergency (fan 100 % when overheating) always stays on.\r\n"
             "[Funktionen]\r\nLuefter=1\r\nTaktbremse=1\r\nEcLeise=1\r\nLernen=1\r\nVorhersage=1\r\n\r\n"
             "; window: Thema = system / hell / dunkel; UpdatePruefen = 1: ask GitHub once a day for a newer version (only shown, nothing installed)\r\n"
@@ -95,11 +95,13 @@ static unsigned load_settings(void)
     wchar_t buf[16], code[16];
     GetPrivateProfileStringW(L"Regler", L"Ziel", L"80", buf, 16, iniFile); ziel = (float)_wtof(buf);
     minP = GetPrivateProfileIntW(L"Regler", L"MinProzent", 30, iniFile);
+    minLeer = GetPrivateProfileIntW(L"Regler", L"MinLeerlauf", 10, iniFile);
     maxP = GetPrivateProfileIntW(L"Regler", L"MaxProzent", 70, iniFile);
     spitze = GetPrivateProfileIntW(L"Regler", L"Spitze", 88, iniFile);
     sicherMhz = GetPrivateProfileIntW(L"Regler", L"SicherMHz", 3600, iniFile);
     // sane limits, whatever is in the file
     ziel = ziel < 50 ? 50 : ziel > 92 ? 92 : ziel; minP = minP < 0 ? 0 : minP > 100 ? 100 : minP;
+    minLeer = minLeer < 0 ? 0 : minLeer > minP ? minP : minLeer;
     maxP = maxP < minP ? minP : maxP > 100 ? 100 : maxP; spitze = spitze < 70 ? 70 : spitze > 95 ? 95 : spitze;
     GetPrivateProfileStringW(L"Regler", L"Sprache", L"de", code, 16, iniFile);
     wchar_t lf[MAX_PATH]; swprintf(lf, MAX_PATH, L"%s\\sprache-%s.ini", exeDir, code);
@@ -601,6 +603,7 @@ static int run(void)
         float prevT = emaT;
         emaT += (med - emaT) / 8;
         slope += ((emaT - prevT) - slope) / 10;
+        float pAlt = pFast;
         pFast += (heat - pFast) / 3; pSlow += (heat - pSlow) / 20;
         mFast += ((float)maxW - mFast) / 3; mSlow += ((float)maxW - mSlow) / 20;
         if (Te >= 0) emaTe += (Te - emaTe) / 10;   // the EC temperature jumps by 15 °C within seconds; the anchor follows slowly
@@ -663,10 +666,17 @@ static int run(void)
         if (!nurLesen && (fn & F_LERNEN) && k > 30 && T < 90 && emaT < 90 && fabsf(pFast - pSlow) < 5 && fabsf(slope) < 0.08f && curveD >= 0)
             learn(pSlow, (float)curveD, mSlow, emaT + tau * slope);
 
-        // --- predict: rising power counts ahead (fast EMA plus its lead over the slow one); switched off: current power only ---
-        float pv = fmaxf(pFast, pSlow) + (fn & F_VORHERSAGE ? fmaxf(0, pFast - pSlow) : 0);
-        int need = maxP;
-        for (int x = minP; x <= maxP; x += 5) if (predict(pv, (float)x, mFast) <= ziel - 1) { need = x; break; }
+        // --- predict: rising power counts ahead (fast EMA plus its lead over the slow one); switched off: current power only.
+        //     The lead counts only while the power still rises and never beyond the measured power: after a jump the
+        //     slow EMA lags for a minute, and a 5-s burst must not be taken for a lasting load ---
+        float lead = (fn & F_VORHERSAGE) && pFast - pAlt > 0.5f ? fmaxf(0, pFast - pSlow) : 0;
+        float pv = fmaxf(pFast, pSlow) + fminf(lead, fmaxf(0, heat - fmaxf(pFast, pSlow)));
+        // idle and far below the target: a lower floor (the BIOS idles at ~1000-2000 rpm; measured: 30 % ~2200, 20 % ~1850, 10 % ~1500 rpm);
+        // with a gap between on and off, so it does not flip like the BIOS curve
+        static int leer;
+        if (emaT < ziel - 25 && pSlow < 30) leer = 1; else if (emaT > ziel - 20 || pSlow > 40) leer = 0;
+        int lo = leer ? minLeer : minP, need = maxP;
+        for (int x = lo; x <= maxP; x += 5) if (predict(pv, (float)x, mFast) <= ziel - 1) { need = x; break; }
         // feedback: warmer than the target anyway -> add more; let it go again slowly (not in the first seconds: median not full)
         if (k >= 15) { if (emaT > ziel + 1) boost = fminf(40, boost + 1); else if (emaT < ziel - 3) boost = fmaxf(0, boost - 1); }
         float wantD = fminf((float)maxP, need + boost);
@@ -676,8 +686,10 @@ static int run(void)
         if (hot >= 5 || Te >= 90) { wantD = 100; grund = GRUND_NOTFALL; }
         if (grund == GRUND_NOTFALL && !warNotfall && !nurLesen) event2(1, L_("notfall", "NOTFALL: CPU %.0f °C, Gehäuse %d °C → Lüfter 100 %%"), T, Te);
         // up: a prediction raises by at most 4 %/s (jumping 30 -> 70 % is loud, the fan needs ~10 s per step anyway),
+        // only 1 %/s while the chip is still far below the target (a short burst then hardly reaches the fan),
         // at once only when really hot or in an emergency; down after 10 s by 3 %/s; after an emergency straight to the wanted value
-        if (wantD >= d) { d = grund == GRUND_NOTFALL || emaT >= ziel + 5 ? wantD : fminf(wantD, d + 4); lowSince = -1; }
+        float auf = T < ziel - 8 && emaT < ziel - 8 ? 1.0f : 4.0f;
+        if (wantD >= d) { d = grund == GRUND_NOTFALL || emaT >= ziel + 5 ? wantD : fminf(wantD, d + auf); lowSince = -1; }
         else if (warNotfall && T < 90) { d = wantD; lowSince = -1; }
         else { if (lowSince < 0) lowSince = k; if (k - lowSince >= 10) d = fmaxf(wantD, d - 3); }
         warNotfall = grund == GRUND_NOTFALL;
