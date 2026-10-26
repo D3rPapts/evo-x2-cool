@@ -9,14 +9,12 @@
 #define EVO_VERSION_W L"0.5.1"
 #define EVO_SHM    L"Global\\evo-x2-cool"
 #define EVO_STOPP  L"Global\\evo-x2-cool-stopp"   // set it and the controller restores everything and ends (service too)
-#define EVO_MAGIC  0x45564F33u   // "EVO3", changes with the layout below so an old window does not misread a new controller
+#define EVO_MAGIC  0x45564F34u   // "EVO4", changes with the layout below so an old window does not misread a new controller
 #define EVO_N      7200          // samples kept: 2 hours at 1 s
 #define EVO_EV     256           // events kept
 
 enum { LAGE_WENIGE, LAGE_VIELE, LAGE_GRAFIK };
 enum { GRUND_MODELL, GRUND_VORHERSAGE, GRUND_NACHREGELN, GRUND_NOTFALL, GRUND_NUR_LESEN, GRUND_ACHTUNG };
-#define EVO_GELB 90   // yellow (attention) from here, CPU or case sensor: the fan climbs steadily, also above MaxProzent
-#define EVO_ROT  95   // red (emergency) from here: fan 100 % at once
 
 // functions that can be switched off in einstellungen.ini, section [Funktionen] (1 = on). The emergency (fan 100 %
 // when overheating) cannot be switched off: it takes over even while the fan control is off.
@@ -58,6 +56,7 @@ typedef struct {
     uint32_t nurLesen;                  // 1 = read-only mode, nothing is controlled
     uint32_t funktionen;                // F_* bits currently active
     float ziel; int32_t minP, maxP, spitze;
+    int32_t achtung, alarm;             // yellow: fan climbs steadily; red: fan 100 % at once (°C)
     float versatz; int32_t felder;      // learned model: overall offset, number of learned cells
     int32_t deckel[3];                  // learned clock cap per situation (MHz)
     volatile uint32_t nSample, nEvent;  // totals written; slot = n % EVO_N / EVO_EV

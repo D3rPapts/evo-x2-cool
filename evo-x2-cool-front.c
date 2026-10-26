@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
+#include <math.h>
 #include <time.h>
 #include "evo.h"
 #pragma comment(lib, "user32.lib")
@@ -46,7 +47,12 @@ static void fill(HDC dc, RECT r, COLORREF c, int round);
 static int text(HDC dc, HFONT f, int x, int y, COLORREF c, int align, const wchar_t *fmt, ...);
 static RECT sw[EVO_NFUNK];                  // switch rectangles
 static unsigned swWant; static ULONGLONG swUntil, swErrUntil;   // clicked state shown until the controller has taken it over
-static RECT zielMinus, zielPlus; static float zielWant; static ULONGLONG zielUntil;   // target temperature - / +
+static RECT stMinus[3], stPlus[3]; static float stWant[3]; static ULONGLONG stUntil[3];   // target / attention / alarm - / +
+static float cur_stufe(int j)   // clicked value until the controller has taken it over
+{
+    if (GetTickCount64() < stUntil[j]) return stWant[j];
+    return !sh ? (j == 0 ? 80.0f : j == 1 ? 90.0f : 95.0f) : j == 0 ? sh->ziel : (float)(j == 1 ? sh->achtung : sh->alarm);
+}
 
 // ---------- texts: section [Anzeige] of sprache-<code>.ini (UTF-16), built-in German as fallback ----------
 static wchar_t iniFile[MAX_PATH], langFile[MAX_PATH];
@@ -367,11 +373,17 @@ static void paint(HWND w, HDC dc)
         RECT r = { charts.left, cy, charts.right, i == 5 ? charts.bottom : cy + weight[i] * unit };
         cy = r.bottom + gap;
         chart(dc, r, &cs[i]);
-        if (i == 0) {   // target and hot-spot lines
+        if (i == 0) {   // dashed lines: target, clock brake, attention, alarm; labels side by side so they do not overlap
             RECT p = { plot.left, r.top + S(20), plot.right, r.bottom };
-            int y1 = p.bottom - (int)((sh->ziel - tmin) / (tmax - tmin) * (p.bottom - p.top)), y2 = p.bottom - (int)((sh->spitze - tmin) / (tmax - tmin) * (p.bottom - p.top));
-            line(dc, p.left, y1, p.right, y1, C_OK, 1, PS_DASH); text(dc, fSmall, p.left + S(4), y1 - S(15), C_OK, 0, L"%s", T(L"ziel", L"Ziel"));
-            line(dc, p.left, y2, p.right, y2, C_HOT, 1, PS_DASH); text(dc, fSmall, p.left + S(4), y2 - S(15), C_HOT, 0, L"%s", T(L"spitze", L"Spitze"));
+            const float lv[4] = { sh->ziel, (float)sh->spitze, (float)sh->achtung, (float)sh->alarm };
+            const COLORREF lcol[4] = { C_OK, C_DIM, C_CAP, C_HOT };
+            const wchar_t *lname[4] = { T(L"ziel", L"Ziel"), T(L"spitze", L"Taktbremse"), T(L"l_achtung", L"Achtung"), T(L"l_alarm", L"Alarm") };
+            int lx = p.left + S(4);
+            for (int j = 0; j < 4; j++) {
+                int yy = p.bottom - (int)((lv[j] - tmin) / (tmax - tmin) * (p.bottom - p.top));
+                line(dc, p.left, yy, p.right, yy, lcol[j], 1, PS_DASH);
+                lx += text(dc, fSmall, lx, yy - S(15), lcol[j], 0, L"%s", lname[j]) + S(10);
+            }
         }
     }
 
@@ -414,24 +426,30 @@ static void paint(HWND w, HDC dc)
     }
 
     // ---- switches: single functions on/off (a click writes einstellungen.ini) ----
-    RECT sc = { rc.right - pad - evW, pad + tileH + gap, rc.right - pad, pad + tileH + gap + S(74) + EVO_NFUNK * S(28) + S(28) };
+    RECT sc = { rc.right - pad - evW, pad + tileH + gap, rc.right - pad, pad + tileH + gap + S(134) + EVO_NFUNK * S(28) + S(28) };
     fill(dc, sc, C_CARD, S(10));
     text(dc, fBold, sc.left + S(14), sc.top + S(12), C_TEXT, 0, L"%s", T(L"funktionen", L"Funktionen"));
     ULONGLONG now = GetTickCount64();
     unsigned on = now < swUntil ? swWant : sh->funktionen;
-    // target temperature, 1 °C per click (written to [Regler] Ziel, the controller takes it over within 5 s)
+    // three temperature steps, 1 °C per click (written to [Regler], the controller takes them over within 5 s):
+    // green = target (as quiet as possible below it), yellow = attention (fan climbs), red = alarm (fan full)
     {
-        int zy = sc.top + S(40); COLORREF bc = sh->nurLesen ? C_GRID : C_OFF;
-        text(dc, fText, sc.left + S(14), zy + S(2), C_TEXT, 0, L"%s", T(L"z_ziel", L"Zieltemperatur"));
-        zielPlus = (RECT){ sc.right - S(38), zy, sc.right - S(14), zy + S(24) };
-        zielMinus = (RECT){ zielPlus.left - S(94), zy, zielPlus.left - S(70), zy + S(24) };
-        fill(dc, zielMinus, bc, S(8)); fill(dc, zielPlus, bc, S(8));
-        text(dc, fBold, (zielMinus.left + zielMinus.right) / 2, zy + S(2), C_TEXT, 2, L"−");
-        text(dc, fBold, (zielPlus.left + zielPlus.right) / 2, zy + S(2), C_TEXT, 2, L"+");
-        text(dc, fBold, (zielMinus.right + zielPlus.left) / 2, zy + S(2), now < zielUntil ? C_WARM : C_TEXT, 2, L"%.0f °C", now < zielUntil ? zielWant : sh->ziel);
+        static const wchar_t *stKey[3] = { L"z_ziel", L"z_achtung", L"z_alarm" }, *stDef[3] = { L"Ziel", L"Achtung (Lüfter steigt)", L"Alarm (Lüfter voll)" };
+        const COLORREF stC[3] = { C_OK, C_CAP, C_HOT }; COLORREF bc = sh->nurLesen ? C_GRID : C_OFF;
+        for (int j = 0; j < 3; j++) {
+            int zy = sc.top + S(40) + j * S(30);
+            RECT dot = { sc.left + S(14), zy + S(7), sc.left + S(24), zy + S(17) }; fill(dc, dot, stC[j], S(10));
+            text(dc, fText, sc.left + S(32), zy + S(2), C_TEXT, 0, L"%s", T(stKey[j], stDef[j]));
+            stPlus[j] = (RECT){ sc.right - S(38), zy, sc.right - S(14), zy + S(24) };
+            stMinus[j] = (RECT){ stPlus[j].left - S(94), zy, stPlus[j].left - S(70), zy + S(24) };
+            fill(dc, stMinus[j], bc, S(8)); fill(dc, stPlus[j], bc, S(8));
+            text(dc, fBold, (stMinus[j].left + stMinus[j].right) / 2, zy + S(2), C_TEXT, 2, L"−");
+            text(dc, fBold, (stPlus[j].left + stPlus[j].right) / 2, zy + S(2), C_TEXT, 2, L"+");
+            text(dc, fBold, (stMinus[j].right + stPlus[j].left) / 2, zy + S(2), now < stUntil[j] ? C_WARM : C_TEXT, 2, L"%.0f °C", cur_stufe(j));
+        }
     }
     for (int i = 0; i < EVO_NFUNK; i++) {
-        int y = sc.top + S(74) + i * S(28), isOn = on >> i & 1;
+        int y = sc.top + S(134) + i * S(28), isOn = on >> i & 1;
         sw[i] = (RECT){ sc.left + S(14), y, sc.left + S(50), y + S(20) };
         fill(dc, sw[i], sh->nurLesen ? C_GRID : isOn ? C_OK : C_OFF, S(20));
         RECT knob = { isOn ? sw[i].right - S(18) : sw[i].left + S(2), y + S(2), isOn ? sw[i].right - S(2) : sw[i].left + S(18), y + S(18) };
@@ -485,19 +503,23 @@ static void toggle_funk(HWND w, int i)
     InvalidateRect(w, 0, FALSE);
 }
 
-// target temperature: 60 °C up to 3 °C below the hot-spot limit (above that the clock brake would fight the fan)
-static void set_ziel(HWND w, float z)
+// the three steps, each at least 2 °C apart: target 60 °C up to 3 °C below the hot-spot limit (above that the clock
+// brake would fight the fan), attention from 70 °C, alarm 80-97 °C (the freezes came at ~100 °C)
+static void set_stufe(HWND w, int j, float z)
 {
     if (!sh || sh->nurLesen) return;
     ULONGLONG now = GetTickCount64();
-    float hi = (float)(sh->spitze - 3 < 90 ? sh->spitze - 3 : 90);
-    z = z < 60 ? 60 : z > hi ? hi : z;
+    static const wchar_t *key[3] = { L"Ziel", L"Achtung", L"Alarm" };
+    float lo = j == 0 ? 60 : j == 1 ? fmaxf(70, cur_stufe(0) + 2) : fmaxf(80, cur_stufe(1) + 2);
+    float hi = j == 0 ? fminf((float)sh->spitze - 3, cur_stufe(1) - 2) : j == 1 ? cur_stufe(2) - 2 : 97;
+    z = z < lo ? lo : z > hi ? hi : z;
     wchar_t v[8]; swprintf(v, 8, L"%.0f", z);
-    if (WritePrivateProfileStringW(L"Regler", L"Ziel", v, iniFile)) { zielWant = z; zielUntil = now + 8000; }
+    if (WritePrivateProfileStringW(L"Regler", key[j], v, iniFile)) { stWant[j] = z; stUntil[j] = now + 8000; }
     else swErrUntil = now + 5000;
     InvalidateRect(w, 0, FALSE);
 }
-static float cur_ziel(void) { return GetTickCount64() < zielUntil ? zielWant : sh ? sh->ziel : 80; }
+static void set_ziel(HWND w, float z) { set_stufe(w, 0, z); }
+static float cur_ziel(void) { return cur_stufe(0); }
 
 // ---------- tray icon ----------
 static NOTIFYICONDATAW tray;
@@ -670,8 +692,10 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp)
             load_lang(); set_title(w); InvalidateRect(w, 0, FALSE);
         }
         for (int i = 0; i < EVO_NFUNK; i++) if (PtInRect(&sw[i], p)) toggle_funk(w, i);
-        if (PtInRect(&zielMinus, p)) set_ziel(w, cur_ziel() - 1);
-        if (PtInRect(&zielPlus, p)) set_ziel(w, cur_ziel() + 1);
+        for (int j = 0; j < 3; j++) {
+            if (PtInRect(&stMinus[j], p)) set_stufe(w, j, cur_stufe(j) - 1);
+            if (PtInRect(&stPlus[j], p)) set_stufe(w, j, cur_stufe(j) + 1);
+        }
         return 0;
     }
     case WM_KEYDOWN: if (wp >= '1' && wp <= '4') { spanIdx = (int)(wp - '1'); InvalidateRect(w, 0, FALSE); } return 0;

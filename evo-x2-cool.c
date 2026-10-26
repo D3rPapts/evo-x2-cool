@@ -46,7 +46,7 @@
 #define SVC L"evo-x2-cool"
 
 // ---------- settings (einstellungen.ini) ----------
-static float ziel = 80; static int minP = 30, minLeer = 10, maxP = 70, spitze = 88, sicherMhz = 3600, nurLesen;
+static float ziel = 80; static int minP = 30, minLeer = 10, maxP = 70, spitze = 88, achtung = 90, alarm = 95, sicherMhz = 3600, nurLesen;
 static unsigned fn = F_ALLE;   // functions switched on
 static const int stufen[] = { 3300, 3600, 3900, 4200, 4500 };   // clock cap steps, MHz; the first one is taken after a hot spot
 #define NSTUFEN 5
@@ -82,7 +82,7 @@ static unsigned load_settings(void)
     if (GetFileAttributesW(iniFile) == INVALID_FILE_ATTRIBUTES) {
         static const char def[] =
             "; evo-x2-cool settings, re-read within 5 s after a change\r\n"
-            "[Regler]\r\nZiel=80\r\nMinProzent=30\r\nMinLeerlauf=10\r\nMaxProzent=70\r\nSpitze=88\r\nSicherMHz=3600\r\nSprache=de\r\n\r\n"
+            "[Regler]\r\nZiel=80\r\nMinProzent=30\r\nMinLeerlauf=10\r\nMaxProzent=70\r\nSpitze=88\r\nAchtung=90\r\nAlarm=95\r\nSicherMHz=3600\r\nSprache=de\r\n\r\n"
             "; 1 = on, 0 = off. The emergency (fan 100 % when overheating) always stays on.\r\n"
             "[Funktionen]\r\nLuefter=1\r\nTaktbremse=1\r\nEcLeise=1\r\nLernen=1\r\nVorhersage=1\r\n\r\n"
             "; window: Thema = system / hell / dunkel; UpdatePruefen = 1: ask GitHub once a day for a newer version (only shown, nothing installed)\r\n"
@@ -99,17 +99,23 @@ static unsigned load_settings(void)
     minLeer = GetPrivateProfileIntW(L"Regler", L"MinLeerlauf", 10, iniFile);
     maxP = GetPrivateProfileIntW(L"Regler", L"MaxProzent", 70, iniFile);
     spitze = GetPrivateProfileIntW(L"Regler", L"Spitze", 88, iniFile);
+    achtung = GetPrivateProfileIntW(L"Regler", L"Achtung", 90, iniFile);
+    alarm = GetPrivateProfileIntW(L"Regler", L"Alarm", 95, iniFile);
     sicherMhz = GetPrivateProfileIntW(L"Regler", L"SicherMHz", 3600, iniFile);
     // sane limits, whatever is in the file
     ziel = ziel < 50 ? 50 : ziel > 92 ? 92 : ziel; minP = minP < 0 ? 0 : minP > 100 ? 100 : minP;
     minLeer = minLeer < 0 ? 0 : minLeer > minP ? minP : minLeer;
     maxP = maxP < minP ? minP : maxP > 100 ? 100 : maxP; spitze = spitze < 70 ? 70 : spitze > 95 ? 95 : spitze;
+    // green < yellow < red, at least 2 °C apart; red at most 97 °C (the freezes came at ~100 °C)
+    alarm = alarm < 80 ? 80 : alarm > 97 ? 97 : alarm;
+    achtung = achtung < 70 ? 70 : achtung > alarm - 2 ? alarm - 2 : achtung;
+    if (ziel > achtung - 2) ziel = (float)(achtung - 2);
     GetPrivateProfileStringW(L"Regler", L"Sprache", L"de", code, 16, iniFile);
     wchar_t lf[MAX_PATH]; swprintf(lf, MAX_PATH, L"%s\\sprache-%s.ini", exeDir, code);
     if (wcscmp(lf, langFile)) { wcscpy(langFile, lf); nLang = 0; }
     unsigned old = fn; fn = 0;
     for (int i = 0; i < EVO_NFUNK; i++) if (GetPrivateProfileIntW(L"Funktionen", evoFunkKey[i], 1, iniFile)) fn |= 1u << i;
-    if (sh) { sh->ziel = ziel; sh->minP = minP; sh->maxP = maxP; sh->spitze = spitze; sh->funktionen = nurLesen ? 0 : fn; }
+    if (sh) { sh->ziel = ziel; sh->minP = minP; sh->maxP = maxP; sh->spitze = spitze; sh->achtung = achtung; sh->alarm = alarm; sh->funktionen = nurLesen ? 0 : fn; }
     return old;
 }
 
@@ -518,7 +524,7 @@ static int run(void)
     int modusOrig = ec_read(0x31), modusJetzt = modusOrig;
     if (modusOrig == 2 || modusOrig < 0) modusOrig = 0;   // "leise" at start is most likely left over from a killed run
     if (sh) {
-        sh->nurLesen = nurLesen; sh->funktionen = nurLesen ? 0 : fn; sh->ziel = ziel; sh->minP = minP; sh->maxP = maxP; sh->spitze = spitze;
+        sh->nurLesen = nurLesen; sh->funktionen = nurLesen ? 0 : fn; sh->ziel = ziel; sh->minP = minP; sh->maxP = maxP; sh->spitze = spitze; sh->achtung = achtung; sh->alarm = alarm;
         sh->versatz = versatz; sh->felder = felder();
         for (int i = 0; i < 3; i++) sh->deckel[i] = stufen[lage[i].stufe];
     }
@@ -722,18 +728,18 @@ static int run(void)
         if (k >= 15) { if (emaT > ziel + 1) boost = fminf(40, boost + 1); else if (emaT < ziel - 3) boost = fmaxf(0, boost - 1); }
         float wantD = fminf((float)maxP, need + boost);
         int grund = boost >= 1 ? GRUND_NACHREGELN : (fn & F_VORHERSAGE) && pv > pSlow + 5 ? GRUND_VORHERSAGE : GRUND_MODELL;
-        // two stages above the noise limit. Yellow (smoothed CPU or case sensor >= 90 °C, off below 88; a 1-s boost spike is
+        // two stages above the noise limit. Yellow (smoothed CPU or case sensor >= Achtung, default 90 °C, off 2 °C below; a 1-s boost spike is
         // the clock brake's job): the fan climbs by 2 %/s,
-        // also beyond MaxProzent, as long as it stays there. Red (CPU >= 95 °C for 3 s or case sensor >= 95 °C): 100 % at once.
+        // also beyond MaxProzent, as long as it stays there. Red (CPU >= Alarm, default 95 °C, for 3 s or case sensor >= Alarm): 100 % at once.
         // Before, the emergency came at a case temperature of 90 °C and always jumped to full: machine 2 pumped 22 times
         // in 70 min at CPU 90-93 °C; with red from 95 °C it would have been 3 times (replay of its log).
         static int gelb, warGelb;
-        if (emaT >= EVO_GELB || Te >= EVO_GELB) gelb = 1; else if (emaT < EVO_GELB - 2 && Te < EVO_GELB - 2) gelb = 0;
+        if (emaT >= achtung || Te >= achtung) gelb = 1; else if (emaT < achtung - 2 && Te < achtung - 2) gelb = 0;
         if (gelb && !warGelb && !nurLesen && (fn & F_LUEFTER)) event(L_("achtung", "Achtung: CPU %.0f °C, Gehäuse %d °C → Lüfter steigt"), T, Te);
         warGelb = gelb;
         if (gelb) { wantD = fmaxf(wantD, fminf(100, d + 2)); grund = GRUND_ACHTUNG; }
-        if (T >= EVO_ROT) hot++; else if (hot > 0) hot--;
-        if (hot >= 3 || Te >= EVO_ROT) { wantD = 100; grund = GRUND_NOTFALL; }
+        if (T >= alarm) hot++; else if (hot > 0) hot--;
+        if (hot >= 3 || Te >= alarm) { wantD = 100; grund = GRUND_NOTFALL; }
         if (grund == GRUND_NOTFALL && !warNotfall && !nurLesen) event2(1, L_("notfall", "NOTFALL: CPU %.0f °C, Gehäuse %d °C → Lüfter 100 %%"), T, Te);
         // up: a prediction raises by at most 4 %/s (jumping 30 -> 70 % is loud, the fan needs ~10 s per step anyway),
         // only 1 %/s while the chip is still far below the target (a short burst then hardly reaches the fan),
