@@ -459,10 +459,11 @@ static void write_curve(int d, float teSmooth, int check)
     curveD = d; curveSys = s; curveAnchor = teSmooth;
 }
 
-// duty % the written curve gives at EC temperature t: pwm up to start, then linear to 100 % at full; -1 = BIOS curve
-static int curve_duty(int t)
+// duty % the written curve gives at EC temperature t: pwm up to start, then linear to 100 % at full; -1 = BIOS curve.
+// b = 0: CPU fans (block 0x60), b = 6: system fan (block 0x66)
+static int curve_duty(int t, int b)
 {
-    int s = curveReg[2], f = curveReg[3], p = curveReg[4];
+    int s = curveReg[b + 2], f = curveReg[b + 3], p = curveReg[b + 4];
     if (curveD < 0 || s < 0 || f <= s || p < 0) return -1;
     return t <= s ? p : t >= f ? 100 : p + (100 - p) * (t - s) / (f - s);
 }
@@ -766,7 +767,8 @@ static int run(void)
             s->ecT = (int16_t)Te; s->busy = (int16_t)busy; s->gpuLoad = (int16_t)gL; s->gpuT = (int16_t)gT; s->fan = (int16_t)(nurLesen ? -1 : curveD);
             s->cap = (int16_t)capNow; s->rpm[0] = (int16_t)r1; s->rpm[1] = (int16_t)r2; s->rpm[2] = (int16_t)r3;
             s->lage = (uint8_t)lg; s->modus = (uint8_t)ec[3]; s->grund = (uint8_t)grund; s->leise = modusJetzt == 2;
-            s->ecFan = (int16_t)(nurLesen || Te < 0 ? -1 : curve_duty(Te));
+            s->ecFan = (int16_t)(nurLesen || Te < 0 ? -1 : curve_duty(Te, 0));
+            s->sysEc = (int16_t)(nurLesen || Te < 0 ? -1 : curve_duty(Te, 6)); s->sysFan = (int16_t)(nurLesen ? -1 : curveSys);
             sh->nSample++;
             if (k % 60 == 0) { sh->versatz = versatz; sh->felder = felder(); for (int i = 0; i < 3; i++) sh->deckel[i] = stufen[lage[i].stufe]; }
         }

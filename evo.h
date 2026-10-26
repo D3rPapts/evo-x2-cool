@@ -9,7 +9,7 @@
 #define EVO_VERSION_W L"0.5.1"
 #define EVO_SHM    L"Global\\evo-x2-cool"
 #define EVO_STOPP  L"Global\\evo-x2-cool-stopp"   // set it and the controller restores everything and ends (service too)
-#define EVO_MAGIC  0x45564F32u   // "EVO2"
+#define EVO_MAGIC  0x45564F33u   // "EVO3", changes with the layout below so an old window does not misread a new controller
 #define EVO_N      7200          // samples kept: 2 hours at 1 s
 #define EVO_EV     256           // events kept
 
@@ -45,7 +45,8 @@ typedef struct {
     float mhz, load;                    // highest effective clock, CPU load %
     int16_t ecT, busy, gpuLoad, gpuT, fan, cap, rpm[3];   // fan = duty % the controller asked for
     uint8_t lage, modus, grund, leise;  // modus = EC power mode register 0x31
-    int16_t ecFan;                      // duty % the written EC curve gives at the current EC temperature, -1 = BIOS curve (fills padding, size unchanged)
+    int16_t ecFan, sysFan, sysEc;       // duty % the written EC curve gives at the current EC temperature (CPU fans), duty asked for
+                                        // the system fan and what its curve gives; -1 = BIOS curve
 } EvoSample;
 
 typedef struct { int64_t t; uint8_t wichtig; char text[119]; } EvoEvent;   // wichtig = hot spot / emergency, shown red; text UTF-8

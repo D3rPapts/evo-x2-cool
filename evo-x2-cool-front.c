@@ -200,17 +200,22 @@ static float gCore(const EvoSample *s) { return s->coreW; }
 static float gGpu(const EvoSample *s) { return s->gpuW; }
 static float gPkg(const EvoSample *s) { return s->pkgW; }
 static float gFan(const EvoSample *s) { return (float)s->fan; }
-// fan 1 speed as duty %, from a calibration on a 64 GB EVO-X2 (10 % = 1500, 20 % = 1850, 30 % = 2230, 50 % = 2890,
-// 70 % = 3450, 100 % = 4210 U/min; 10 % confirmed on the 128 GB one), so the measured line is directly comparable with the target
-static float gRpm(const EvoSample *s)
+// fan speed as duty %, so the measured line is directly comparable with the target. Calibration on a 64 GB EVO-X2 at
+// 0/10/20/30/50/70/100 % (median rpm at a steady duty from the logs; 10 % on CPU fan 1 confirmed on the 128 GB one).
+// The system fan stalls below ~15 % and sometimes reads 8000 rpm when it stops: that is no value.
+static float rpmPct(int r, const float rpm[7])
 {
-    static const float rpm[7] = { 0, 1500, 1850, 2230, 2890, 3450, 4210 }, pct[7] = { 0, 10, 20, 30, 50, 70, 100 };
-    float r = s->rpm[0];
-    if (r < 0) return -1;
+    static const float pct[7] = { 0, 10, 20, 30, 50, 70, 100 };
+    if (r < 0 || r > 6000) return -1;
     for (int i = 1; i < 7; i++) if (r <= rpm[i]) return pct[i - 1] + (r - rpm[i - 1]) / (rpm[i] - rpm[i - 1]) * (pct[i] - pct[i - 1]);
     return 100;
 }
+static float gRpm1(const EvoSample *s) { static const float r[7] = { 0, 1500, 1850, 2230, 2890, 3450, 4210 }; return rpmPct(s->rpm[0], r); }
+static float gRpm2(const EvoSample *s) { static const float r[7] = { 0, 1200, 1670, 2000, 2770, 3160, 4015 }; return rpmPct(s->rpm[1], r); }
+static float gRpm3(const EvoSample *s) { static const float r[7] = { 0, 200, 414, 630, 1090, 1281, 1850 }; return rpmPct(s->rpm[2], r); }
 static float gEcFan(const EvoSample *s) { return s->fan < 0 || s->ecFan < 0 ? -1 : (float)s->ecFan; }
+static float gSysFan(const EvoSample *s) { return (float)s->sysFan; }
+static float gSysEc(const EvoSample *s) { return s->sysFan < 0 || s->sysEc < 0 ? -1 : (float)s->sysEc; }
 static float gCap(const EvoSample *s) { return s->cap > 0 ? (float)s->cap : -1; }
 static float gMhz(const EvoSample *s) { return s->mhz; }
 
@@ -343,18 +348,23 @@ static void paint(HWND w, HDC dc)
     float tmin = 30, tmax = 100;
     for (uint32_t i = 0; i < count; i++) { const EvoSample *s = sample(i); if (s->tctl > tmax) tmax = s->tctl; if (s->tctl > 0 && s->tctl < tmin) tmin = s->tctl; }
     tmax = (float)((int)((tmax + 9.99f) / 10) * 10); tmin = (float)((int)(tmin / 10) * 10);
-    Chart cs[4] = {
+    const wchar_t *lIst = T(L"l_ist", L"Ist (aus Drehzahl)"), *lEc = T(L"l_ecfan", L"EC-Kurve (mit Aufschlag)"), *lSoll = T(L"l_soll", L"Soll");
+    Chart cs[6] = {
         { T(L"c_temp", L"Temperatur °C"), tmin, tmax, 10, { { gVorh, C_DIM, 1, T(L"l_erwartet", L"erwartet") }, { gEc, C_WARM, 1, T(L"l_ec", L"Gehäuse-Fühler (EC)") },
                                            { gTctl, C_RAW, 1, T(L"l_roh", L"CPU roh") }, { gGlatt, C_HOT, S(2), T(L"l_glatt", L"CPU geglättet (Regelgröße)") } } },
         { T(L"c_power", L"Leistung W"), 0, pmax, pmax / 4, { { gPkg, C_PKG, 1, T(L"l_chip", L"ganzer Chip") }, { gGpu, RGB(165, 124, 255), S(2), T(L"l_gpu", L"Grafik") },
                                               { gCore, RGB(78, 161, 255), S(2), T(L"l_kerne", L"Kerne") } } },
-        { T(L"c_fan", L"Lüfter %"), 0, 100, 25, { { gRpm, C_RPM, 1, T(L"l_ist", L"Ist (aus Drehzahl)") }, { gEcFan, C_WARM, 1, T(L"l_ecfan", L"EC-Kurve (mit Aufschlag)") },
-                                         { gFan, C_FAN, S(2), T(L"l_soll", L"Soll") } } },
         { T(L"c_clock", L"CPU-Takt MHz"), 0, 6000, 1500, { { gMhz, C_MHZ, 1, T(L"l_kern", L"schnellster Kern (Mittel je Sekunde)") }, { gCap, C_CAP, S(2), T(L"l_bremse", L"Taktbremse") } } },
+        // one chart per fan at the bottom, smaller: CPU fans 1 and 2 share the curve (block 0x60), the system fan has its own (0x66)
+        { T(L"c_fan1", L"CPU-Lüfter 1 %"), 0, 100, 50, { { gRpm1, C_RPM, 1, lIst }, { gEcFan, C_WARM, 1, lEc }, { gFan, C_FAN, S(2), lSoll } } },
+        { T(L"c_fan2", L"CPU-Lüfter 2 %"), 0, 100, 50, { { gRpm2, C_RPM, 1, lIst }, { gEcFan, C_WARM, 1, lEc }, { gFan, C_FAN, S(2), lSoll } } },
+        { T(L"c_fan3", L"Systemlüfter (SSD, WLAN) %"), 0, 100, 50, { { gRpm3, C_RPM, 1, lIst }, { gSysEc, C_WARM, 1, lEc }, { gSysFan, C_FAN, S(2), lSoll } } },
     };
-    int ch = (charts.bottom - charts.top - 3 * gap) / 4;
-    for (int i = 0; i < 4; i++) {
-        RECT r = { charts.left, charts.top + i * (ch + gap), charts.right, charts.top + i * (ch + gap) + ch };
+    static const int weight[6] = { 3, 3, 3, 2, 2, 2 };   // the three fan charts get 2/3 of the height of the others
+    int unit = (charts.bottom - charts.top - 5 * gap) / 15, cy = charts.top;
+    for (int i = 0; i < 6; i++) {
+        RECT r = { charts.left, cy, charts.right, i == 5 ? charts.bottom : cy + weight[i] * unit };
+        cy = r.bottom + gap;
         chart(dc, r, &cs[i]);
         if (i == 0) {   // target and hot-spot lines
             RECT p = { plot.left, r.top + S(20), plot.right, r.bottom };
@@ -390,8 +400,8 @@ static void paint(HWND w, HDC dc)
         wchar_t tip[4][80];
         swprintf(tip[0], 80, T(L"tip0", L"CPU %.1f °C (geglättet %.1f) · Gehäuse %d °C"), at->tctl, at->tglatt, at->ecT);
         swprintf(tip[1], 80, T(L"tip1", L"Kerne %.1f W · Grafik %.0f W · Chip %.0f W"), at->coreW, at->gpuW, at->pkgW);
-        if (at->fan >= 0) swprintf(tip[2], 80, T(L"tip2", L"Lüfter %d %% %s · %d U/min"), at->fan, grundText(at->grund), at->rpm[0]);
-        else swprintf(tip[2], 80, T(L"tip2b", L"Lüfter BIOS · %d U/min"), at->rpm[0]);
+        if (at->fan >= 0) swprintf(tip[2], 80, T(L"tip2", L"Lüfter %d %% %s · %d / %d / %d U/min"), at->fan, grundText(at->grund), at->rpm[0], at->rpm[1], at->rpm[2]);
+        else swprintf(tip[2], 80, T(L"tip2b", L"Lüfter BIOS · %d / %d / %d U/min"), at->rpm[0], at->rpm[1], at->rpm[2]);
         swprintf(tip[3], 80, T(L"tip3", L"Bremse %d MHz · Kern %.0f MHz · %s"), at->cap, at->mhz, lageText(at->lage));
         int tw2 = 0; SelectObject(dc, fSmall);
         for (int i = 0; i < 4; i++) { SIZE sz; GetTextExtentPoint32W(dc, tip[i], (int)wcslen(tip[i]), &sz); if (sz.cx > tw2) tw2 = sz.cx; }
