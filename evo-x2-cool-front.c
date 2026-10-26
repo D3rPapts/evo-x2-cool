@@ -141,6 +141,7 @@ static const wchar_t *grundText(int i)
     case GRUND_NACHREGELN: return T(L"grund2", L"nachgeregelt");
     case GRUND_NOTFALL: return T(L"grund3", L"NOTFALL");
     case GRUND_NUR_LESEN: return T(L"grund4", L"nur lesen");
+    case GRUND_ACHTUNG: return T(L"grund5", L"Achtung, steigt");
     default: return T(L"grund0", L"nach Modell");
     }
 }
@@ -319,7 +320,7 @@ static void paint(HWND w, HDC dc)
     int tw = (rc.right - 2 * pad - 5 * gap) / 6;
     for (int i = 0; i < 6; i++) {
         RECT t = { pad + i * (tw + gap), pad, pad + i * (tw + gap) + tw, pad + tileH };
-        tile(dc, t, labels[i], i == 0 ? tc : at->grund == GRUND_NOTFALL && i == 2 ? C_HOT : C_TEXT, v[i], sub[i]);
+        tile(dc, t, labels[i], i == 0 ? tc : at->grund == GRUND_NOTFALL && i == 2 ? C_HOT : at->grund == GRUND_ACHTUNG && i == 2 ? C_WARM : C_TEXT, v[i], sub[i]);
     }
 
     // ---- span buttons and status ----
@@ -379,7 +380,7 @@ static void paint(HWND w, HDC dc)
     fill(dc, strip, C_CARD, 0);
     for (uint32_t i = 0; i < count; i++) {
         const EvoSample *s = sample(i);
-        COLORREF c = s->grund == GRUND_NOTFALL ? C_HOT : s->lage == LAGE_GRAFIK ? C_GRAFIK : s->lage == LAGE_VIELE ? C_VIELE : C_CARD;
+        COLORREF c = s->grund == GRUND_NOTFALL ? C_HOT : s->grund == GRUND_ACHTUNG ? C_CAP : s->lage == LAGE_GRAFIK ? C_GRAFIK : s->lage == LAGE_VIELE ? C_VIELE : C_CARD;
         if (c == C_CARD) continue;
         int x0 = i ? xOf(strip, i - 1) : xOf(strip, 0) - 1, x1 = xOf(strip, i);
         RECT t = { x0, strip.top, x1 > x0 ? x1 : x0 + 1, strip.bottom };
@@ -460,11 +461,12 @@ static void paint(HWND w, HDC dc)
         ey += S(16) + h + S(10);
     }
     // what the colours of the strip under the curves mean
-    int lx2 = ev.left + S(14), ly = ev.bottom - S(28);
+    int lx2 = ev.left + S(14), ly = ev.bottom - S(44);   // two rows: load type, then the warning stages
     text(dc, fSmall, lx2, ly - S(18), C_DIM, 0, L"%s", T(L"streifen", L"Farbstreifen unten = Lastart:"));
-    const COLORREF lc[3] = { C_GRAFIK, C_VIELE, C_HOT };
-    const wchar_t *ln[3] = { T(L"s_gpu", L"Grafik arbeitet"), T(L"s_viele", L"viele Kerne"), T(L"s_notfall", L"Notfall") };
-    for (int i = 0; i < 3; i++) {
+    const COLORREF lc[4] = { C_GRAFIK, C_VIELE, C_CAP, C_HOT };
+    const wchar_t *ln[4] = { T(L"s_gpu", L"Grafik arbeitet"), T(L"s_viele", L"viele Kerne"), T(L"s_achtung", L"Achtung"), T(L"s_notfall", L"Notfall") };
+    for (int i = 0; i < 4; i++) {
+        if (i == 2) { lx2 = ev.left + S(14); ly += S(16); }
         RECT q = { lx2, ly + S(3), lx2 + S(10), ly + S(13) }; fill(dc, q, lc[i], 0);
         lx2 += S(16) + text(dc, fSmall, lx2 + S(14), ly, C_DIM, 0, L"%s", ln[i]) + S(10);
     }

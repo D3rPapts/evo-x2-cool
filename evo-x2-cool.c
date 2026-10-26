@@ -722,9 +722,18 @@ static int run(void)
         if (k >= 15) { if (emaT > ziel + 1) boost = fminf(40, boost + 1); else if (emaT < ziel - 3) boost = fmaxf(0, boost - 1); }
         float wantD = fminf((float)maxP, need + boost);
         int grund = boost >= 1 ? GRUND_NACHREGELN : (fn & F_VORHERSAGE) && pv > pSlow + 5 ? GRUND_VORHERSAGE : GRUND_MODELL;
-        // emergency above the noise limit
-        if (T >= 96) hot++; else if (hot > 0) hot--;
-        if (hot >= 5 || Te >= 90) { wantD = 100; grund = GRUND_NOTFALL; }
+        // two stages above the noise limit. Yellow (smoothed CPU or case sensor >= 90 °C, off below 88; a 1-s boost spike is
+        // the clock brake's job): the fan climbs by 2 %/s,
+        // also beyond MaxProzent, as long as it stays there. Red (CPU >= 95 °C for 3 s or case sensor >= 95 °C): 100 % at once.
+        // Before, the emergency came at a case temperature of 90 °C and always jumped to full: machine 2 pumped 22 times
+        // in 70 min at CPU 90-93 °C; with red from 95 °C it would have been 3 times (replay of its log).
+        static int gelb, warGelb;
+        if (emaT >= EVO_GELB || Te >= EVO_GELB) gelb = 1; else if (emaT < EVO_GELB - 2 && Te < EVO_GELB - 2) gelb = 0;
+        if (gelb && !warGelb && !nurLesen && (fn & F_LUEFTER)) event(L_("achtung", "Achtung: CPU %.0f °C, Gehäuse %d °C → Lüfter steigt"), T, Te);
+        warGelb = gelb;
+        if (gelb) { wantD = fmaxf(wantD, fminf(100, d + 2)); grund = GRUND_ACHTUNG; }
+        if (T >= EVO_ROT) hot++; else if (hot > 0) hot--;
+        if (hot >= 3 || Te >= EVO_ROT) { wantD = 100; grund = GRUND_NOTFALL; }
         if (grund == GRUND_NOTFALL && !warNotfall && !nurLesen) event2(1, L_("notfall", "NOTFALL: CPU %.0f °C, Gehäuse %d °C → Lüfter 100 %%"), T, Te);
         // up: a prediction raises by at most 4 %/s (jumping 30 -> 70 % is loud, the fan needs ~10 s per step anyway),
         // only 1 %/s while the chip is still far below the target (a short burst then hardly reaches the fan),
@@ -734,7 +743,7 @@ static int run(void)
         // controller keeps the fan until it is down at its wanted value, then the BIOS curve takes over again.
         static int nachNotfall;
         float auf = T < ziel - 8 && emaT < ziel - 8 ? 1.0f : 4.0f;
-        if (wantD >= d) { d = grund == GRUND_NOTFALL || emaT >= ziel + 5 ? wantD : fminf(wantD, d + auf); lowSince = -1; nachNotfall = 0; }
+        if (wantD >= d) { d = grund == GRUND_NOTFALL || grund == GRUND_ACHTUNG || emaT >= ziel + 5 ? wantD : fminf(wantD, d + auf); lowSince = -1; nachNotfall = 0; }
         else if (warNotfall || nachNotfall) { d = fmaxf(wantD, d - 1); nachNotfall = d > wantD; lowSince = -1; }
         else { if (lowSince < 0) lowSince = k; if (k - lowSince >= 10) d = fmaxf(wantD, d - 3); }
         warNotfall = grund == GRUND_NOTFALL;
@@ -751,6 +760,7 @@ static int run(void)
         if (ssdT >= 55) { int m = 30 + 5 * (ssdT - 55); sw = sw > m ? sw : m > 100 ? 100 : m; }
         sysWant = sw;
         int fanOn = !nurLesen && ((fn & F_LUEFTER) || grund == GRUND_NOTFALL || nachNotfall);   // the emergency takes over even when switched off
+        // (yellow does not: switched off, the BIOS curve is already at full from 85 °C)
         if (fanOn && (abs(di - curveD) >= 2 || abs(sysWant - curveSys) >= 2 || fabsf(emaTe - curveAnchor) > 3)) write_curve(di, emaTe, 0);
         else if (fanOn && k % 60 == 30 && curveD >= 0) write_curve(curveD, curveAnchor, 1);
         else if (!fanOn && curveD >= 0) restore_bios(orig);
@@ -759,7 +769,7 @@ static int run(void)
         // --- record (Prozent = duty really written, -1 = BIOS curve; Regler_Prozent = what the controller wants, also when switched off) ---
         int r1 = ec[1] < 0 || ec[2] < 0 ? -1 : ec[1] << 8 | ec[2], r2 = ec[4] < 0 || ec[5] < 0 ? -1 : ec[4] << 8 | ec[5], r3 = ec[6] < 0 || ec[7] < 0 ? -1 : ec[6] << 8 | ec[7];
         float vorh = predict(pv, (float)(curveD >= 0 ? curveD : di), mFast);
-        static const char *grundName[] = { "modell", "vorhersage", "nachregeln", "NOTFALL", "nur-lesen" };
+        static const char *grundName[] = { "modell", "vorhersage", "nachregeln", "NOTFALL", "nur-lesen", "achtung" };
         if (sh) {
             EvoSample *s = &sh->s[sh->nSample % EVO_N];
             s->t = time(0); s->tctl = T; s->tglatt = emaT; s->vorhersage = vorh; s->pkgW = (float)pkgW; s->coreW = (float)sumW; s->maxCoreW = (float)maxW;

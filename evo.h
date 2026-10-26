@@ -14,7 +14,9 @@
 #define EVO_EV     256           // events kept
 
 enum { LAGE_WENIGE, LAGE_VIELE, LAGE_GRAFIK };
-enum { GRUND_MODELL, GRUND_VORHERSAGE, GRUND_NACHREGELN, GRUND_NOTFALL, GRUND_NUR_LESEN };
+enum { GRUND_MODELL, GRUND_VORHERSAGE, GRUND_NACHREGELN, GRUND_NOTFALL, GRUND_NUR_LESEN, GRUND_ACHTUNG };
+#define EVO_GELB 90   // yellow (attention) from here, CPU or case sensor: the fan climbs steadily, also above MaxProzent
+#define EVO_ROT  95   // red (emergency) from here: fan 100 % at once
 
 // functions that can be switched off in einstellungen.ini, section [Funktionen] (1 = on). The emergency (fan 100 %
 // when overheating) cannot be switched off: it takes over even while the fan control is off.
