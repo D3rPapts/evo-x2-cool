@@ -298,7 +298,7 @@ static void csv_line(const char *line)
         csvDay = st.wDay;
         if (GetFileSize(csv, 0) == 0) {
             static const char h[] = "Zeit;Tctl;Tctl_glatt;EC_C;Paket_W;Kerne_W;Kern_max_W;GPU_W;APU_W;Waerme_W;P_vorher;Takt_max_MHz;CPU_Last;"
-                                    "Kerne_aktiv;GPU_Last;GPU_C;Prozent;Grund;L1;L2;Sys;Vorhersage_C;Versatz;Felder;Deckel_MHz;Lage;Modus\r\n";
+                                    "Kerne_aktiv;GPU_Last;GPU_C;Prozent;Grund;L1;L2;Sys;Vorhersage_C;Versatz;Felder;Deckel_MHz;Lage;Modus;Regler_Prozent\r\n";
             WriteFile(csv, h, sizeof h - 1, &w, 0);
         }
     }
@@ -743,7 +743,7 @@ static int run(void)
         else if (!fanOn && curveD >= 0) restore_bios(orig);
         if (nurLesen) grund = GRUND_NUR_LESEN;
 
-        // --- record ---
+        // --- record (Prozent = duty really written, -1 = BIOS curve; Regler_Prozent = what the controller wants, also when switched off) ---
         int r1 = ec[1] < 0 || ec[2] < 0 ? -1 : ec[1] << 8 | ec[2], r2 = ec[4] < 0 || ec[5] < 0 ? -1 : ec[4] << 8 | ec[5], r3 = ec[6] < 0 || ec[7] < 0 ? -1 : ec[6] << 8 | ec[7];
         float vorh = predict(pv, (float)(curveD >= 0 ? curveD : di), mFast);
         static const char *grundName[] = { "modell", "vorhersage", "nachregeln", "NOTFALL", "nur-lesen" };
@@ -759,9 +759,9 @@ static int run(void)
         }
         SYSTEMTIME st; GetLocalTime(&st);
         char line[400];
-        snprintf(line, sizeof line, "%02d:%02d:%02d;%.1f;%.1f;%d;%.1f;%.1f;%.1f;%.0f;%d;%.1f;%.1f;%.0f;%.0f;%d;%d;%d;%d;%s;%d;%d;%d;%.1f;%.2f;%d;%d;%s;%d\r\n",
+        snprintf(line, sizeof line, "%02d:%02d:%02d;%.1f;%.1f;%d;%.1f;%.1f;%.1f;%.0f;%d;%.1f;%.1f;%.0f;%.0f;%d;%d;%d;%d;%s;%d;%d;%d;%.1f;%.2f;%d;%d;%s;%d;%d\r\n",
                  st.wHour, st.wMinute, st.wSecond, T, emaT, Te, pkgW, sumW, maxW, G, aW, heat, pv, maxMhz, load, busy, gL, gT,
-                 nurLesen ? -1 : curveD, grundName[grund], r1, r2, r3, vorh, versatz, felder(), capNow, lageName[lg], ec[3]);
+                 nurLesen ? -1 : curveD, grundName[grund], r1, r2, r3, vorh, versatz, felder(), capNow, lageName[lg], ec[3], nurLesen ? -1 : di);
         csv_line(line);
         if (console) printf("\r%02d:%02d:%02d  Tctl %5.1f (glatt %5.1f)  EC %3d  Kerne %5.1f W  GPU %5.1f W  -> Luefter %3d %% [%s] %d U/min  Takt %d MHz [%s]   ",
                             st.wHour, st.wMinute, st.wSecond, T, emaT, Te, sumW, G, nurLesen ? -1 : curveD, grundName[grund], r1, capNow, lageName[lg]);
