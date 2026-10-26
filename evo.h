@@ -9,11 +9,11 @@
 #define EVO_VERSION_W L"0.5.2"
 #define EVO_SHM    L"Global\\evo-x2-cool"
 #define EVO_STOPP  L"Global\\evo-x2-cool-stopp"   // set it and the controller restores everything and ends (service too)
-#define EVO_MAGIC  0x45564F34u   // "EVO4", changes with the layout below so an old window does not misread a new controller
+#define EVO_MAGIC  0x45564F35u   // "EVO5", changes with the layout below so an old window does not misread a new controller
 #define EVO_N      7200          // samples kept: 2 hours at 1 s
 #define EVO_EV     256           // events kept
 
-enum { LAGE_WENIGE, LAGE_VIELE, LAGE_GRAFIK };
+enum { LAGE_WENIGE, LAGE_VIELE, LAGE_GRAFIK, LAGE_BEIDE, EVO_NLAGE };   // BEIDE = GPU busy and many cores
 enum { GRUND_MODELL, GRUND_VORHERSAGE, GRUND_NACHREGELN, GRUND_NOTFALL, GRUND_NUR_LESEN, GRUND_ACHTUNG };
 
 // functions that can be switched off in einstellungen.ini, section [Funktionen] (1 = on). The emergency (fan 100 %
@@ -58,7 +58,7 @@ typedef struct {
     float ziel; int32_t minP, maxP, spitze;
     int32_t achtung, alarm;             // yellow: fan climbs steadily; red: fan 100 % at once (°C)
     float versatz; int32_t felder;      // learned model: overall offset, number of learned cells
-    int32_t deckel[3];                  // learned clock cap per situation (MHz)
+    int32_t deckel[EVO_NLAGE];          // learned clock cap per situation (MHz)
     volatile uint32_t nSample, nEvent;  // totals written; slot = n % EVO_N / EVO_EV
     EvoSample s[EVO_N];
     EvoEvent e[EVO_EV];

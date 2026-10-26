@@ -48,8 +48,12 @@
 // ---------- settings (einstellungen.ini) ----------
 static float ziel = 80; static int minP = 30, minLeer = 10, maxP = 70, spitze = 88, achtung = 90, alarm = 95, sicherMhz = 3600, nurLesen;
 static unsigned fn = F_ALLE;   // functions switched on
-static const int stufen[] = { 3300, 3600, 3900, 4200, 4500 };   // clock cap steps, MHz; the first one is taken after a hot spot
-#define NSTUFEN 5
+static const int stufen[] = { 2400, 3000, 3300, 3600, 3900, 4200, 4500 };   // clock cap steps, MHz
+#define NSTUFEN 7
+// lowest step per situation, also the cap for 30 s after a hot spot: 3300 MHz, but 2400 with the GPU busy and many cores
+// at the same time. There the cores take power from the GPU at the same 85 W, the heat sits on a small spot, and Tctl
+// jumped from 80 to 91-97 °C within 5-10 s even at 3300 MHz (machine 2, five emergencies in 4 h with the controller on).
+static const int unten[EVO_NLAGE] = { 2, 2, 2, 0 };
 static const float tau = 40;   // thermal time constant of the heatsink, s
 
 static HANDLE hCpu, hEc, mPci, mEc, stopEv;
@@ -324,7 +328,7 @@ static void csv_line(const char *line)
 #define ND 11
 static struct { float r; int n; } cell[NP][ND];
 static float versatz;
-static const char *lageName[3] = { "wenige", "viele", "grafik" };   // keys in modell.txt
+static const char *lageName[EVO_NLAGE] = { "wenige", "viele", "grafik", "beide" };   // keys in modell.txt
 static const char *funk_text(int i)
 {
     switch (i) {
@@ -335,10 +339,14 @@ static const char *funk_text(int i)
     default: return L_("f4", "Vorhersage");
     }
 }
-static const char *lage_text(int i) { return i == LAGE_WENIGE ? L_("lage0", "wenige Kerne aktiv") : i == LAGE_VIELE ? L_("lage1", "viele Kerne aktiv") : L_("lage2", "Grafik arbeitet (oder kühlt danach ab)"); }
+static const char *lage_text(int i)
+{
+    return i == LAGE_WENIGE ? L_("lage0", "wenige Kerne aktiv") : i == LAGE_VIELE ? L_("lage1", "viele Kerne aktiv")
+         : i == LAGE_BEIDE ? L_("lage3", "Grafik + viele Kerne") : L_("lage2", "Grafik arbeitet (oder kühlt danach ab)");
+}
 // per situation: current cap step, calm seconds earned at that cap, highest temperature since, and how many hot spots
 // each step has caused. A step that caused hot spots is tried again only after a longer calm run: 10 min, 1 h, 1 day.
-static struct { int stufe, ruhig, spitze, fehl[NSTUFEN]; } lage[3];
+static struct { int stufe, ruhig, spitze, fehl[NSTUFEN]; } lage[EVO_NLAGE];
 static int wartezeit(int fehl) { return fehl <= 0 ? 600 : fehl == 1 ? 3600 : 86400; }
 
 static int pk(float p) { int k = (int)lroundf(p / 10); return k < 0 ? 0 : k >= NP ? NP - 1 : k; }
@@ -372,6 +380,7 @@ static void load_model(void)
 {
     wchar_t p[MAX_PATH]; char line[128], name[16]; int a, b, n, m; float r;
     lage[LAGE_WENIGE].stufe = stufe_von(4200); lage[LAGE_VIELE].stufe = stufe_von(3600); lage[LAGE_GRAFIK].stufe = stufe_von(3600);
+    lage[LAGE_BEIDE].stufe = stufe_von(3000);
     swprintf(p, MAX_PATH, L"%s\\modell.txt", dataDir);
     FILE *f = _wfopen(p, L"r");
     if (!f) return;
@@ -380,8 +389,8 @@ static void load_model(void)
         if (sscanf(line, "skala %d", &m) == 1) skala = m;
         else if (sscanf(line, "versatz %f", &r) == 1) { if (skala == SKALA) versatz = r; }
         else if (sscanf(line, "feld %d %d %f %d", &a, &b, &r, &n) == 4 && a >= 0 && a < NP && b >= 0 && b < ND) { if (skala == SKALA) { cell[a][b].r = r; cell[a][b].n = n; } }
-        else if (sscanf(line, "deckel %15s %d", name, &m) == 2) { for (int i = 0; i < 3; i++) if (!strcmp(name, lageName[i])) lage[i].stufe = stufe_von(m); }
-        else if (sscanf(line, "fehl %15s %d %d", name, &m, &n) == 3) { for (int i = 0; i < 3; i++) if (!strcmp(name, lageName[i])) lage[i].fehl[stufe_von(m)] = n; }
+        else if (sscanf(line, "deckel %15s %d", name, &m) == 2) { for (int i = 0; i < EVO_NLAGE; i++) if (!strcmp(name, lageName[i])) lage[i].stufe = stufe_von(m); }
+        else if (sscanf(line, "fehl %15s %d %d", name, &m, &n) == 3) { for (int i = 0; i < EVO_NLAGE; i++) if (!strcmp(name, lageName[i])) lage[i].fehl[stufe_von(m)] = n; }
     }
     fclose(f);
     if (skala != SKALA) event(L_("skala", "Neues Wärmemodell (ganze Chipleistung): Lüfter-Erfahrung wird neu gelernt, Taktgrenzen bleiben"));
@@ -394,8 +403,8 @@ static void save_model(void)
     FILE *f = _wfopen(tmp, L"w");
     if (!f) return;
     fprintf(f, "skala %d\nversatz %.2f\n", SKALA, versatz);
-    for (int i = 0; i < 3; i++) fprintf(f, "deckel %s %d\n", lageName[i], stufen[lage[i].stufe]);
-    for (int i = 0; i < 3; i++) for (int s = 0; s < NSTUFEN; s++) if (lage[i].fehl[s]) fprintf(f, "fehl %s %d %d\n", lageName[i], stufen[s], lage[i].fehl[s]);
+    for (int i = 0; i < EVO_NLAGE; i++) fprintf(f, "deckel %s %d\n", lageName[i], stufen[lage[i].stufe]);
+    for (int i = 0; i < EVO_NLAGE; i++) for (int s = 0; s < NSTUFEN; s++) if (lage[i].fehl[s]) fprintf(f, "fehl %s %d %d\n", lageName[i], stufen[s], lage[i].fehl[s]);
     for (int a = 0; a < NP; a++) for (int b = 0; b < ND; b++) if (cell[a][b].n) fprintf(f, "feld %d %d %.2f %d\n", a, b, cell[a][b].r, cell[a][b].n);
     fclose(f);
     MoveFileExW(tmp, p, MOVEFILE_REPLACE_EXISTING);
@@ -526,7 +535,7 @@ static int run(void)
     if (sh) {
         sh->nurLesen = nurLesen; sh->funktionen = nurLesen ? 0 : fn; sh->ziel = ziel; sh->minP = minP; sh->maxP = maxP; sh->spitze = spitze; sh->achtung = achtung; sh->alarm = alarm;
         sh->versatz = versatz; sh->felder = felder();
-        for (int i = 0; i < 3; i++) sh->deckel[i] = stufen[lage[i].stufe];
+        for (int i = 0; i < EVO_NLAGE; i++) sh->deckel[i] = stufen[lage[i].stufe];
     }
     if (nurLesen) event(L_("start_nurlesen", "Start: nur lesen, es wird nichts gesteuert"));
     else {
@@ -664,7 +673,7 @@ static int run(void)
         if (G > 20) { if (grafikSeit < 0) grafikSeit = k; }
         else if (grafikSeit >= 0) { if (k - grafikSeit >= 30) nachlauf = 1; grafikSeit = -1; }
         if (nachlauf && emaT < 65) nachlauf = 0;   // the heat of the GPU phase is gone
-        int lg = G > 20 || nachlauf ? LAGE_GRAFIK : busy > 4 ? LAGE_VIELE : LAGE_WENIGE;
+        int lg = G > 20 || nachlauf ? (G > 20 && busy > 4 ? LAGE_BEIDE : LAGE_GRAFIK) : busy > 4 ? LAGE_VIELE : LAGE_WENIGE;
         // a situation with a lower cap counts at once, one with a higher cap only after 10 s: a few busy threads that
         // come and go must not flip the cap (and the EC mode) every second
         if (lageNow >= 0 && lg != lageNow && lage[lg].stufe > lage[lageNow].stufe && ++locker < 10) lg = lageNow;
@@ -675,11 +684,11 @@ static int run(void)
             if (T >= spitze) {
                 // hot spot: lowest step at once; this situation loses one step (learned from danger), and the step that
                 // caused it is tried again only after a longer calm run each time
-                if (k > sicherBis && lage[lg].stufe > 0 && capNow > stufen[0]) {
+                if (k > sicherBis && lage[lg].stufe > unten[lg] && capNow > stufen[unten[lg]]) {
                     int s = lage[lg].stufe;
                     if (lage[lg].fehl[s] < 9) lage[lg].fehl[s]++;
                     lage[lg].stufe--;
-                    event2(1, L_("spitze_runter", "Spitze %.0f °C bei „%s“: 30 s Taktbremse %d MHz, für diese Lastart künftig %d MHz"), T, lage_text(lg), stufen[0], stufen[lage[lg].stufe]);
+                    event2(1, L_("spitze_runter", "Spitze %.0f °C bei „%s“: 30 s Taktbremse %d MHz, für diese Lastart künftig %d MHz"), T, lage_text(lg), stufen[unten[lg]], stufen[lage[lg].stufe]);
                     event(L_("spitze_warte", "%d MHz erst wieder nach %d min Last ohne Spitze"), stufen[s], wartezeit(lage[lg].fehl[s]) / 60);
                 } else if (k > sicherBis)
                     event2(1, L_("spitze_unten", "Spitze %.0f °C bei „%s“, Taktbremse stand schon auf %d MHz"), T, lage_text(lg), capNow);
@@ -696,7 +705,7 @@ static int run(void)
                     event(L_("ruhig", "%d min am Limit ohne Spitze bei „%s“: probiert %d MHz"), w / 60, lage_text(lg), stufen[s]);
                 }
             }
-            int want = k <= sicherBis ? stufen[0] : stufen[lage[lg].stufe];
+            int want = k <= sicherBis ? stufen[unten[lg]] : stufen[lage[lg].stufe];
             if (want != capNow && write_cap(want)) { event(L_("takt", "Taktbremse %d → %d MHz%s"), capNow, want, k <= sicherBis ? L_("takt_spitze", " (nach Hitzespitze)") : ""); capNow = want; }
         }
         if (!nurLesen) {
@@ -786,7 +795,7 @@ static int run(void)
             s->ecFan = (int16_t)(nurLesen || Te < 0 ? -1 : curve_duty(Te, 0));
             s->sysEc = (int16_t)(nurLesen || Te < 0 ? -1 : curve_duty(Te, 6)); s->sysFan = (int16_t)(nurLesen ? -1 : curveSys);
             sh->nSample++;
-            if (k % 60 == 0) { sh->versatz = versatz; sh->felder = felder(); for (int i = 0; i < 3; i++) sh->deckel[i] = stufen[lage[i].stufe]; }
+            if (k % 60 == 0) { sh->versatz = versatz; sh->felder = felder(); for (int i = 0; i < EVO_NLAGE; i++) sh->deckel[i] = stufen[lage[i].stufe]; }
         }
         SYSTEMTIME st; GetLocalTime(&st);
         char line[400];

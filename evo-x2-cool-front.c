@@ -158,7 +158,11 @@ static void apply_theme(HWND w)
     typedef HRESULT (WINAPI *DWMSET)(HWND, DWORD, const void *, DWORD);
     if (dwm && w) { DWMSET set = (DWMSET)(void (*)(void))GetProcAddress(dwm, "DwmSetWindowAttribute"); if (set) set(w, 20, &d, sizeof d); }
 }
-static const wchar_t *lageText(int i) { return i == LAGE_VIELE ? T(L"lage1", L"viele Kerne aktiv") : i == LAGE_GRAFIK ? T(L"lage2", L"Grafik (+ Abkühlen)") : T(L"lage0", L"wenige Kerne aktiv"); }
+static const wchar_t *lageText(int i)
+{
+    return i == LAGE_VIELE ? T(L"lage1", L"viele Kerne aktiv") : i == LAGE_GRAFIK ? T(L"lage2", L"Grafik (+ Abkühlen)")
+         : i == LAGE_BEIDE ? T(L"lage3", L"Grafik + viele Kerne") : T(L"lage0", L"wenige Kerne aktiv");
+}
 static const wchar_t *grundText(int i)
 {
     switch (i) {
@@ -429,8 +433,8 @@ static void paint(HWND w, HDC dc)
         if (status) wcsncpy(st, status, 199), st[199] = 0;
         else {
             struct tm lt; time_t tt = (time_t)at->t; localtime_s(&lt, &tt);
-            swprintf(st, 200, T(L"status", L"%s%02d:%02d:%02d · Taktbremse gelernt – wenige %d · viele %d · Grafik %d MHz"),
-                     hover >= 0 ? T(L"maus", L"Mauszeiger ") : L"", lt.tm_hour, lt.tm_min, lt.tm_sec, sh->deckel[0], sh->deckel[1], sh->deckel[2]);
+            swprintf(st, 200, T(L"status", L"%s%02d:%02d:%02d · Taktbremse gelernt – wenige %d · viele %d · Grafik %d · Grafik + viele %d MHz"),
+                     hover >= 0 ? T(L"maus", L"Mauszeiger ") : L"", lt.tm_hour, lt.tm_min, lt.tm_sec, sh->deckel[0], sh->deckel[1], sh->deckel[2], sh->deckel[3]);
         }
         RECT sr = { bx + S(6), by + S(4), sx, by + S(22) };
         SelectObject(dc, fSmall); SetTextColor(dc, status ? C_HOT : C_DIM);
@@ -484,11 +488,12 @@ static void paint(HWND w, HDC dc)
     fill(dc, strip, C_CARD, 0);
     for (uint32_t i = 0; i < count; i++) {
         const EvoSample *s = sample(i);
-        COLORREF c = s->grund == GRUND_NOTFALL ? C_HOT : s->grund == GRUND_ACHTUNG ? C_CAP : s->lage == LAGE_GRAFIK ? C_GRAFIK : s->lage == LAGE_VIELE ? C_VIELE : C_CARD;
+        COLORREF c = s->grund == GRUND_NOTFALL ? C_HOT : s->grund == GRUND_ACHTUNG ? C_CAP : s->lage == LAGE_GRAFIK || s->lage == LAGE_BEIDE ? C_GRAFIK : s->lage == LAGE_VIELE ? C_VIELE : C_CARD;
         if (c == C_CARD) continue;
         int x0 = i ? xOf(strip, i - 1) : xOf(strip, 0) - 1, x1 = xOf(strip, i);
         RECT t = { x0, strip.top, x1 > x0 ? x1 : x0 + 1, strip.bottom };
         fill(dc, t, c, 0);
+        if (s->lage == LAGE_BEIDE && c == C_GRAFIK) { t.top = (strip.top + strip.bottom) / 2; fill(dc, t, C_VIELE, 0); }   // GPU + many cores: both colours
     }
     static const int tick[4] = { 1, 5, 15, 30 };   // minutes between time labels
     for (int m = (int)span / 60; m >= 0; m -= tick[spanIdx]) {
