@@ -562,7 +562,7 @@ static int run(void)
     // controller state
     float hist[10]; int nHist = 0;
     float emaT = 0, slope = 0, pFast = 0, pSlow = 0, mFast = 0, mSlow = 0, emaTe = 0, d = (float)(minP > 40 ? minP : 40), boost = 0;
-    int capNow = read_cap(), sicherBis = 0, grafikSeit = -1, nachlauf = 0, lageNow = -1, locker = 0, hot = 0, lowSince = -1, warNotfall = 0;
+    int capNow = read_cap(), sicherBis = 0, sicherCap = 0, grafikSeit = -1, nachlauf = 0, lageNow = -1, locker = 0, hot = 0, lowSince = -1, warNotfall = 0;
     int ec[8] = { -1, -1, -1, -1, -1, -1, -1, -1 };
     static const uint8_t regs[8] = { 0x70, 0x35, 0x36, 0x31, 0x37, 0x38, 0x28, 0x29 };
     int console = GetConsoleWindow() != 0;
@@ -692,6 +692,9 @@ static int run(void)
                     event(L_("spitze_warte", "%d MHz erst wieder nach %d min Last ohne Spitze"), stufen[s], wartezeit(lage[lg].fehl[s]) / 60);
                 } else if (k > sicherBis)
                     event2(1, L_("spitze_unten", "Spitze %.0f °C bei „%s“, Taktbremse stand schon auf %d MHz"), T, lage_text(lg), capNow);
+                // the safe cap stays for the whole 30 s, also when the load type changes in between (a short GPU dip
+                // switched "GPU + many cores" at 2400 to "many cores" at 3300 and the chip went to 93 °C)
+                if (k > sicherBis || stufen[unten[lg]] < sicherCap) sicherCap = stufen[unten[lg]];
                 sicherBis = k + 30; lage[lg].ruhig = 0;
             }
             // calm long enough at this step: may try the next one. Only seconds in which a core really runs at the cap count
@@ -705,7 +708,7 @@ static int run(void)
                     event(L_("ruhig", "%d min am Limit ohne Spitze bei „%s“: probiert %d MHz"), w / 60, lage_text(lg), stufen[s]);
                 }
             }
-            int want = k <= sicherBis ? stufen[unten[lg]] : stufen[lage[lg].stufe];
+            int want = k <= sicherBis ? (sicherCap < stufen[unten[lg]] ? sicherCap : stufen[unten[lg]]) : stufen[lage[lg].stufe];
             if (want != capNow && write_cap(want)) { event(L_("takt", "Taktbremse %d → %d MHz%s"), capNow, want, k <= sicherBis ? L_("takt_spitze", " (nach Hitzespitze)") : ""); capNow = want; }
         }
         if (!nurLesen) {
