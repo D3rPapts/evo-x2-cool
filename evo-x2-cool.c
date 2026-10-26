@@ -48,12 +48,13 @@
 // ---------- settings (einstellungen.ini) ----------
 static float ziel = 80; static int minP = 30, minLeer = 10, maxP = 70, spitze = 88, achtung = 90, alarm = 95, sicherMhz = 3600, nurLesen;
 static unsigned fn = F_ALLE;   // functions switched on
-static const int stufen[] = { 2400, 3000, 3300, 3600, 3900, 4200, 4500 };   // clock cap steps, MHz
-#define NSTUFEN 7
-// lowest step per situation, also the cap for 30 s after a hot spot: 3300 MHz, but 2400 with the GPU busy and many cores
-// at the same time. There the cores take power from the GPU at the same 85 W, the heat sits on a small spot, and Tctl
-// jumped from 80 to 91-97 °C within 5-10 s even at 3300 MHz (machine 2, five emergencies in 4 h with the controller on).
-static const int unten[EVO_NLAGE] = { 2, 2, 2, 0 };
+static const int stufen[] = { 3000, 3300, 3600, 3900, 4200, 4500 };   // clock cap steps, MHz
+#define NSTUFEN 6
+// lowest step per situation, also the cap for 30 s after a hot spot: 3300 MHz, but 3000 with the GPU busy and many cores
+// at the same time. There the cores take power from the GPU at the same 85 W and Tctl jumped from 80 to 91-97 °C within
+// 5-10 s (machine 2). Lower is not worth it: on machine 1, 2400 MHz cost 19 % clock for only ~12 % less core power, and
+// the spikes still came (92.5 °C), when the GPU paused and the cores took the free budget.
+static const int unten[EVO_NLAGE] = { 1, 1, 1, 0 };
 static const float tau = 40;   // thermal time constant of the heatsink, s
 
 static HANDLE hCpu, hEc, mPci, mEc, stopEv;
@@ -380,7 +381,7 @@ static void load_model(void)
 {
     wchar_t p[MAX_PATH]; char line[128], name[16]; int a, b, n, m; float r;
     lage[LAGE_WENIGE].stufe = stufe_von(4200); lage[LAGE_VIELE].stufe = stufe_von(3600); lage[LAGE_GRAFIK].stufe = stufe_von(3600);
-    lage[LAGE_BEIDE].stufe = stufe_von(3000);
+    lage[LAGE_BEIDE].stufe = stufe_von(3300);
     swprintf(p, MAX_PATH, L"%s\\modell.txt", dataDir);
     FILE *f = _wfopen(p, L"r");
     if (!f) return;
@@ -739,6 +740,9 @@ static int run(void)
         // feedback: warmer than the target anyway -> add more; let it go again slowly (not in the first seconds: median not full)
         if (k >= 15) { if (emaT > ziel + 1) boost = fminf(40, boost + 1); else if (emaT < ziel - 3) boost = fmaxf(0, boost - 1); }
         float wantD = fminf((float)maxP, need + boost);
+        // GPU + many cores: the spike comes within 5 s, the fan needs ~10 s to spin up, so it starts at 50 % at once
+        int vorbeugen = lg == LAGE_BEIDE && wantD < 50;
+        if (vorbeugen) wantD = 50;
         int grund = boost >= 1 ? GRUND_NACHREGELN : (fn & F_VORHERSAGE) && pv > pSlow + 5 ? GRUND_VORHERSAGE : GRUND_MODELL;
         // two stages above the noise limit. Yellow (smoothed CPU or case sensor >= Achtung, default 90 °C, off 2 °C below; a 1-s boost spike is
         // the clock brake's job): the fan climbs by 2 %/s,
@@ -761,7 +765,7 @@ static int run(void)
         // controller keeps the fan until it is down at its wanted value, then the BIOS curve takes over again.
         static int nachNotfall;
         float auf = T < ziel - 8 && emaT < ziel - 8 ? 1.0f : 4.0f;
-        if (wantD >= d) { d = grund == GRUND_NOTFALL || grund == GRUND_ACHTUNG || emaT >= ziel + 5 ? wantD : fminf(wantD, d + auf); lowSince = -1; nachNotfall = 0; }
+        if (wantD >= d) { d = grund == GRUND_NOTFALL || grund == GRUND_ACHTUNG || vorbeugen || emaT >= ziel + 5 ? wantD : fminf(wantD, d + auf); lowSince = -1; nachNotfall = 0; }
         else if (warNotfall || nachNotfall) { d = fmaxf(wantD, d - 1); nachNotfall = d > wantD; lowSince = -1; }
         else { if (lowSince < 0) lowSince = k; if (k - lowSince >= 10) d = fmaxf(wantD, d - 3); }
         warNotfall = grund == GRUND_NOTFALL;
