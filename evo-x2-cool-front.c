@@ -25,6 +25,23 @@
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "gdiplus.lib")
+
+// GDI+ flat API, only what the rounded shapes need (the official headers are C++ only). Plain GDI draws round corners
+// without anti-aliasing, so switches, tiles and buttons got jagged edges.
+typedef struct { UINT32 version; void *debugCallback; BOOL noBackgroundThread, noCodecs; } GpStartupInput;
+int WINAPI GdiplusStartup(ULONG_PTR *token, const GpStartupInput *in, void *out);
+int WINAPI GdipCreateFromHDC(HDC dc, void **g);
+int WINAPI GdipDeleteGraphics(void *g);
+int WINAPI GdipSetSmoothingMode(void *g, int mode);
+int WINAPI GdipSetPixelOffsetMode(void *g, int mode);
+int WINAPI GdipCreateSolidFill(DWORD argb, void **brush);
+int WINAPI GdipDeleteBrush(void *brush);
+int WINAPI GdipCreatePath(int fillMode, void **path);
+int WINAPI GdipAddPathArc(void *path, float x, float y, float w, float h, float start, float sweep);
+int WINAPI GdipClosePathFigure(void *path);
+int WINAPI GdipFillPath(void *g, void *brush, void *path);
+int WINAPI GdipDeletePath(void *path);
 #define WM_TRAY   (WM_APP + 1)   // mouse on the tray icon
 #define WM_ZEIGEN (WM_APP + 2)   // sent by a second start: show the window
 #define WM_UPDATE (WM_APP + 3)   // the update check found a newer version
@@ -175,9 +192,28 @@ static void open_shm(void)
 
 static void fill(HDC dc, RECT r, COLORREF c, int round)
 {
-    HBRUSH b = CreateSolidBrush(c), ob = SelectObject(dc, b); HPEN op = SelectObject(dc, GetStockObject(NULL_PEN));
-    if (round) RoundRect(dc, r.left, r.top, r.right + 1, r.bottom + 1, round, round); else FillRect(dc, &r, b);
-    SelectObject(dc, ob); SelectObject(dc, op); DeleteObject(b);
+    void *g = 0;
+    if (!round || GdipCreateFromHDC(dc, &g)) {   // square, or no GDI+: plain GDI
+        HBRUSH b = CreateSolidBrush(c), ob = SelectObject(dc, b); HPEN op = SelectObject(dc, GetStockObject(NULL_PEN));
+        if (round) RoundRect(dc, r.left, r.top, r.right + 1, r.bottom + 1, round, round); else FillRect(dc, &r, b);
+        SelectObject(dc, ob); SelectObject(dc, op); DeleteObject(b);
+        return;
+    }
+    // same area as RoundRect above (right/bottom included), corners as anti-aliased quarter circles
+    float x = (float)r.left, y = (float)r.top, w = (float)(r.right - r.left + 1), h = (float)(r.bottom - r.top + 1);
+    float d = fminf((float)round, fminf(w, h));
+    void *br = 0, *path = 0;
+    GdipSetSmoothingMode(g, 4);      // anti-alias
+    GdipSetPixelOffsetMode(g, 4);    // half: pixel edges on whole coordinates, like GDI
+    GdipCreateSolidFill(0xFF000000u | GetRValue(c) << 16 | GetGValue(c) << 8 | GetBValue(c), &br);
+    GdipCreatePath(0, &path);
+    GdipAddPathArc(path, x, y, d, d, 180, 90);
+    GdipAddPathArc(path, x + w - d, y, d, d, 270, 90);
+    GdipAddPathArc(path, x + w - d, y + h - d, d, d, 0, 90);
+    GdipAddPathArc(path, x, y + h - d, d, d, 90, 90);
+    GdipClosePathFigure(path);
+    GdipFillPath(g, br, path);
+    GdipDeletePath(path); GdipDeleteBrush(br); GdipDeleteGraphics(g);
 }
 
 // text at x,y (align: 0 left, 1 right edge at x, 2 centred); returns its width
@@ -801,6 +837,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     HWND old = FindWindowW(L"evo-x2-cool-front", 0);   // already running: bring it to the front instead of a second copy
     if (old) { DWORD pid; GetWindowThreadProcessId(old, &pid); AllowSetForegroundWindow(pid); PostMessageW(old, WM_ZEIGEN, 0, 0); return 0; }
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    ULONG_PTR gdipToken; GpStartupInput gin = { 1, 0, FALSE, TRUE };   // only for anti-aliased round corners (fill)
+    GdiplusStartup(&gdipToken, &gin, 0);
     dpi = (int)GetDpiForSystem();
     ExpandEnvironmentStringsW(EVO_INI, iniFile, MAX_PATH);
     load_lang();
