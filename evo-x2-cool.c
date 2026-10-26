@@ -740,8 +740,11 @@ static int run(void)
         // feedback: warmer than the target anyway -> add more; let it go again slowly (not in the first seconds: median not full)
         if (k >= 15) { if (emaT > ziel + 1) boost = fminf(40, boost + 1); else if (emaT < ziel - 3) boost = fmaxf(0, boost - 1); }
         float wantD = fminf((float)maxP, need + boost);
-        // GPU + many cores: the spike comes within 5 s, the fan needs ~10 s to spin up, so it starts at 50 % at once
-        int vorbeugen = lg == LAGE_BEIDE && wantD < 50;
+        // GPU + many cores: the spike comes within 5 s, the fan needs ~10 s to spin up, so it starts at 50 % at once. Only
+        // when the cores really draw power (> 15 W): GPU inference keeps many cores busy at ~5 W (machine 1: 4 min at 50 %
+        // for nothing); at the spikes on machine 2 they jumped to 17-30 W in the first second. GPU working counts too, as the
+        // cores take its power and it falls below 20 W
+        int vorbeugen = (lg == LAGE_BEIDE || lg == LAGE_GRAFIK) && busy > 4 && sumW > 15 && wantD < 50;
         if (vorbeugen) wantD = 50;
         int grund = boost >= 1 ? GRUND_NACHREGELN : (fn & F_VORHERSAGE) && pv > pSlow + 5 ? GRUND_VORHERSAGE : GRUND_MODELL;
         // two stages above the noise limit. Yellow (smoothed CPU or case sensor >= Achtung, default 90 °C, off 2 °C below; a 1-s boost spike is
