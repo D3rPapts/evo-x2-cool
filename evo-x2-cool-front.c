@@ -437,7 +437,7 @@ static void paint(HWND w, HDC dc)
         static const wchar_t *stKey[3] = { L"z_ziel", L"z_achtung", L"z_alarm" }, *stDef[3] = { L"Ziel", L"Achtung (Lüfter steigt)", L"Alarm (Lüfter voll)" };
         const COLORREF stC[3] = { C_OK, C_CAP, C_HOT }; COLORREF bc = sh->nurLesen ? C_GRID : C_OFF;
         for (int j = 0; j < 3; j++) {
-            int zy = sc.top + S(40) + j * S(30);
+            int zy = sc.top + S(40) + (2 - j) * S(30);   // red on top, like the temperature scale
             RECT dot = { sc.left + S(14), zy + S(7), sc.left + S(24), zy + S(17) }; fill(dc, dot, stC[j], S(10));
             text(dc, fText, sc.left + S(32), zy + S(2), C_TEXT, 0, L"%s", T(stKey[j], stDef[j]));
             stPlus[j] = (RECT){ sc.right - S(38), zy, sc.right - S(14), zy + S(24) };
