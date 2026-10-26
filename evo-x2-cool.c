@@ -26,6 +26,7 @@
 #define UNICODE
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
+#include <winioctl.h>
 #include <powrprof.h>
 #include <sddl.h>
 #include <stdio.h>
@@ -45,7 +46,7 @@
 #define SVC L"evo-x2-cool"
 
 // ---------- settings (einstellungen.ini) ----------
-static float ziel = 80; static int minP = 30, maxP = 70, spitze = 88, sicherMhz = 3600, nurLesen;
+static float ziel = 80; static int minP = 30, minLeer = 10, maxP = 70, spitze = 88, sicherMhz = 3600, nurLesen;
 static unsigned fn = F_ALLE;   // functions switched on
 static const int stufen[] = { 3300, 3600, 3900, 4200, 4500 };   // clock cap steps, MHz; the first one is taken after a hot spot
 #define NSTUFEN 5
@@ -81,7 +82,7 @@ static unsigned load_settings(void)
     if (GetFileAttributesW(iniFile) == INVALID_FILE_ATTRIBUTES) {
         static const char def[] =
             "; evo-x2-cool settings, re-read within 5 s after a change\r\n"
-            "[Regler]\r\nZiel=80\r\nMinProzent=30\r\nMaxProzent=70\r\nSpitze=88\r\nSicherMHz=3600\r\nSprache=de\r\n\r\n"
+            "[Regler]\r\nZiel=80\r\nMinProzent=30\r\nMinLeerlauf=10\r\nMaxProzent=70\r\nSpitze=88\r\nSicherMHz=3600\r\nSprache=de\r\n\r\n"
             "; 1 = on, 0 = off. The emergency (fan 100 % when overheating) always stays on.\r\n"
             "[Funktionen]\r\nLuefter=1\r\nTaktbremse=1\r\nEcLeise=1\r\nLernen=1\r\nVorhersage=1\r\n\r\n"
             "; window: Thema = system / hell / dunkel; UpdatePruefen = 1: ask GitHub once a day for a newer version (only shown, nothing installed)\r\n"
@@ -95,11 +96,13 @@ static unsigned load_settings(void)
     wchar_t buf[16], code[16];
     GetPrivateProfileStringW(L"Regler", L"Ziel", L"80", buf, 16, iniFile); ziel = (float)_wtof(buf);
     minP = GetPrivateProfileIntW(L"Regler", L"MinProzent", 30, iniFile);
+    minLeer = GetPrivateProfileIntW(L"Regler", L"MinLeerlauf", 10, iniFile);
     maxP = GetPrivateProfileIntW(L"Regler", L"MaxProzent", 70, iniFile);
     spitze = GetPrivateProfileIntW(L"Regler", L"Spitze", 88, iniFile);
     sicherMhz = GetPrivateProfileIntW(L"Regler", L"SicherMHz", 3600, iniFile);
     // sane limits, whatever is in the file
     ziel = ziel < 50 ? 50 : ziel > 92 ? 92 : ziel; minP = minP < 0 ? 0 : minP > 100 ? 100 : minP;
+    minLeer = minLeer < 0 ? 0 : minLeer > minP ? minP : minLeer;
     maxP = maxP < minP ? minP : maxP > 100 ? 100 : maxP; spitze = spitze < 70 ? 70 : spitze > 95 ? 95 : spitze;
     GetPrivateProfileStringW(L"Regler", L"Sprache", L"de", code, 16, iniFile);
     wchar_t lf[MAX_PATH]; swprintf(lf, MAX_PATH, L"%s\\sprache-%s.ini", exeDir, code);
@@ -409,12 +412,33 @@ static int read_bios_fan(uint8_t orig[12])
     return 1;
 }
 
+// hottest SSD in °C from the storage driver (NVMe reports it without any extra driver), -1 = unknown
+static int ssd_temp(void)
+{
+    int best = -1;
+    for (int i = 0; i < 8; i++) {
+        wchar_t p[32]; swprintf(p, 32, L"\\\\.\\PhysicalDrive%d", i);
+        HANDLE h = CreateFileW(p, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, 0, OPEN_EXISTING, 0, 0);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        STORAGE_PROPERTY_QUERY q = { StorageDeviceTemperatureProperty, PropertyStandardQuery };
+        union { STORAGE_TEMPERATURE_DATA_DESCRIPTOR d; BYTE b[256]; } o; DWORD n;
+        if (DeviceIoControl(h, IOCTL_STORAGE_QUERY_PROPERTY, &q, sizeof q, &o, sizeof o, &n, 0) && n >= sizeof o.d && o.d.InfoCount > 0) {
+            int t = o.d.TemperatureInfo[0].Temperature;
+            if (t > best && t < 120) best = t;
+        }
+        CloseHandle(h);
+    }
+    return best;
+}
+
 // fan curve anchored 3 °C below the smoothed EC temperature: today's temperature lies on the rising part,
-// duty there = d, +2 % per °C above. Both CPU fan blocks (0x60, 0x66), mode 1 = curve active.
+// duty there = d, +2 % per °C above. Block 0x60 drives both CPU fans (blowers on the chip's heatsink), block 0x66 the
+// 120 mm system fan on the back of the board; mode 1 = curve active. The system fan gets sysWant (-1 = same as the CPU
+// fans); 0 = off, written as a curve that starts only at 85 °C, so the EC still turns it on if the controller dies.
 // Each EC write costs a write plus a read-back (~2 ms of spinning), so only registers that change are written (usually
 // start/full/pwm). check = 1 reads every register first instead of trusting the cache (done once a minute, in case the
 // EC was reset, e.g. after sleep).
-static int curveD = -1; static float curveAnchor = -1;
+static int curveD = -1, sysWant = -1, curveSys = -1; static float curveAnchor = -1;
 static int curveReg[12] = { -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 };
 static void write_curve(int d, float teSmooth, int check)
 {
@@ -422,22 +446,24 @@ static void write_curve(int d, float teSmooth, int check)
     int pwm = d - 6 < 0 ? 0 : d - 6;
     int full = start + (100 - pwm + 1) / 2 + 1; if (full > 105) full = 105;
     static const int order[6] = { 1, 2, 3, 4, 5, 0 };   // the mode byte (curve on) last
-    int val[6] = { 1, 20, start, full, pwm, 2 };
+    int s = sysWant < 0 ? d : sysWant, spwm = s - 6 < 0 ? 0 : s - 6;
+    int sfull = start + (100 - spwm + 1) / 2 + 1; if (sfull > 105) sfull = 105;
+    int val[12] = { 1, 20, start, full, pwm, 2, 1, 20, s ? start : 85, s ? sfull : 105, s ? spwm : 0, 2 };
     for (int b = 0; b <= 6; b += 6)
         for (int j = 0; j < 6; j++) {
             int i = b + order[j];
-            if ((check ? ec_read((uint8_t)(0x60 + i)) : curveReg[i]) != val[order[j]])
-                curveReg[i] = ec_write((uint8_t)(0x60 + i), (uint8_t)val[order[j]]) ? val[order[j]] : -1;
-            else curveReg[i] = val[order[j]];
+            if ((check ? ec_read((uint8_t)(0x60 + i)) : curveReg[i]) != val[i])
+                curveReg[i] = ec_write((uint8_t)(0x60 + i), (uint8_t)val[i]) ? val[i] : -1;
+            else curveReg[i] = val[i];
         }
-    curveD = d; curveAnchor = teSmooth;
+    curveD = d; curveSys = s; curveAnchor = teSmooth;
 }
 
 static int restore_bios(const uint8_t orig[12])
 {
     int ok = 1;
     for (int i = 11; i >= 0; i--) { ok &= ec_write((uint8_t)(0x60 + i), orig[i]); curveReg[i] = -1; }
-    curveD = -1; curveAnchor = -1;
+    curveD = curveSys = -1; curveAnchor = -1;
     return ok;
 }
 
@@ -601,6 +627,7 @@ static int run(void)
         float prevT = emaT;
         emaT += (med - emaT) / 8;
         slope += ((emaT - prevT) - slope) / 10;
+        float pAlt = pFast;
         pFast += (heat - pFast) / 3; pSlow += (heat - pSlow) / 20;
         mFast += ((float)maxW - mFast) / 3; mSlow += ((float)maxW - mSlow) / 20;
         if (Te >= 0) emaTe += (Te - emaTe) / 10;   // the EC temperature jumps by 15 °C within seconds; the anchor follows slowly
@@ -663,10 +690,17 @@ static int run(void)
         if (!nurLesen && (fn & F_LERNEN) && k > 30 && T < 90 && emaT < 90 && fabsf(pFast - pSlow) < 5 && fabsf(slope) < 0.08f && curveD >= 0)
             learn(pSlow, (float)curveD, mSlow, emaT + tau * slope);
 
-        // --- predict: rising power counts ahead (fast EMA plus its lead over the slow one); switched off: current power only ---
-        float pv = fmaxf(pFast, pSlow) + (fn & F_VORHERSAGE ? fmaxf(0, pFast - pSlow) : 0);
-        int need = maxP;
-        for (int x = minP; x <= maxP; x += 5) if (predict(pv, (float)x, mFast) <= ziel - 1) { need = x; break; }
+        // --- predict: rising power counts ahead (fast EMA plus its lead over the slow one); switched off: current power only.
+        //     The lead counts only while the power still rises and never beyond the measured power: after a jump the
+        //     slow EMA lags for a minute, and a 5-s burst must not be taken for a lasting load ---
+        float lead = (fn & F_VORHERSAGE) && pFast - pAlt > 0.5f ? fmaxf(0, pFast - pSlow) : 0;
+        float pv = fmaxf(pFast, pSlow) + fminf(lead, fmaxf(0, heat - fmaxf(pFast, pSlow)));
+        // idle and far below the target: a lower floor (the BIOS idles at ~1000-2000 rpm; measured: 30 % ~2200, 20 % ~1850, 10 % ~1500 rpm);
+        // with a gap between on and off, so it does not flip like the BIOS curve
+        static int leer;
+        if (emaT < ziel - 25 && pSlow < 30) leer = 1; else if (emaT > ziel - 20 || pSlow > 40) leer = 0;
+        int lo = leer ? minLeer : minP, need = maxP;
+        for (int x = lo; x <= maxP; x += 5) if (predict(pv, (float)x, mFast) <= ziel - 1) { need = x; break; }
         // feedback: warmer than the target anyway -> add more; let it go again slowly (not in the first seconds: median not full)
         if (k >= 15) { if (emaT > ziel + 1) boost = fminf(40, boost + 1); else if (emaT < ziel - 3) boost = fmaxf(0, boost - 1); }
         float wantD = fminf((float)maxP, need + boost);
@@ -676,14 +710,31 @@ static int run(void)
         if (hot >= 5 || Te >= 90) { wantD = 100; grund = GRUND_NOTFALL; }
         if (grund == GRUND_NOTFALL && !warNotfall && !nurLesen) event2(1, L_("notfall", "NOTFALL: CPU %.0f °C, Gehäuse %d °C → Lüfter 100 %%"), T, Te);
         // up: a prediction raises by at most 4 %/s (jumping 30 -> 70 % is loud, the fan needs ~10 s per step anyway),
-        // at once only when really hot or in an emergency; down after 10 s by 3 %/s; after an emergency straight to the wanted value
-        if (wantD >= d) { d = grund == GRUND_NOTFALL || emaT >= ziel + 5 ? wantD : fminf(wantD, d + 4); lowSince = -1; }
-        else if (warNotfall && T < 90) { d = wantD; lowSince = -1; }
+        // only 1 %/s while the chip is still far below the target (a short burst then hardly reaches the fan),
+        // at once only when really hot or in an emergency; down after 10 s by 3 %/s.
+        // After an emergency down at once but only by 1 %/s: dropping straight back let the chip heat up again within
+        // a minute, and the emergency pumped (machine 2: 22 times in 70 min). Also with the fan switched off, the
+        // controller keeps the fan until it is down at its wanted value, then the BIOS curve takes over again.
+        static int nachNotfall;
+        float auf = T < ziel - 8 && emaT < ziel - 8 ? 1.0f : 4.0f;
+        if (wantD >= d) { d = grund == GRUND_NOTFALL || emaT >= ziel + 5 ? wantD : fminf(wantD, d + auf); lowSince = -1; nachNotfall = 0; }
+        else if (warNotfall || nachNotfall) { d = fmaxf(wantD, d - 1); nachNotfall = d > wantD; lowSince = -1; }
         else { if (lowSince < 0) lowSince = k; if (k - lowSince >= 10) d = fmaxf(wantD, d - 3); }
         warNotfall = grund == GRUND_NOTFALL;
         int di = (int)lroundf(d);
-        int fanOn = !nurLesen && ((fn & F_LUEFTER) || grund == GRUND_NOTFALL);   // the emergency takes over even when switched off
-        if (fanOn && (abs(di - curveD) >= 2 || fabsf(emaTe - curveAnchor) > 3)) write_curve(di, emaTe, 0);
+        // system fan: the 120 mm fan on the back of the board cools the SSDs, the WLAN card and the board under the
+        // chip, not the chip itself. Idle with cool SSDs: off, like the BIOS does; otherwise with the CPU fans;
+        // warm SSDs (loading a big model): at least 30 %, +5 % per °C above 55. SSD unknown: as before, with the CPU fans
+        static int ssdT = -1, sysAus;
+        if (k % 10 == 1) ssdT = ssd_temp();
+        int aus = leer && grund != GRUND_NOTFALL && ssdT >= 0 && ssdT < (sysAus ? 50 : 47);
+        if (aus != sysAus && !nurLesen && (fn & F_LUEFTER)) event(aus ? L_("sys_aus", "Systemlüfter aus (Leerlauf, SSD %d °C)") : L_("sys_an", "Systemlüfter wieder an (SSD %d °C)"), ssdT);
+        sysAus = aus;
+        int sw = aus ? 0 : di;
+        if (ssdT >= 55) { int m = 30 + 5 * (ssdT - 55); sw = sw > m ? sw : m > 100 ? 100 : m; }
+        sysWant = sw;
+        int fanOn = !nurLesen && ((fn & F_LUEFTER) || grund == GRUND_NOTFALL || nachNotfall);   // the emergency takes over even when switched off
+        if (fanOn && (abs(di - curveD) >= 2 || abs(sysWant - curveSys) >= 2 || fabsf(emaTe - curveAnchor) > 3)) write_curve(di, emaTe, 0);
         else if (fanOn && k % 60 == 30 && curveD >= 0) write_curve(curveD, curveAnchor, 1);
         else if (!fanOn && curveD >= 0) restore_bios(orig);
         if (nurLesen) grund = GRUND_NUR_LESEN;
