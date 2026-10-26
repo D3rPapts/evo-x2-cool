@@ -2,7 +2,7 @@
 ; Installs both programs to Program Files, the PawnIO driver if it is missing, the controller as a service and
 ; optionally the window in the tray at logon. Uninstall puts the BIOS fan curve back and may keep the learned data.
 
-#define AppVer "0.5.0"
+#define AppVer "0.5.1"
 
 [Setup]
 AppId={{7464B3D3-23BC-4840-B095-EC3434E506D4}

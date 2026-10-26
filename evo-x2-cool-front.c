@@ -200,16 +200,17 @@ static float gCore(const EvoSample *s) { return s->coreW; }
 static float gGpu(const EvoSample *s) { return s->gpuW; }
 static float gPkg(const EvoSample *s) { return s->pkgW; }
 static float gFan(const EvoSample *s) { return (float)s->fan; }
-// fan 1 speed as duty %, from a calibration on a 64 GB EVO-X2 (30 % = 2230, 50 % = 2890, 70 % = 3450, 100 % = 4210 U/min),
-// so the measured line is directly comparable with the target
+// fan 1 speed as duty %, from a calibration on a 64 GB EVO-X2 (10 % = 1500, 20 % = 1850, 30 % = 2230, 50 % = 2890,
+// 70 % = 3450, 100 % = 4210 U/min; 10 % confirmed on the 128 GB one), so the measured line is directly comparable with the target
 static float gRpm(const EvoSample *s)
 {
-    static const float rpm[5] = { 0, 2230, 2890, 3450, 4210 }, pct[5] = { 0, 30, 50, 70, 100 };
+    static const float rpm[7] = { 0, 1500, 1850, 2230, 2890, 3450, 4210 }, pct[7] = { 0, 10, 20, 30, 50, 70, 100 };
     float r = s->rpm[0];
     if (r < 0) return -1;
-    for (int i = 1; i < 5; i++) if (r <= rpm[i]) return pct[i - 1] + (r - rpm[i - 1]) / (rpm[i] - rpm[i - 1]) * (pct[i] - pct[i - 1]);
+    for (int i = 1; i < 7; i++) if (r <= rpm[i]) return pct[i - 1] + (r - rpm[i - 1]) / (rpm[i] - rpm[i - 1]) * (pct[i] - pct[i - 1]);
     return 100;
 }
+static float gEcFan(const EvoSample *s) { return s->fan < 0 || s->ecFan < 0 ? -1 : (float)s->ecFan; }
 static float gCap(const EvoSample *s) { return s->cap > 0 ? (float)s->cap : -1; }
 static float gMhz(const EvoSample *s) { return s->mhz; }
 
@@ -347,7 +348,8 @@ static void paint(HWND w, HDC dc)
                                            { gTctl, C_RAW, 1, T(L"l_roh", L"CPU roh") }, { gGlatt, C_HOT, S(2), T(L"l_glatt", L"CPU geglättet (Regelgröße)") } } },
         { T(L"c_power", L"Leistung W"), 0, pmax, pmax / 4, { { gPkg, C_PKG, 1, T(L"l_chip", L"ganzer Chip") }, { gGpu, RGB(165, 124, 255), S(2), T(L"l_gpu", L"Grafik") },
                                               { gCore, RGB(78, 161, 255), S(2), T(L"l_kerne", L"Kerne") } } },
-        { T(L"c_fan", L"Lüfter %"), 0, 100, 25, { { gRpm, C_RPM, 1, T(L"l_ist", L"Ist (aus Drehzahl)") }, { gFan, C_FAN, S(2), T(L"l_soll", L"Soll") } } },
+        { T(L"c_fan", L"Lüfter %"), 0, 100, 25, { { gRpm, C_RPM, 1, T(L"l_ist", L"Ist (aus Drehzahl)") }, { gEcFan, C_WARM, 1, T(L"l_ecfan", L"EC-Kurve (mit Aufschlag)") },
+                                         { gFan, C_FAN, S(2), T(L"l_soll", L"Soll") } } },
         { T(L"c_clock", L"CPU-Takt MHz"), 0, 6000, 1500, { { gMhz, C_MHZ, 1, T(L"l_kern", L"schnellster Kern (Mittel je Sekunde)") }, { gCap, C_CAP, S(2), T(L"l_bremse", L"Taktbremse") } } },
     };
     int ch = (charts.bottom - charts.top - 3 * gap) / 4;

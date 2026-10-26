@@ -459,6 +459,14 @@ static void write_curve(int d, float teSmooth, int check)
     curveD = d; curveSys = s; curveAnchor = teSmooth;
 }
 
+// duty % the written curve gives at EC temperature t: pwm up to start, then linear to 100 % at full; -1 = BIOS curve
+static int curve_duty(int t)
+{
+    int s = curveReg[2], f = curveReg[3], p = curveReg[4];
+    if (curveD < 0 || s < 0 || f <= s || p < 0) return -1;
+    return t <= s ? p : t >= f ? 100 : p + (100 - p) * (t - s) / (f - s);
+}
+
 static int restore_bios(const uint8_t orig[12])
 {
     int ok = 1;
@@ -685,7 +693,11 @@ static int run(void)
             if (want != capNow && write_cap(want)) { event(L_("takt", "Taktbremse %d → %d MHz%s"), capNow, want, k <= sicherBis ? L_("takt_spitze", " (nach Hitzespitze)") : ""); capNow = want; }
         }
         if (!nurLesen) {
+            // quiet applies at once, going back waits 10 s, so a short GPU blip does not flip the power limit
+            static int modusLocker;
             int modus = (fn & F_LEISE) && lg == LAGE_VIELE && G < 5 ? 2 : modusOrig;
+            if (modus == modusJetzt || modus == 2) modusLocker = 0;
+            else if (modusJetzt == 2 && ++modusLocker < 10) modus = 2;
             if (modus != modusJetzt && ec_write(0x31, (uint8_t)modus)) { event(L_("modus", "EC-Leistungsmodus → %s"), modus == 2 ? L_("modus2", "leise (54 W)") : modus == 1 ? L_("modus1", "Leistung") : L_("modus0", "ausgewogen")); modusJetzt = modus; }
         }
 
@@ -754,6 +766,7 @@ static int run(void)
             s->ecT = (int16_t)Te; s->busy = (int16_t)busy; s->gpuLoad = (int16_t)gL; s->gpuT = (int16_t)gT; s->fan = (int16_t)(nurLesen ? -1 : curveD);
             s->cap = (int16_t)capNow; s->rpm[0] = (int16_t)r1; s->rpm[1] = (int16_t)r2; s->rpm[2] = (int16_t)r3;
             s->lage = (uint8_t)lg; s->modus = (uint8_t)ec[3]; s->grund = (uint8_t)grund; s->leise = modusJetzt == 2;
+            s->ecFan = (int16_t)(nurLesen || Te < 0 ? -1 : curve_duty(Te));
             sh->nSample++;
             if (k % 60 == 0) { sh->versatz = versatz; sh->felder = felder(); for (int i = 0; i < 3; i++) sh->deckel[i] = stufen[lage[i].stufe]; }
         }

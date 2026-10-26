@@ -5,8 +5,8 @@
 #include <stdint.h>
 #include <wchar.h>
 
-#define EVO_VERSION   "0.5.0"   // also AppVer in installer\evo-x2-cool.iss and the git tag v0.5.0
-#define EVO_VERSION_W L"0.5.0"
+#define EVO_VERSION   "0.5.1"   // also AppVer in installer\evo-x2-cool.iss and the git tag v0.5.1
+#define EVO_VERSION_W L"0.5.1"
 #define EVO_SHM    L"Global\\evo-x2-cool"
 #define EVO_STOPP  L"Global\\evo-x2-cool-stopp"   // set it and the controller restores everything and ends (service too)
 #define EVO_MAGIC  0x45564F32u   // "EVO2"
@@ -45,6 +45,7 @@ typedef struct {
     float mhz, load;                    // highest effective clock, CPU load %
     int16_t ecT, busy, gpuLoad, gpuT, fan, cap, rpm[3];   // fan = duty % the controller asked for
     uint8_t lage, modus, grund, leise;  // modus = EC power mode register 0x31
+    int16_t ecFan;                      // duty % the written EC curve gives at the current EC temperature, -1 = BIOS curve (fills padding, size unchanged)
 } EvoSample;
 
 typedef struct { int64_t t; uint8_t wichtig; char text[119]; } EvoEvent;   // wichtig = hot spot / emergency, shown red; text UTF-8
