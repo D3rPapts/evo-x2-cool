@@ -28,7 +28,7 @@ There was no way to control the fans of this machine under Windows, so we built 
 
 EVO-X2-COOL watches the chip every second, predicts where the temperature is heading, and:
 
-- **controls the fans** through the fan curve inside the EC: as quiet as possible while the predicted end temperature stays below the target (default 80 °C). Rising power is counted ahead, but only while it still rises and never beyond the measured power; far below the target the fan ramps up slowly, so a short burst stays quiet;
+- **controls the fans** through the fan curve inside the EC: as quiet as possible while the predicted end temperature stays below the target (default 80 °C). Rising power is counted ahead, but only while it still rises and never beyond the measured power; far below the target the fan ramps up slowly, so a short burst stays quiet. The 120 mm system fan on the back (SSDs, WLAN) is off while idle and the SSDs are cool, and runs at least 30 % from 55 °C SSD temperature;
 - **brakes the clock** depending on the load type (few cores / many cores / GPU busy). After a hot spot it drops to a safe clock for 30 s and remembers a lower limit for that load type. It tries the next higher step again only after a calm run with a core really at the limit: 10 minutes, then 1 hour, then 1 day after every further hot spot on that step;
 - **learns** how warm the machine really gets at a given chip power and fan duty, and corrects its own model. The starting model (end temperature = 34 + P × (0.58 − 0.30 × fan) + 6 × hottest core W, P = whole chip power) was fitted on the logs of two EVO-X2;
 - **switches the EC to the quiet power mode** (54 W) while many cores are busy and the GPU is idle;

@@ -5,8 +5,8 @@
 #include <stdint.h>
 #include <wchar.h>
 
-#define EVO_VERSION   "0.4.0"   // also AppVer in installer\evo-x2-cool.iss and the git tag v0.4.0
-#define EVO_VERSION_W L"0.4.0"
+#define EVO_VERSION   "0.5.0"   // also AppVer in installer\evo-x2-cool.iss and the git tag v0.5.0
+#define EVO_VERSION_W L"0.5.0"
 #define EVO_SHM    L"Global\\evo-x2-cool"
 #define EVO_STOPP  L"Global\\evo-x2-cool-stopp"   // set it and the controller restores everything and ends (service too)
 #define EVO_MAGIC  0x45564F32u   // "EVO2"
