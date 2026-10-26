@@ -687,14 +687,18 @@ static int run(void)
         if (grund == GRUND_NOTFALL && !warNotfall && !nurLesen) event2(1, L_("notfall", "NOTFALL: CPU %.0f °C, Gehäuse %d °C → Lüfter 100 %%"), T, Te);
         // up: a prediction raises by at most 4 %/s (jumping 30 -> 70 % is loud, the fan needs ~10 s per step anyway),
         // only 1 %/s while the chip is still far below the target (a short burst then hardly reaches the fan),
-        // at once only when really hot or in an emergency; down after 10 s by 3 %/s; after an emergency straight to the wanted value
+        // at once only when really hot or in an emergency; down after 10 s by 3 %/s.
+        // After an emergency down at once but only by 1 %/s: dropping straight back let the chip heat up again within
+        // a minute, and the emergency pumped (machine 2: 22 times in 70 min). Also with the fan switched off, the
+        // controller keeps the fan until it is down at its wanted value, then the BIOS curve takes over again.
+        static int nachNotfall;
         float auf = T < ziel - 8 && emaT < ziel - 8 ? 1.0f : 4.0f;
-        if (wantD >= d) { d = grund == GRUND_NOTFALL || emaT >= ziel + 5 ? wantD : fminf(wantD, d + auf); lowSince = -1; }
-        else if (warNotfall && T < 90) { d = wantD; lowSince = -1; }
+        if (wantD >= d) { d = grund == GRUND_NOTFALL || emaT >= ziel + 5 ? wantD : fminf(wantD, d + auf); lowSince = -1; nachNotfall = 0; }
+        else if (warNotfall || nachNotfall) { d = fmaxf(wantD, d - 1); nachNotfall = d > wantD; lowSince = -1; }
         else { if (lowSince < 0) lowSince = k; if (k - lowSince >= 10) d = fmaxf(wantD, d - 3); }
         warNotfall = grund == GRUND_NOTFALL;
         int di = (int)lroundf(d);
-        int fanOn = !nurLesen && ((fn & F_LUEFTER) || grund == GRUND_NOTFALL);   // the emergency takes over even when switched off
+        int fanOn = !nurLesen && ((fn & F_LUEFTER) || grund == GRUND_NOTFALL || nachNotfall);   // the emergency takes over even when switched off
         if (fanOn && (abs(di - curveD) >= 2 || fabsf(emaTe - curveAnchor) > 3)) write_curve(di, emaTe, 0);
         else if (fanOn && k % 60 == 30 && curveD >= 0) write_curve(curveD, curveAnchor, 1);
         else if (!fanOn && curveD >= 0) restore_bios(orig);
