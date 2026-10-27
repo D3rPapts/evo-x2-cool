@@ -328,7 +328,7 @@ static void csv_line(const char *line)
         csvDay = st.wDay;
         if (GetFileSize(csv, 0) == 0) {
             static const char h[] = "Zeit;Tctl;Tctl_glatt;EC_C;Paket_W;Kerne_W;Kern_max_W;GPU_W;APU_W;Waerme_W;P_vorher;Takt_max_MHz;CPU_Last;"
-                                    "Kerne_aktiv;GPU_Last;GPU_C;Prozent;Grund;L1;L2;Sys;Vorhersage_C;Versatz;Felder;Deckel_MHz;Lage;Modus;Regler_Prozent;SSD_C;SSD_Sensor_C;SSD_einzeln\r\n";
+                                    "Kerne_aktiv;GPU_Last;GPU_C;Prozent;Grund;L1;L2;Sys;Vorhersage_C;Versatz;Felder;Deckel_MHz;Lage;Modus;Regler_Prozent;SSD_C;SSD_Sensor_C;SSD_einzeln;SSD_MBs\r\n";
             WriteFile(csv, h, sizeof h - 1, &w, 0);
         }
     }
@@ -477,6 +477,32 @@ static int ssd_temp(int *sensor)
         CloseHandle(h);
     }
     return best;
+}
+
+// data moved by all drives together in MB/s since the last call (read every second). The temperature comes too late:
+// on machine 2 a 990 dropped out while the system fan only followed its rising temperature. The amount of data
+// moved is known at once, so the system fan can start before the drive is warm.
+static double ssd_io(void)
+{
+    static HANDLE h[8]; static int offen; static LONGLONG alt[8]; static ULONGLONG tAlt;
+    ULONGLONG t = GetTickCount64(); double sek = tAlt ? (t - tAlt) / 1000.0 : 0; tAlt = t;
+    if (!offen) {
+        offen = 1;
+        for (int i = 0; i < 8; i++) {
+            wchar_t p[32]; swprintf(p, 32, L"\\\\.\\PhysicalDrive%d", i);
+            h[i] = CreateFileW(p, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, 0, OPEN_EXISTING, 0, 0);
+            alt[i] = -1;
+        }
+    }
+    double mb = 0;
+    for (int i = 0; i < 8; i++) {
+        DISK_PERFORMANCE dp; DWORD n;
+        if (h[i] == INVALID_HANDLE_VALUE || !DeviceIoControl(h[i], IOCTL_DISK_PERFORMANCE, 0, 0, &dp, sizeof dp, &n, 0)) continue;
+        LONGLONG b = dp.BytesRead.QuadPart + dp.BytesWritten.QuadPart;
+        if (alt[i] >= 0 && b >= alt[i] && sek > 0) mb += (b - alt[i]) / 1e6 / sek;
+        alt[i] = b;
+    }
+    return mb;
 }
 
 // fan curve anchored 3 °C below the smoothed EC temperature: today's temperature lies on the rising part,
@@ -810,18 +836,24 @@ static int run(void)
         int di = (int)lroundf(d);
         // system fan: the 120 mm fan on the back of the board cools the SSDs, the WLAN card and the board under the
         // chip, not the chip itself. Idle with cool SSDs: off, like the BIOS does; otherwise with the CPU fans;
-        // warm SSDs (loading a big model): at least 30 %, +5 % per °C above 55, and +3 % per °C of the hottest sensor
-        // (SSD controller) above 75. Read every 5 s: moving data heats a 990 by 20 °C within two minutes. SSD unknown:
-        // as before, with the CPU fans
-        static int ssdT = -1, ssdS = -1, sysAus;
+        // running: at least 40 % and 10 % above the CPU fans (it followed them at 30-45 %, ~800 rpm, while a 990 on
+        // machine 2 overheated). Warm SSDs: at least 30 %, +6 % per °C above 50, and +4 % per °C of the hottest sensor
+        // (SSD controller) above 70; read every 5 s, moving data heats a 990 by 20 °C within two minutes.
+        // Data moving (read every second): ahead of the temperature, 50 % from 100 MB/s, +10 % per 200 MB/s, full from
+        // ~1100 MB/s; held and then let down by 1 %/s, as the drive keeps the heat for a while. SSD unknown: with the CPU fans
+        static int ssdT = -1, ssdS = -1, sysAus; static float ioHalt;
         if (k % 5 == 1) ssdT = ssd_temp(&ssdS);
-        int aus = leer && grund != GRUND_NOTFALL && ssdT >= 0 && ssdT < (sysAus ? 50 : 47) && ssdS < (sysAus ? 75 : 70);
+        double io = ssd_io();
+        float ioWant = io >= 100 ? (float)fmin(100, 50 + (io - 100) / 20) : 0;
+        ioHalt = fmaxf(ioWant, ioHalt - 1);
+        int aus = leer && grund != GRUND_NOTFALL && ioHalt <= 0 && ssdT >= 0 && ssdT < (sysAus ? 50 : 47) && ssdS < (sysAus ? 75 : 70);
         if (aus != sysAus && !nurLesen && (fn & F_LUEFTER)) event(aus ? L_("sys_aus", "Systemlüfter aus (Leerlauf, SSD %d °C)") : L_("sys_an", "Systemlüfter wieder an (SSD %d °C)"), ssdT);
         sysAus = aus;
-        int sw = aus ? 0 : di;
-        if (ssdT >= 55) { int m = 30 + 5 * (ssdT - 55); sw = sw > m ? sw : m > 100 ? 100 : m; }
-        if (ssdS >= 75) { int m = 30 + 3 * (ssdS - 75); sw = sw > m ? sw : m > 100 ? 100 : m; }
-        sysWant = sw;
+        int sw = aus ? 0 : di + 10 > 40 ? di + 10 : 40;
+        if (ssdT >= 50) { int m = 30 + 6 * (ssdT - 50); sw = sw > m ? sw : m; }
+        if (ssdS >= 70) { int m = 30 + 4 * (ssdS - 70); sw = sw > m ? sw : m; }
+        if (ioHalt > sw) sw = (int)ceilf(ioHalt);
+        sysWant = sw > 100 ? 100 : sw;
         int fanOn = !nurLesen && ((fn & F_LUEFTER) || grund == GRUND_NOTFALL || nachNotfall);   // the emergency takes over even when switched off
         // (yellow does not: switched off, the BIOS curve is already at full from 85 °C)
         if (fanOn && (abs(di - curveD) >= 2 || abs(sysWant - curveSys) >= 2 || fabsf(emaTe - curveAnchor) > 3)) write_curve(di, emaTe, 0);
@@ -848,9 +880,9 @@ static int run(void)
         }
         SYSTEMTIME st; GetLocalTime(&st);
         char line[400];
-        snprintf(line, sizeof line, "%02d:%02d:%02d;%.1f;%.1f;%d;%.1f;%.1f;%.1f;%.0f;%d;%.1f;%.1f;%.0f;%.0f;%d;%d;%d;%d;%s;%d;%d;%d;%.1f;%.2f;%d;%d;%s;%d;%d;%d;%d;%s\r\n",
+        snprintf(line, sizeof line, "%02d:%02d:%02d;%.1f;%.1f;%d;%.1f;%.1f;%.1f;%.0f;%d;%.1f;%.1f;%.0f;%.0f;%d;%d;%d;%d;%s;%d;%d;%d;%.1f;%.2f;%d;%d;%s;%d;%d;%d;%d;%s;%.0f\r\n",
                  st.wHour, st.wMinute, st.wSecond, T, emaT, Te, pkgW, sumW, maxW, G, aW, heat, pv, maxMhz, load, busy, gL, gT,
-                 nurLesen ? -1 : curveD, grundName[grund], r1, r2, r3, vorh, versatz, felder(), capNow, lageName[lg], ec[3], nurLesen ? -1 : di, ssdT, ssdS, ssdEinzeln);
+                 nurLesen ? -1 : curveD, grundName[grund], r1, r2, r3, vorh, versatz, felder(), capNow, lageName[lg], ec[3], nurLesen ? -1 : di, ssdT, ssdS, ssdEinzeln, io);
         csv_line(line);
         if (console) printf("\r%02d:%02d:%02d  Tctl %5.1f (glatt %5.1f)  EC %3d  Kerne %5.1f W  GPU %5.1f W  -> Luefter %3d %% [%s] %d U/min  Takt %d MHz [%s]   ",
                             st.wHour, st.wMinute, st.wSecond, T, emaT, Te, sumW, G, nurLesen ? -1 : curveD, grundName[grund], r1, capNow, lageName[lg]);
