@@ -167,10 +167,20 @@ static void pout(uint8_t port, uint8_t v) { int64_t a[2] = { port, v }; pio_exec
 // driver cutting in; it does not take our mutex). Each byte costs ~1 ms of spinning, so few bytes are read.
 static int ec_wait(uint8_t mask, uint8_t want) { for (int i = 0; i < 20000; i++) if ((pin(0x66) & mask) == want) return 1; return 0; }
 
+// Windows' ACPI EC driver talks to the EC as well and does not take our mutex. A byte waiting in the output buffer is
+// most likely its answer: taking it made Windows time out ("EC did not respond", ACPI event 13, 5 s later) and gave us
+// a foreign byte (0x49: L1 ~18800 rpm, once a case temperature of 116 °C and a false emergency). So wait until the EC
+// is idle; only a byte nobody fetches for a while is really stale and is dropped.
+static int ec_idle(void)
+{
+    for (int i = 0; i < 2000; i++) if ((pin(0x66) & 3) == 0) return 1;
+    if (pin(0x66) & 1) pin(0x62);
+    return ec_wait(2, 0);
+}
+
 static int ec_read_raw(uint8_t reg)
 {
-    if (pin(0x66) & 1) pin(0x62);   // drop a stale byte
-    if (!ec_wait(2, 0)) return -1; pout(0x66, 0x80);
+    if (!ec_idle()) return -1; pout(0x66, 0x80);
     if (!ec_wait(2, 0)) return -1; pout(0x62, reg);
     if (!ec_wait(1, 1)) return -1; return pin(0x62);
 }
@@ -186,13 +196,22 @@ static int ec_read(uint8_t reg)
     return -1;
 }
 
+// A changed value counts only when a second read gives the same: a byte meant for Windows rarely comes twice in a row.
+// Unchanged values cost one read as before.
+static int ec_read_sicher(uint8_t reg, int alt)
+{
+    int v = ec_read(reg);
+    if (v < 0 || v == alt) return v;
+    return ec_read(reg) == v ? v : -1;
+}
+
 // write with read-back; never called in read-only mode
 static int ec_write(uint8_t reg, uint8_t val)
 {
     if (nurLesen) return 0;
     for (int t = 0; t < 5; t++) {
         if (ec_lock()) {
-            int ok = ec_wait(2, 0); if (ok) pout(0x66, 0x81);
+            int ok = ec_idle(); if (ok) pout(0x66, 0x81);
             ok = ok && ec_wait(2, 0); if (ok) pout(0x62, reg);
             ok = ok && ec_wait(2, 0); if (ok) pout(0x62, val);
             ok = ok && ec_wait(2, 0) && ec_read_raw(reg) == val;
@@ -521,7 +540,7 @@ static int run(void)
     if (sh) { memset(sh, 0, sizeof *sh); sh->magic = EVO_MAGIC; sh->size = sizeof *sh; }
 
     // safety: only control the EC we know (firmware 1.10 = bytes 01 0A at 0x00)
-    int v0 = ec_read(0x00), v1 = ec_read(0x01);
+    int v0 = ec_read_sicher(0x00, -1), v1 = ec_read_sicher(0x01, -1);
     if (!nurLesen && (v0 != 1 || v1 != 10)) { event(L_("ec_version", "EC-Version %d.%d unbekannt (erwartet 1.10): nur lesen"), v0, v1); nurLesen = 1; }
     uint8_t orig[12] = { 0 };
     if (!nurLesen && !read_bios_fan(orig)) { event(L_("bios_fehlt", "BIOS-Lüftereinstellungen (UEFI Setup) nicht lesbar: nur lesen")); nurLesen = 1; }
@@ -531,7 +550,7 @@ static int run(void)
     if (adlIdx < 0) event(L_("adl", "GPU-Werte vom Treiber nicht verfügbar: GPU-Leistung wird geschätzt"));
     NTQSI ntqsi = (NTQSI)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQuerySystemInformation");
     load_model();
-    int modusOrig = ec_read(0x31), modusJetzt = modusOrig;
+    int modusOrig = ec_read_sicher(0x31, -1), modusJetzt = modusOrig;
     if (modusOrig == 2 || modusOrig < 0) modusOrig = 0;   // "leise" at start is most likely left over from a killed run
     if (sh) {
         sh->nurLesen = nurLesen; sh->funktionen = nurLesen ? 0 : fn; sh->ziel = ziel; sh->minP = minP; sh->maxP = maxP; sh->spitze = spitze; sh->achtung = achtung; sh->alarm = alarm;
@@ -563,7 +582,7 @@ static int run(void)
     // controller state
     float hist[10]; int nHist = 0;
     float emaT = 0, slope = 0, pFast = 0, pSlow = 0, mFast = 0, mSlow = 0, emaTe = 0, d = (float)(minP > 40 ? minP : 40), boost = 0;
-    int capNow = read_cap(), sicherBis = 0, sicherCap = 0, grafikSeit = -1, nachlauf = 0, lageNow = -1, locker = 0, hot = 0, lowSince = -1, warNotfall = 0;
+    int capNow = read_cap(), sicherBis = 0, sicherCap = 0, grafikSeit = -1, grafikBis = 0, nachlauf = 0, lageNow = -1, locker = 0, hot = 0, lowSince = -1, warNotfall = 0;
     int ec[8] = { -1, -1, -1, -1, -1, -1, -1, -1 };
     static const uint8_t regs[8] = { 0x70, 0x35, 0x36, 0x31, 0x37, 0x38, 0x28, 0x29 };
     int console = GetConsoleWindow() != 0;
@@ -626,7 +645,8 @@ static int run(void)
         // EC temperature and fan 1 every 2 s (the EC temperature is only the second emergency path and the slow curve
         // anchor; Tctl is read every second), the rest every 10 s
         int nEc = k % 10 == 0 ? 8 : k % 2 == 0 ? 3 : 0;
-        for (int i = 0; i < nEc; i++) { int v = ec_read(regs[i]); if (v >= 0) ec[i] = v; }
+        // a value that is not confirmed or impossible (case above 110 °C) keeps the last reading
+        for (int i = 0; i < nEc; i++) { int v = ec_read_sicher(regs[i], ec[i]); if (v >= 0 && !(i == 0 && v > 110)) ec[i] = v; }
         int Te = ec[0];
         // GPU every second while it works, every 2 s while it rests (a start is noticed at most 1 s later)
         static int gW = -1, gL = -1, gT = -1, aW = -1;
@@ -671,10 +691,12 @@ static int run(void)
         }
 
         // --- situation and clock cap ---
-        if (G > 20) { if (grafikSeit < 0) grafikSeit = k; }
+        if (G > 20) { if (grafikSeit < 0) grafikSeit = k; grafikBis = k + 60; }
         else if (grafikSeit >= 0) { if (k - grafikSeit >= 30) nachlauf = 1; grafikSeit = -1; }
         if (nachlauf && emaT < 65) nachlauf = 0;   // the heat of the GPU phase is gone
-        int lg = G > 20 || nachlauf ? (G > 20 && busy > 4 ? LAGE_BEIDE : LAGE_GRAFIK) : busy > 4 ? LAGE_VIELE : LAGE_WENIGE;
+        // a GPU pause under a minute stays "GPU": an image job on machine 2 switched GPU <-> few cores every ~10 s for
+        // minutes, and each switch moved the clock cap 3300 <-> 3600 MHz
+        int lg = G > 20 || nachlauf || k < grafikBis ? (G > 20 && busy > 4 ? LAGE_BEIDE : LAGE_GRAFIK) : busy > 4 ? LAGE_VIELE : LAGE_WENIGE;
         // a situation with a lower cap counts at once, one with a higher cap only after 10 s: a few busy threads that
         // come and go must not flip the cap (and the EC mode) every second
         if (lageNow >= 0 && lg != lageNow && lage[lg].stufe > lage[lageNow].stufe && ++locker < 10) lg = lageNow;
