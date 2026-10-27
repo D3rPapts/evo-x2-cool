@@ -328,7 +328,7 @@ static void csv_line(const char *line)
         csvDay = st.wDay;
         if (GetFileSize(csv, 0) == 0) {
             static const char h[] = "Zeit;Tctl;Tctl_glatt;EC_C;Paket_W;Kerne_W;Kern_max_W;GPU_W;APU_W;Waerme_W;P_vorher;Takt_max_MHz;CPU_Last;"
-                                    "Kerne_aktiv;GPU_Last;GPU_C;Prozent;Grund;L1;L2;Sys;Vorhersage_C;Versatz;Felder;Deckel_MHz;Lage;Modus;Regler_Prozent;SSD_C;SSD_Sensor_C\r\n";
+                                    "Kerne_aktiv;GPU_Last;GPU_C;Prozent;Grund;L1;L2;Sys;Vorhersage_C;Versatz;Felder;Deckel_MHz;Lage;Modus;Regler_Prozent;SSD_C;SSD_Sensor_C;SSD_einzeln\r\n";
             WriteFile(csv, h, sizeof h - 1, &w, 0);
         }
     }
@@ -451,9 +451,11 @@ static int read_bios_fan(uint8_t orig[12])
 // returns the hottest composite value (the one the drive's own limits refer to); *sensor gets the hottest single
 // sensor. A Samsung 990 PRO reports its controller as a second sensor: 90 °C at a composite of 66 °C while data moved,
 // and on machine 2 a 990 dropped out under GPU load while the composite never raised the system fan.
+// Each drive goes to ssdEinzeln as "disk:composite/sensor" for the log, so one can see which one was hot.
+static char ssdEinzeln[96];
 static int ssd_temp(int *sensor)
 {
-    int best = -1; *sensor = -1;
+    int best = -1, len = 0; *sensor = -1; ssdEinzeln[0] = 0;
     for (int i = 0; i < 8; i++) {
         wchar_t p[32]; swprintf(p, 32, L"\\\\.\\PhysicalDrive%d", i);
         HANDLE h = CreateFileW(p, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, 0, OPEN_EXISTING, 0, 0);
@@ -461,13 +463,16 @@ static int ssd_temp(int *sensor)
         STORAGE_PROPERTY_QUERY q = { StorageDeviceTemperatureProperty, PropertyStandardQuery };
         union { STORAGE_TEMPERATURE_DATA_DESCRIPTOR d; BYTE b[256]; } o; DWORD n;
         if (DeviceIoControl(h, IOCTL_STORAGE_QUERY_PROPERTY, &q, sizeof q, &o, sizeof o, &n, 0) && n >= sizeof o.d && o.d.InfoCount > 0) {
-            int t = o.d.TemperatureInfo[0].Temperature;
-            if (t > best && t < 120) best = t;
+            int c = o.d.TemperatureInfo[0].Temperature, s = -1;
+            if (c > best && c < 120) best = c;
             int nInfo = (n - offsetof(STORAGE_TEMPERATURE_DATA_DESCRIPTOR, TemperatureInfo)) / sizeof(STORAGE_TEMPERATURE_INFO);
-            for (int s = 0; s < o.d.InfoCount && s < nInfo; s++) {
-                t = o.d.TemperatureInfo[s].Temperature;
-                if (t > *sensor && t < 150) *sensor = t;
+            for (int j = 0; j < o.d.InfoCount && j < nInfo; j++) {
+                int t = o.d.TemperatureInfo[j].Temperature;
+                if (t > s && t < 150) s = t;
             }
+            if (s > *sensor) *sensor = s;
+            if (len < (int)sizeof ssdEinzeln - 16)
+                len += snprintf(ssdEinzeln + len, sizeof ssdEinzeln - len, "%s%d:%d/%d", len ? " " : "", i, c, s);
         }
         CloseHandle(h);
     }
@@ -837,14 +842,15 @@ static int run(void)
             s->lage = (uint8_t)lg; s->modus = (uint8_t)ec[3]; s->grund = (uint8_t)grund; s->leise = modusJetzt == 2;
             s->ecFan = (int16_t)(nurLesen || Te < 0 ? -1 : curve_duty(Te, 0));
             s->sysEc = (int16_t)(nurLesen || Te < 0 ? -1 : curve_duty(Te, 6)); s->sysFan = (int16_t)(nurLesen ? -1 : curveSys);
+            s->ssdT = (int16_t)ssdT; s->ssdS = (int16_t)ssdS;
             sh->nSample++;
             if (k % 60 == 0) { sh->versatz = versatz; sh->felder = felder(); for (int i = 0; i < EVO_NLAGE; i++) sh->deckel[i] = stufen[lage[i].stufe]; }
         }
         SYSTEMTIME st; GetLocalTime(&st);
         char line[400];
-        snprintf(line, sizeof line, "%02d:%02d:%02d;%.1f;%.1f;%d;%.1f;%.1f;%.1f;%.0f;%d;%.1f;%.1f;%.0f;%.0f;%d;%d;%d;%d;%s;%d;%d;%d;%.1f;%.2f;%d;%d;%s;%d;%d;%d;%d\r\n",
+        snprintf(line, sizeof line, "%02d:%02d:%02d;%.1f;%.1f;%d;%.1f;%.1f;%.1f;%.0f;%d;%.1f;%.1f;%.0f;%.0f;%d;%d;%d;%d;%s;%d;%d;%d;%.1f;%.2f;%d;%d;%s;%d;%d;%d;%d;%s\r\n",
                  st.wHour, st.wMinute, st.wSecond, T, emaT, Te, pkgW, sumW, maxW, G, aW, heat, pv, maxMhz, load, busy, gL, gT,
-                 nurLesen ? -1 : curveD, grundName[grund], r1, r2, r3, vorh, versatz, felder(), capNow, lageName[lg], ec[3], nurLesen ? -1 : di, ssdT, ssdS);
+                 nurLesen ? -1 : curveD, grundName[grund], r1, r2, r3, vorh, versatz, felder(), capNow, lageName[lg], ec[3], nurLesen ? -1 : di, ssdT, ssdS, ssdEinzeln);
         csv_line(line);
         if (console) printf("\r%02d:%02d:%02d  Tctl %5.1f (glatt %5.1f)  EC %3d  Kerne %5.1f W  GPU %5.1f W  -> Luefter %3d %% [%s] %d U/min  Takt %d MHz [%s]   ",
                             st.wHour, st.wMinute, st.wSecond, T, emaT, Te, sumW, G, nurLesen ? -1 : curveD, grundName[grund], r1, capNow, lageName[lg]);

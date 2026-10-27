@@ -398,7 +398,7 @@ static void paint(HWND w, HDC dc)
     }
 
     // ---- tiles ----
-    wchar_t v[6][32], sub[6][80];
+    wchar_t v[7][32], sub[7][80];
     COLORREF tc = at->tctl >= sh->spitze ? C_HOT : at->tglatt > sh->ziel ? C_WARM : C_TEXT;
     // the same order for CPU and GPU: temperature large, power below
     swprintf(v[0], 32, L"%.1f °C", at->tctl);         swprintf(sub[0], 80, T(L"sub_cpu", L"geglättet %.1f (Ziel %.0f) · %.1f W"), at->tglatt, sh->ziel, at->coreW);
@@ -410,11 +410,16 @@ static void paint(HWND w, HDC dc)
     swprintf(sub[3], 80, T(L"sub_cap", L"Lastart: %s%s"), lageText(at->lage), at->leise ? T(L"leise", L" + EC leise") : L"");
     swprintf(v[4], 32, L"%.0f W", at->pkgW);          swprintf(sub[4], 80, T(L"sub_chip", L"stärkster Kern %.1f W · %d Kerne voll"), at->maxCoreW, at->busy);
     swprintf(v[5], 32, T(L"v_learn", L"%d Bereiche"), sh->felder); swprintf(sub[5], 80, T(L"sub_learn", L"real %+.1f °C wärmer als Formel"), sh->versatz);
-    const wchar_t *labels[6] = { T(L"t_cpu", L"CPU"), T(L"t_gpu", L"Grafik"), T(L"t_fan", L"Lüfter"), T(L"t_cap", L"Taktbremse"), T(L"t_chip", L"Chip gesamt"), T(L"t_learn", L"Gelernte Last-Bereiche") };
-    int tw = (rc.right - 2 * pad - 5 * gap) / 6;
-    for (int i = 0; i < 6; i++) {
+    // SSD: the composite large (the drive's own limits refer to it), the hottest sensor (controller) below; warm from
+    // 70 / 90 °C, hot from the 990 PRO's own warning level 82 °C or a controller at 100 °C
+    if (at->ssdT >= 0) swprintf(v[6], 32, L"%d °C", at->ssdT); else wcscpy(v[6], L"–");
+    swprintf(sub[6], 80, T(L"sub_ssd", L"Controller %d °C · System %d U/min"), at->ssdS, at->rpm[2]);
+    COLORREF ssdC = at->ssdT >= 82 || at->ssdS >= 100 ? C_HOT : at->ssdT >= 70 || at->ssdS >= 90 ? C_WARM : C_TEXT;
+    const wchar_t *labels[7] = { T(L"t_cpu", L"CPU"), T(L"t_gpu", L"Grafik"), T(L"t_fan", L"Lüfter"), T(L"t_cap", L"Taktbremse"), T(L"t_chip", L"Chip gesamt"), T(L"t_learn", L"Gelernte Last-Bereiche"), T(L"t_ssd", L"SSD") };
+    int tw = (rc.right - 2 * pad - 6 * gap) / 7;
+    for (int i = 0; i < 7; i++) {
         RECT t = { pad + i * (tw + gap), pad, pad + i * (tw + gap) + tw, pad + tileH };
-        tile(dc, t, labels[i], i == 0 ? tc : at->grund == GRUND_NOTFALL && i == 2 ? C_HOT : at->grund == GRUND_ACHTUNG && i == 2 ? C_WARM : C_TEXT, v[i], sub[i]);
+        tile(dc, t, labels[i], i == 0 ? tc : i == 6 ? ssdC : at->grund == GRUND_NOTFALL && i == 2 ? C_HOT : at->grund == GRUND_ACHTUNG && i == 2 ? C_WARM : C_TEXT, v[i], sub[i]);
     }
 
     // ---- span buttons and status ----
