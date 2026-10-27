@@ -836,7 +836,7 @@ static int run(void)
         int di = (int)lroundf(d);
         // system fan: the 120 mm fan on the back of the board cools the SSDs, the WLAN card and the board under the
         // chip, not the chip itself. Idle with cool SSDs: off, like the BIOS does; otherwise with the CPU fans;
-        // running: at least 40 % and 10 % above the CPU fans (it followed them at 30-45 %, ~800 rpm, while a 990 on
+        // running: at least 30 % and 10 % above the CPU fans (it followed them at 30-45 %, ~800 rpm, while a 990 on
         // machine 2 overheated). Warm SSDs: at least 30 %, +6 % per °C above 50, and +4 % per °C of the hottest sensor
         // (SSD controller) above 70; read every 5 s, moving data heats a 990 by 20 °C within two minutes.
         // Data moving (read every second): ahead of the temperature, 50 % from 100 MB/s, +10 % per 200 MB/s, full from
@@ -849,7 +849,7 @@ static int run(void)
         int aus = leer && grund != GRUND_NOTFALL && ioHalt <= 0 && ssdT >= 0 && ssdT < (sysAus ? 50 : 47) && ssdS < (sysAus ? 75 : 70);
         if (aus != sysAus && !nurLesen && (fn & F_LUEFTER)) event(aus ? L_("sys_aus", "Systemlüfter aus (Leerlauf, SSD %d °C)") : L_("sys_an", "Systemlüfter wieder an (SSD %d °C)"), ssdT);
         sysAus = aus;
-        int sw = aus ? 0 : di + 10 > 40 ? di + 10 : 40;
+        int sw = aus ? 0 : di + 10 > 30 ? di + 10 : 30;
         if (ssdT >= 50) { int m = 30 + 6 * (ssdT - 50); sw = sw > m ? sw : m; }
         if (ssdS >= 70) { int m = 30 + 4 * (ssdS - 70); sw = sw > m ? sw : m; }
         if (ioHalt > sw) sw = (int)ceilf(ioHalt);
