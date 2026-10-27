@@ -46,10 +46,15 @@
 #define SVC L"evo-x2-cool"
 
 // ---------- settings (einstellungen.ini) ----------
-static float ziel = 80; static int minP = 30, minLeer = 10, maxP = 70, spitze = 88, sicherMhz = 3600, nurLesen;
+static float ziel = 80; static int minP = 30, minLeer = 10, maxP = 70, spitze = 88, achtung = 90, alarm = 95, sicherMhz = 3600, nurLesen;
 static unsigned fn = F_ALLE;   // functions switched on
-static const int stufen[] = { 3300, 3600, 3900, 4200, 4500 };   // clock cap steps, MHz; the first one is taken after a hot spot
-#define NSTUFEN 5
+static const int stufen[] = { 3000, 3300, 3600, 3900, 4200, 4500 };   // clock cap steps, MHz
+#define NSTUFEN 6
+// lowest step per situation, also the cap for 30 s after a hot spot: 3300 MHz, but 3000 with the GPU busy and many cores
+// at the same time. There the cores take power from the GPU at the same 85 W and Tctl jumped from 80 to 91-97 °C within
+// 5-10 s (machine 2). Lower is not worth it: on machine 1, 2400 MHz cost 19 % clock for only ~12 % less core power, and
+// the spikes still came (92.5 °C), when the GPU paused and the cores took the free budget.
+static const int unten[EVO_NLAGE] = { 1, 1, 1, 0 };
 static const float tau = 40;   // thermal time constant of the heatsink, s
 
 static HANDLE hCpu, hEc, mPci, mEc, stopEv;
@@ -82,7 +87,7 @@ static unsigned load_settings(void)
     if (GetFileAttributesW(iniFile) == INVALID_FILE_ATTRIBUTES) {
         static const char def[] =
             "; evo-x2-cool settings, re-read within 5 s after a change\r\n"
-            "[Regler]\r\nZiel=80\r\nMinProzent=30\r\nMinLeerlauf=10\r\nMaxProzent=70\r\nSpitze=88\r\nSicherMHz=3600\r\nSprache=de\r\n\r\n"
+            "[Regler]\r\nZiel=80\r\nMinProzent=30\r\nMinLeerlauf=10\r\nMaxProzent=70\r\nSpitze=88\r\nAchtung=90\r\nAlarm=95\r\nSicherMHz=3600\r\nSprache=de\r\n\r\n"
             "; 1 = on, 0 = off. The emergency (fan 100 % when overheating) always stays on.\r\n"
             "[Funktionen]\r\nLuefter=1\r\nTaktbremse=1\r\nEcLeise=1\r\nLernen=1\r\nVorhersage=1\r\n\r\n"
             "; window: Thema = system / hell / dunkel; UpdatePruefen = 1: ask GitHub once a day for a newer version (only shown, nothing installed)\r\n"
@@ -99,17 +104,23 @@ static unsigned load_settings(void)
     minLeer = GetPrivateProfileIntW(L"Regler", L"MinLeerlauf", 10, iniFile);
     maxP = GetPrivateProfileIntW(L"Regler", L"MaxProzent", 70, iniFile);
     spitze = GetPrivateProfileIntW(L"Regler", L"Spitze", 88, iniFile);
+    achtung = GetPrivateProfileIntW(L"Regler", L"Achtung", 90, iniFile);
+    alarm = GetPrivateProfileIntW(L"Regler", L"Alarm", 95, iniFile);
     sicherMhz = GetPrivateProfileIntW(L"Regler", L"SicherMHz", 3600, iniFile);
     // sane limits, whatever is in the file
     ziel = ziel < 50 ? 50 : ziel > 92 ? 92 : ziel; minP = minP < 0 ? 0 : minP > 100 ? 100 : minP;
     minLeer = minLeer < 0 ? 0 : minLeer > minP ? minP : minLeer;
     maxP = maxP < minP ? minP : maxP > 100 ? 100 : maxP; spitze = spitze < 70 ? 70 : spitze > 95 ? 95 : spitze;
+    // green < yellow < red, at least 2 °C apart; red at most 97 °C (the freezes came at ~100 °C)
+    alarm = alarm < 80 ? 80 : alarm > 97 ? 97 : alarm;
+    achtung = achtung < 70 ? 70 : achtung > alarm - 2 ? alarm - 2 : achtung;
+    if (ziel > achtung - 2) ziel = (float)(achtung - 2);
     GetPrivateProfileStringW(L"Regler", L"Sprache", L"de", code, 16, iniFile);
     wchar_t lf[MAX_PATH]; swprintf(lf, MAX_PATH, L"%s\\sprache-%s.ini", exeDir, code);
     if (wcscmp(lf, langFile)) { wcscpy(langFile, lf); nLang = 0; }
     unsigned old = fn; fn = 0;
     for (int i = 0; i < EVO_NFUNK; i++) if (GetPrivateProfileIntW(L"Funktionen", evoFunkKey[i], 1, iniFile)) fn |= 1u << i;
-    if (sh) { sh->ziel = ziel; sh->minP = minP; sh->maxP = maxP; sh->spitze = spitze; sh->funktionen = nurLesen ? 0 : fn; }
+    if (sh) { sh->ziel = ziel; sh->minP = minP; sh->maxP = maxP; sh->spitze = spitze; sh->achtung = achtung; sh->alarm = alarm; sh->funktionen = nurLesen ? 0 : fn; }
     return old;
 }
 
@@ -156,10 +167,20 @@ static void pout(uint8_t port, uint8_t v) { int64_t a[2] = { port, v }; pio_exec
 // driver cutting in; it does not take our mutex). Each byte costs ~1 ms of spinning, so few bytes are read.
 static int ec_wait(uint8_t mask, uint8_t want) { for (int i = 0; i < 20000; i++) if ((pin(0x66) & mask) == want) return 1; return 0; }
 
+// Windows' ACPI EC driver talks to the EC as well and does not take our mutex. A byte waiting in the output buffer is
+// most likely its answer: taking it made Windows time out ("EC did not respond", ACPI event 13, 5 s later) and gave us
+// a foreign byte (0x49: L1 ~18800 rpm, once a case temperature of 116 °C and a false emergency). So wait until the EC
+// is idle; only a byte nobody fetches for a while is really stale and is dropped.
+static int ec_idle(void)
+{
+    for (int i = 0; i < 2000; i++) if ((pin(0x66) & 3) == 0) return 1;
+    if (pin(0x66) & 1) pin(0x62);
+    return ec_wait(2, 0);
+}
+
 static int ec_read_raw(uint8_t reg)
 {
-    if (pin(0x66) & 1) pin(0x62);   // drop a stale byte
-    if (!ec_wait(2, 0)) return -1; pout(0x66, 0x80);
+    if (!ec_idle()) return -1; pout(0x66, 0x80);
     if (!ec_wait(2, 0)) return -1; pout(0x62, reg);
     if (!ec_wait(1, 1)) return -1; return pin(0x62);
 }
@@ -175,13 +196,22 @@ static int ec_read(uint8_t reg)
     return -1;
 }
 
+// A changed value counts only when a second read gives the same: a byte meant for Windows rarely comes twice in a row.
+// Unchanged values cost one read as before.
+static int ec_read_sicher(uint8_t reg, int alt)
+{
+    int v = ec_read(reg);
+    if (v < 0 || v == alt) return v;
+    return ec_read(reg) == v ? v : -1;
+}
+
 // write with read-back; never called in read-only mode
 static int ec_write(uint8_t reg, uint8_t val)
 {
     if (nurLesen) return 0;
     for (int t = 0; t < 5; t++) {
         if (ec_lock()) {
-            int ok = ec_wait(2, 0); if (ok) pout(0x66, 0x81);
+            int ok = ec_idle(); if (ok) pout(0x66, 0x81);
             ok = ok && ec_wait(2, 0); if (ok) pout(0x62, reg);
             ok = ok && ec_wait(2, 0); if (ok) pout(0x62, val);
             ok = ok && ec_wait(2, 0) && ec_read_raw(reg) == val;
@@ -298,7 +328,7 @@ static void csv_line(const char *line)
         csvDay = st.wDay;
         if (GetFileSize(csv, 0) == 0) {
             static const char h[] = "Zeit;Tctl;Tctl_glatt;EC_C;Paket_W;Kerne_W;Kern_max_W;GPU_W;APU_W;Waerme_W;P_vorher;Takt_max_MHz;CPU_Last;"
-                                    "Kerne_aktiv;GPU_Last;GPU_C;Prozent;Grund;L1;L2;Sys;Vorhersage_C;Versatz;Felder;Deckel_MHz;Lage;Modus;Regler_Prozent\r\n";
+                                    "Kerne_aktiv;GPU_Last;GPU_C;Prozent;Grund;L1;L2;Sys;Vorhersage_C;Versatz;Felder;Deckel_MHz;Lage;Modus;Regler_Prozent;SSD_C;SSD_Sensor_C;SSD_einzeln;SSD_MBs\r\n";
             WriteFile(csv, h, sizeof h - 1, &w, 0);
         }
     }
@@ -318,7 +348,7 @@ static void csv_line(const char *line)
 #define ND 11
 static struct { float r; int n; } cell[NP][ND];
 static float versatz;
-static const char *lageName[3] = { "wenige", "viele", "grafik" };   // keys in modell.txt
+static const char *lageName[EVO_NLAGE] = { "wenige", "viele", "grafik", "beide" };   // keys in modell.txt
 static const char *funk_text(int i)
 {
     switch (i) {
@@ -329,10 +359,14 @@ static const char *funk_text(int i)
     default: return L_("f4", "Vorhersage");
     }
 }
-static const char *lage_text(int i) { return i == LAGE_WENIGE ? L_("lage0", "wenige Kerne aktiv") : i == LAGE_VIELE ? L_("lage1", "viele Kerne aktiv") : L_("lage2", "Grafik arbeitet (oder kühlt danach ab)"); }
+static const char *lage_text(int i)
+{
+    return i == LAGE_WENIGE ? L_("lage0", "wenige Kerne aktiv") : i == LAGE_VIELE ? L_("lage1", "viele Kerne aktiv")
+         : i == LAGE_BEIDE ? L_("lage3", "Grafik + viele Kerne") : L_("lage2", "Grafik arbeitet (oder kühlt danach ab)");
+}
 // per situation: current cap step, calm seconds earned at that cap, highest temperature since, and how many hot spots
 // each step has caused. A step that caused hot spots is tried again only after a longer calm run: 10 min, 1 h, 1 day.
-static struct { int stufe, ruhig, spitze, fehl[NSTUFEN]; } lage[3];
+static struct { int stufe, ruhig, spitze, fehl[NSTUFEN]; } lage[EVO_NLAGE];
 static int wartezeit(int fehl) { return fehl <= 0 ? 600 : fehl == 1 ? 3600 : 86400; }
 
 static int pk(float p) { int k = (int)lroundf(p / 10); return k < 0 ? 0 : k >= NP ? NP - 1 : k; }
@@ -366,6 +400,7 @@ static void load_model(void)
 {
     wchar_t p[MAX_PATH]; char line[128], name[16]; int a, b, n, m; float r;
     lage[LAGE_WENIGE].stufe = stufe_von(4200); lage[LAGE_VIELE].stufe = stufe_von(3600); lage[LAGE_GRAFIK].stufe = stufe_von(3600);
+    lage[LAGE_BEIDE].stufe = stufe_von(3300);
     swprintf(p, MAX_PATH, L"%s\\modell.txt", dataDir);
     FILE *f = _wfopen(p, L"r");
     if (!f) return;
@@ -374,8 +409,8 @@ static void load_model(void)
         if (sscanf(line, "skala %d", &m) == 1) skala = m;
         else if (sscanf(line, "versatz %f", &r) == 1) { if (skala == SKALA) versatz = r; }
         else if (sscanf(line, "feld %d %d %f %d", &a, &b, &r, &n) == 4 && a >= 0 && a < NP && b >= 0 && b < ND) { if (skala == SKALA) { cell[a][b].r = r; cell[a][b].n = n; } }
-        else if (sscanf(line, "deckel %15s %d", name, &m) == 2) { for (int i = 0; i < 3; i++) if (!strcmp(name, lageName[i])) lage[i].stufe = stufe_von(m); }
-        else if (sscanf(line, "fehl %15s %d %d", name, &m, &n) == 3) { for (int i = 0; i < 3; i++) if (!strcmp(name, lageName[i])) lage[i].fehl[stufe_von(m)] = n; }
+        else if (sscanf(line, "deckel %15s %d", name, &m) == 2) { for (int i = 0; i < EVO_NLAGE; i++) if (!strcmp(name, lageName[i])) lage[i].stufe = stufe_von(m); }
+        else if (sscanf(line, "fehl %15s %d %d", name, &m, &n) == 3) { for (int i = 0; i < EVO_NLAGE; i++) if (!strcmp(name, lageName[i])) lage[i].fehl[stufe_von(m)] = n; }
     }
     fclose(f);
     if (skala != SKALA) event(L_("skala", "Neues Wärmemodell (ganze Chipleistung): Lüfter-Erfahrung wird neu gelernt, Taktgrenzen bleiben"));
@@ -388,8 +423,8 @@ static void save_model(void)
     FILE *f = _wfopen(tmp, L"w");
     if (!f) return;
     fprintf(f, "skala %d\nversatz %.2f\n", SKALA, versatz);
-    for (int i = 0; i < 3; i++) fprintf(f, "deckel %s %d\n", lageName[i], stufen[lage[i].stufe]);
-    for (int i = 0; i < 3; i++) for (int s = 0; s < NSTUFEN; s++) if (lage[i].fehl[s]) fprintf(f, "fehl %s %d %d\n", lageName[i], stufen[s], lage[i].fehl[s]);
+    for (int i = 0; i < EVO_NLAGE; i++) fprintf(f, "deckel %s %d\n", lageName[i], stufen[lage[i].stufe]);
+    for (int i = 0; i < EVO_NLAGE; i++) for (int s = 0; s < NSTUFEN; s++) if (lage[i].fehl[s]) fprintf(f, "fehl %s %d %d\n", lageName[i], stufen[s], lage[i].fehl[s]);
     for (int a = 0; a < NP; a++) for (int b = 0; b < ND; b++) if (cell[a][b].n) fprintf(f, "feld %d %d %.2f %d\n", a, b, cell[a][b].r, cell[a][b].n);
     fclose(f);
     MoveFileExW(tmp, p, MOVEFILE_REPLACE_EXISTING);
@@ -413,9 +448,14 @@ static int read_bios_fan(uint8_t orig[12])
 }
 
 // hottest SSD in °C from the storage driver (NVMe reports it without any extra driver), -1 = unknown
-static int ssd_temp(void)
+// returns the hottest composite value (the one the drive's own limits refer to); *sensor gets the hottest single
+// sensor. A Samsung 990 PRO reports its controller as a second sensor: 90 °C at a composite of 66 °C while data moved,
+// and on machine 2 a 990 dropped out under GPU load while the composite never raised the system fan.
+// Each drive goes to ssdEinzeln as "disk:composite/sensor" for the log, so one can see which one was hot.
+static char ssdEinzeln[96];
+static int ssd_temp(int *sensor)
 {
-    int best = -1;
+    int best = -1, len = 0; *sensor = -1; ssdEinzeln[0] = 0;
     for (int i = 0; i < 8; i++) {
         wchar_t p[32]; swprintf(p, 32, L"\\\\.\\PhysicalDrive%d", i);
         HANDLE h = CreateFileW(p, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, 0, OPEN_EXISTING, 0, 0);
@@ -423,12 +463,46 @@ static int ssd_temp(void)
         STORAGE_PROPERTY_QUERY q = { StorageDeviceTemperatureProperty, PropertyStandardQuery };
         union { STORAGE_TEMPERATURE_DATA_DESCRIPTOR d; BYTE b[256]; } o; DWORD n;
         if (DeviceIoControl(h, IOCTL_STORAGE_QUERY_PROPERTY, &q, sizeof q, &o, sizeof o, &n, 0) && n >= sizeof o.d && o.d.InfoCount > 0) {
-            int t = o.d.TemperatureInfo[0].Temperature;
-            if (t > best && t < 120) best = t;
+            int c = o.d.TemperatureInfo[0].Temperature, s = -1;
+            if (c > best && c < 120) best = c;
+            int nInfo = (n - offsetof(STORAGE_TEMPERATURE_DATA_DESCRIPTOR, TemperatureInfo)) / sizeof(STORAGE_TEMPERATURE_INFO);
+            for (int j = 0; j < o.d.InfoCount && j < nInfo; j++) {
+                int t = o.d.TemperatureInfo[j].Temperature;
+                if (t > s && t < 150) s = t;
+            }
+            if (s > *sensor) *sensor = s;
+            if (len < (int)sizeof ssdEinzeln - 16)
+                len += snprintf(ssdEinzeln + len, sizeof ssdEinzeln - len, "%s%d:%d/%d", len ? " " : "", i, c, s);
         }
         CloseHandle(h);
     }
     return best;
+}
+
+// data moved by all drives together in MB/s since the last call (read every second). The temperature comes too late:
+// on machine 2 a 990 dropped out while the system fan only followed its rising temperature. The amount of data
+// moved is known at once, so the system fan can start before the drive is warm.
+static double ssd_io(void)
+{
+    static HANDLE h[8]; static int offen; static LONGLONG alt[8]; static ULONGLONG tAlt;
+    ULONGLONG t = GetTickCount64(); double sek = tAlt ? (t - tAlt) / 1000.0 : 0; tAlt = t;
+    if (!offen) {
+        offen = 1;
+        for (int i = 0; i < 8; i++) {
+            wchar_t p[32]; swprintf(p, 32, L"\\\\.\\PhysicalDrive%d", i);
+            h[i] = CreateFileW(p, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, 0, OPEN_EXISTING, 0, 0);
+            alt[i] = -1;
+        }
+    }
+    double mb = 0;
+    for (int i = 0; i < 8; i++) {
+        DISK_PERFORMANCE dp; DWORD n;
+        if (h[i] == INVALID_HANDLE_VALUE || !DeviceIoControl(h[i], IOCTL_DISK_PERFORMANCE, 0, 0, &dp, sizeof dp, &n, 0)) continue;
+        LONGLONG b = dp.BytesRead.QuadPart + dp.BytesWritten.QuadPart;
+        if (alt[i] >= 0 && b >= alt[i] && sek > 0) mb += (b - alt[i]) / 1e6 / sek;
+        alt[i] = b;
+    }
+    return mb;
 }
 
 // fan curve anchored 3 °C below the smoothed EC temperature: today's temperature lies on the rising part,
@@ -505,7 +579,7 @@ static int run(void)
     if (sh) { memset(sh, 0, sizeof *sh); sh->magic = EVO_MAGIC; sh->size = sizeof *sh; }
 
     // safety: only control the EC we know (firmware 1.10 = bytes 01 0A at 0x00)
-    int v0 = ec_read(0x00), v1 = ec_read(0x01);
+    int v0 = ec_read_sicher(0x00, -1), v1 = ec_read_sicher(0x01, -1);
     if (!nurLesen && (v0 != 1 || v1 != 10)) { event(L_("ec_version", "EC-Version %d.%d unbekannt (erwartet 1.10): nur lesen"), v0, v1); nurLesen = 1; }
     uint8_t orig[12] = { 0 };
     if (!nurLesen && !read_bios_fan(orig)) { event(L_("bios_fehlt", "BIOS-Lüftereinstellungen (UEFI Setup) nicht lesbar: nur lesen")); nurLesen = 1; }
@@ -515,17 +589,17 @@ static int run(void)
     if (adlIdx < 0) event(L_("adl", "GPU-Werte vom Treiber nicht verfügbar: GPU-Leistung wird geschätzt"));
     NTQSI ntqsi = (NTQSI)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQuerySystemInformation");
     load_model();
-    int modusOrig = ec_read(0x31), modusJetzt = modusOrig;
+    int modusOrig = ec_read_sicher(0x31, -1), modusJetzt = modusOrig;
     if (modusOrig == 2 || modusOrig < 0) modusOrig = 0;   // "leise" at start is most likely left over from a killed run
     if (sh) {
-        sh->nurLesen = nurLesen; sh->funktionen = nurLesen ? 0 : fn; sh->ziel = ziel; sh->minP = minP; sh->maxP = maxP; sh->spitze = spitze;
+        sh->nurLesen = nurLesen; sh->funktionen = nurLesen ? 0 : fn; sh->ziel = ziel; sh->minP = minP; sh->maxP = maxP; sh->spitze = spitze; sh->achtung = achtung; sh->alarm = alarm;
         sh->versatz = versatz; sh->felder = felder();
-        for (int i = 0; i < 3; i++) sh->deckel[i] = stufen[lage[i].stufe];
+        for (int i = 0; i < EVO_NLAGE; i++) sh->deckel[i] = stufen[lage[i].stufe];
     }
     if (nurLesen) event(L_("start_nurlesen", "Start: nur lesen, es wird nichts gesteuert"));
     else {
-        event(L_("start", "Start: Ziel %.0f °C, Lüfter %d–%d %%, Spitze ab %d °C, gelernt: %d Bereiche, %+.1f °C"),
-              ziel, minP, maxP, spitze, felder(), versatz);
+        event(L_("start", "Start: Ziel %.0f °C, Achtung %d °C, Alarm %d °C, Lüfter %d–%d %%, Taktbremse ab %d °C, gelernt: %d Bereiche, %+.1f °C"),
+              ziel, achtung, alarm, minP, maxP, spitze, felder(), versatz);
         for (int i = 0; i < EVO_NFUNK; i++) if (!(fn >> i & 1)) event(L_("f_aus", "%s ist ausgeschaltet"), funk_text(i));
         event(L_("bios", "BIOS-Lüfterkurve gesichert (%d/%d/%d °C), kommt beim Beenden zurück"),
               orig[1], orig[2], orig[3]);
@@ -547,7 +621,7 @@ static int run(void)
     // controller state
     float hist[10]; int nHist = 0;
     float emaT = 0, slope = 0, pFast = 0, pSlow = 0, mFast = 0, mSlow = 0, emaTe = 0, d = (float)(minP > 40 ? minP : 40), boost = 0;
-    int capNow = read_cap(), sicherBis = 0, grafikSeit = -1, nachlauf = 0, lageNow = -1, locker = 0, hot = 0, lowSince = -1, warNotfall = 0;
+    int capNow = read_cap(), sicherBis = 0, sicherCap = 0, grafikSeit = -1, grafikBis = 0, nachlauf = 0, lageNow = -1, locker = 0, hot = 0, lowSince = -1, warNotfall = 0;
     int ec[8] = { -1, -1, -1, -1, -1, -1, -1, -1 };
     static const uint8_t regs[8] = { 0x70, 0x35, 0x36, 0x31, 0x37, 0x38, 0x28, 0x29 };
     int console = GetConsoleWindow() != 0;
@@ -610,7 +684,8 @@ static int run(void)
         // EC temperature and fan 1 every 2 s (the EC temperature is only the second emergency path and the slow curve
         // anchor; Tctl is read every second), the rest every 10 s
         int nEc = k % 10 == 0 ? 8 : k % 2 == 0 ? 3 : 0;
-        for (int i = 0; i < nEc; i++) { int v = ec_read(regs[i]); if (v >= 0) ec[i] = v; }
+        // a value that is not confirmed or impossible (case above 110 °C) keeps the last reading
+        for (int i = 0; i < nEc; i++) { int v = ec_read_sicher(regs[i], ec[i]); if (v >= 0 && !(i == 0 && v > 110)) ec[i] = v; }
         int Te = ec[0];
         // GPU every second while it works, every 2 s while it rests (a start is noticed at most 1 s later)
         static int gW = -1, gL = -1, gT = -1, aW = -1;
@@ -649,16 +724,18 @@ static int run(void)
                 unsigned old = load_settings();
                 for (int i = 0; i < EVO_NFUNK; i++)
                     if ((old ^ fn) >> i & 1) event(fn >> i & 1 ? L_("f_an", "%s eingeschaltet") : L_("f_aus", "%s ist ausgeschaltet"), funk_text(i));
-                if (old == fn) event(L_("ini", "Einstellungen neu gelesen: Ziel %.0f °C, Lüfter %d–%d %%, Spitze ab %d °C"), ziel, minP, maxP, spitze);
+                if (old == fn) event(L_("ini", "Einstellungen neu gelesen: Ziel %.0f °C, Achtung %d °C, Alarm %d °C, Lüfter %d–%d %%, Taktbremse ab %d °C"), ziel, achtung, alarm, minP, maxP, spitze);
                 if (!nurLesen && (old & F_TAKT) && !(fn & F_TAKT) && write_cap(0)) capNow = 0;   // off = no clock limit at all
             }
         }
 
         // --- situation and clock cap ---
-        if (G > 20) { if (grafikSeit < 0) grafikSeit = k; }
+        if (G > 20) { if (grafikSeit < 0) grafikSeit = k; grafikBis = k + 60; }
         else if (grafikSeit >= 0) { if (k - grafikSeit >= 30) nachlauf = 1; grafikSeit = -1; }
         if (nachlauf && emaT < 65) nachlauf = 0;   // the heat of the GPU phase is gone
-        int lg = G > 20 || nachlauf ? LAGE_GRAFIK : busy > 4 ? LAGE_VIELE : LAGE_WENIGE;
+        // a GPU pause under a minute stays "GPU": an image job on machine 2 switched GPU <-> few cores every ~10 s for
+        // minutes, and each switch moved the clock cap 3300 <-> 3600 MHz
+        int lg = G > 20 || nachlauf || k < grafikBis ? (G > 20 && busy > 4 ? LAGE_BEIDE : LAGE_GRAFIK) : busy > 4 ? LAGE_VIELE : LAGE_WENIGE;
         // a situation with a lower cap counts at once, one with a higher cap only after 10 s: a few busy threads that
         // come and go must not flip the cap (and the EC mode) every second
         if (lageNow >= 0 && lg != lageNow && lage[lg].stufe > lage[lageNow].stufe && ++locker < 10) lg = lageNow;
@@ -669,14 +746,17 @@ static int run(void)
             if (T >= spitze) {
                 // hot spot: lowest step at once; this situation loses one step (learned from danger), and the step that
                 // caused it is tried again only after a longer calm run each time
-                if (k > sicherBis && lage[lg].stufe > 0 && capNow > stufen[0]) {
+                if (k > sicherBis && lage[lg].stufe > unten[lg] && capNow > stufen[unten[lg]]) {
                     int s = lage[lg].stufe;
                     if (lage[lg].fehl[s] < 9) lage[lg].fehl[s]++;
                     lage[lg].stufe--;
-                    event2(1, L_("spitze_runter", "Spitze %.0f °C bei „%s“: 30 s Taktbremse %d MHz, für diese Lastart künftig %d MHz"), T, lage_text(lg), stufen[0], stufen[lage[lg].stufe]);
+                    event2(1, L_("spitze_runter", "Spitze %.0f °C bei „%s“: 30 s Taktbremse %d MHz, für diese Lastart künftig %d MHz"), T, lage_text(lg), stufen[unten[lg]], stufen[lage[lg].stufe]);
                     event(L_("spitze_warte", "%d MHz erst wieder nach %d min Last ohne Spitze"), stufen[s], wartezeit(lage[lg].fehl[s]) / 60);
                 } else if (k > sicherBis)
                     event2(1, L_("spitze_unten", "Spitze %.0f °C bei „%s“, Taktbremse stand schon auf %d MHz"), T, lage_text(lg), capNow);
+                // the safe cap stays for the whole 30 s, also when the load type changes in between (a short GPU dip
+                // switched "GPU + many cores" at 2400 to "many cores" at 3300 and the chip went to 93 °C)
+                if (k > sicherBis || stufen[unten[lg]] < sicherCap) sicherCap = stufen[unten[lg]];
                 sicherBis = k + 30; lage[lg].ruhig = 0;
             }
             // calm long enough at this step: may try the next one. Only seconds in which a core really runs at the cap count
@@ -690,7 +770,7 @@ static int run(void)
                     event(L_("ruhig", "%d min am Limit ohne Spitze bei „%s“: probiert %d MHz"), w / 60, lage_text(lg), stufen[s]);
                 }
             }
-            int want = k <= sicherBis ? stufen[0] : stufen[lage[lg].stufe];
+            int want = k <= sicherBis ? (sicherCap < stufen[unten[lg]] ? sicherCap : stufen[unten[lg]]) : stufen[lage[lg].stufe];
             if (want != capNow && write_cap(want)) { event(L_("takt", "Taktbremse %d → %d MHz%s"), capNow, want, k <= sicherBis ? L_("takt_spitze", " (nach Hitzespitze)") : ""); capNow = want; }
         }
         if (!nurLesen) {
@@ -721,10 +801,25 @@ static int run(void)
         // feedback: warmer than the target anyway -> add more; let it go again slowly (not in the first seconds: median not full)
         if (k >= 15) { if (emaT > ziel + 1) boost = fminf(40, boost + 1); else if (emaT < ziel - 3) boost = fmaxf(0, boost - 1); }
         float wantD = fminf((float)maxP, need + boost);
+        // GPU + many cores: the spike comes within 5 s, the fan needs ~10 s to spin up, so it starts at 50 % at once. Only
+        // when the cores really draw power (> 15 W): GPU inference keeps many cores busy at ~5 W (machine 1: 4 min at 50 %
+        // for nothing); at the spikes on machine 2 they jumped to 17-30 W in the first second. GPU working counts too, as the
+        // cores take its power and it falls below 20 W
+        int vorbeugen = (lg == LAGE_BEIDE || lg == LAGE_GRAFIK) && busy > 4 && sumW > 15 && wantD < 50;
+        if (vorbeugen) wantD = 50;
         int grund = boost >= 1 ? GRUND_NACHREGELN : (fn & F_VORHERSAGE) && pv > pSlow + 5 ? GRUND_VORHERSAGE : GRUND_MODELL;
-        // emergency above the noise limit
-        if (T >= 96) hot++; else if (hot > 0) hot--;
-        if (hot >= 5 || Te >= 90) { wantD = 100; grund = GRUND_NOTFALL; }
+        // two stages above the noise limit. Yellow (smoothed CPU or case sensor >= Achtung, default 90 °C, off 2 °C below; a 1-s boost spike is
+        // the clock brake's job): the fan climbs by 2 %/s,
+        // also beyond MaxProzent, as long as it stays there. Red (CPU >= Alarm, default 95 °C, for 3 s or case sensor >= Alarm): 100 % at once.
+        // Before, the emergency came at a case temperature of 90 °C and always jumped to full: machine 2 pumped 22 times
+        // in 70 min at CPU 90-93 °C; with red from 95 °C it would have been 3 times (replay of its log).
+        static int gelb, warGelb;
+        if (emaT >= achtung || Te >= achtung) gelb = 1; else if (emaT < achtung - 2 && Te < achtung - 2) gelb = 0;
+        if (gelb && !warGelb && !nurLesen && (fn & F_LUEFTER)) event(L_("achtung", "Achtung: CPU %.0f °C, Gehäuse %d °C → Lüfter steigt"), T, Te);
+        warGelb = gelb;
+        if (gelb) { wantD = fmaxf(wantD, fminf(100, d + 2)); grund = GRUND_ACHTUNG; }
+        if (T >= alarm) hot++; else if (hot > 0) hot--;
+        if (hot >= 3 || Te >= alarm) { wantD = 100; grund = GRUND_NOTFALL; }
         if (grund == GRUND_NOTFALL && !warNotfall && !nurLesen) event2(1, L_("notfall", "NOTFALL: CPU %.0f °C, Gehäuse %d °C → Lüfter 100 %%"), T, Te);
         // up: a prediction raises by at most 4 %/s (jumping 30 -> 70 % is loud, the fan needs ~10 s per step anyway),
         // only 1 %/s while the chip is still far below the target (a short burst then hardly reaches the fan),
@@ -734,23 +829,33 @@ static int run(void)
         // controller keeps the fan until it is down at its wanted value, then the BIOS curve takes over again.
         static int nachNotfall;
         float auf = T < ziel - 8 && emaT < ziel - 8 ? 1.0f : 4.0f;
-        if (wantD >= d) { d = grund == GRUND_NOTFALL || emaT >= ziel + 5 ? wantD : fminf(wantD, d + auf); lowSince = -1; nachNotfall = 0; }
+        if (wantD >= d) { d = grund == GRUND_NOTFALL || grund == GRUND_ACHTUNG || vorbeugen || emaT >= ziel + 5 ? wantD : fminf(wantD, d + auf); lowSince = -1; nachNotfall = 0; }
         else if (warNotfall || nachNotfall) { d = fmaxf(wantD, d - 1); nachNotfall = d > wantD; lowSince = -1; }
         else { if (lowSince < 0) lowSince = k; if (k - lowSince >= 10) d = fmaxf(wantD, d - 3); }
         warNotfall = grund == GRUND_NOTFALL;
         int di = (int)lroundf(d);
         // system fan: the 120 mm fan on the back of the board cools the SSDs, the WLAN card and the board under the
         // chip, not the chip itself. Idle with cool SSDs: off, like the BIOS does; otherwise with the CPU fans;
-        // warm SSDs (loading a big model): at least 30 %, +5 % per °C above 55. SSD unknown: as before, with the CPU fans
-        static int ssdT = -1, sysAus;
-        if (k % 10 == 1) ssdT = ssd_temp();
-        int aus = leer && grund != GRUND_NOTFALL && ssdT >= 0 && ssdT < (sysAus ? 50 : 47);
+        // running: at least 30 % and 10 % above the CPU fans (it followed them at 30-45 %, ~800 rpm, while a 990 on
+        // machine 2 overheated). Warm SSDs: at least 30 %, +6 % per °C above 50, and +4 % per °C of the hottest sensor
+        // (SSD controller) above 70; read every 5 s, moving data heats a 990 by 20 °C within two minutes.
+        // Data moving (read every second): ahead of the temperature, 50 % from 100 MB/s, +10 % per 200 MB/s, full from
+        // ~1100 MB/s; held and then let down by 1 %/s, as the drive keeps the heat for a while. SSD unknown: with the CPU fans
+        static int ssdT = -1, ssdS = -1, sysAus; static float ioHalt;
+        if (k % 5 == 1) ssdT = ssd_temp(&ssdS);
+        double io = ssd_io();
+        float ioWant = io >= 100 ? (float)fmin(100, 50 + (io - 100) / 20) : 0;
+        ioHalt = fmaxf(ioWant, ioHalt - 1);
+        int aus = leer && grund != GRUND_NOTFALL && ioHalt <= 0 && ssdT >= 0 && ssdT < (sysAus ? 50 : 47) && ssdS < (sysAus ? 75 : 70);
         if (aus != sysAus && !nurLesen && (fn & F_LUEFTER)) event(aus ? L_("sys_aus", "Systemlüfter aus (Leerlauf, SSD %d °C)") : L_("sys_an", "Systemlüfter wieder an (SSD %d °C)"), ssdT);
         sysAus = aus;
-        int sw = aus ? 0 : di;
-        if (ssdT >= 55) { int m = 30 + 5 * (ssdT - 55); sw = sw > m ? sw : m > 100 ? 100 : m; }
-        sysWant = sw;
+        int sw = aus ? 0 : di + 10 > 30 ? di + 10 : 30;
+        if (ssdT >= 50) { int m = 30 + 6 * (ssdT - 50); sw = sw > m ? sw : m; }
+        if (ssdS >= 70) { int m = 30 + 4 * (ssdS - 70); sw = sw > m ? sw : m; }
+        if (ioHalt > sw) sw = (int)ceilf(ioHalt);
+        sysWant = sw > 100 ? 100 : sw;
         int fanOn = !nurLesen && ((fn & F_LUEFTER) || grund == GRUND_NOTFALL || nachNotfall);   // the emergency takes over even when switched off
+        // (yellow does not: switched off, the BIOS curve is already at full from 85 °C)
         if (fanOn && (abs(di - curveD) >= 2 || abs(sysWant - curveSys) >= 2 || fabsf(emaTe - curveAnchor) > 3)) write_curve(di, emaTe, 0);
         else if (fanOn && k % 60 == 30 && curveD >= 0) write_curve(curveD, curveAnchor, 1);
         else if (!fanOn && curveD >= 0) restore_bios(orig);
@@ -759,7 +864,7 @@ static int run(void)
         // --- record (Prozent = duty really written, -1 = BIOS curve; Regler_Prozent = what the controller wants, also when switched off) ---
         int r1 = ec[1] < 0 || ec[2] < 0 ? -1 : ec[1] << 8 | ec[2], r2 = ec[4] < 0 || ec[5] < 0 ? -1 : ec[4] << 8 | ec[5], r3 = ec[6] < 0 || ec[7] < 0 ? -1 : ec[6] << 8 | ec[7];
         float vorh = predict(pv, (float)(curveD >= 0 ? curveD : di), mFast);
-        static const char *grundName[] = { "modell", "vorhersage", "nachregeln", "NOTFALL", "nur-lesen" };
+        static const char *grundName[] = { "modell", "vorhersage", "nachregeln", "NOTFALL", "nur-lesen", "achtung" };
         if (sh) {
             EvoSample *s = &sh->s[sh->nSample % EVO_N];
             s->t = time(0); s->tctl = T; s->tglatt = emaT; s->vorhersage = vorh; s->pkgW = (float)pkgW; s->coreW = (float)sumW; s->maxCoreW = (float)maxW;
@@ -769,14 +874,15 @@ static int run(void)
             s->lage = (uint8_t)lg; s->modus = (uint8_t)ec[3]; s->grund = (uint8_t)grund; s->leise = modusJetzt == 2;
             s->ecFan = (int16_t)(nurLesen || Te < 0 ? -1 : curve_duty(Te, 0));
             s->sysEc = (int16_t)(nurLesen || Te < 0 ? -1 : curve_duty(Te, 6)); s->sysFan = (int16_t)(nurLesen ? -1 : curveSys);
+            s->ssdT = (int16_t)ssdT; s->ssdS = (int16_t)ssdS;
             sh->nSample++;
-            if (k % 60 == 0) { sh->versatz = versatz; sh->felder = felder(); for (int i = 0; i < 3; i++) sh->deckel[i] = stufen[lage[i].stufe]; }
+            if (k % 60 == 0) { sh->versatz = versatz; sh->felder = felder(); for (int i = 0; i < EVO_NLAGE; i++) sh->deckel[i] = stufen[lage[i].stufe]; }
         }
         SYSTEMTIME st; GetLocalTime(&st);
         char line[400];
-        snprintf(line, sizeof line, "%02d:%02d:%02d;%.1f;%.1f;%d;%.1f;%.1f;%.1f;%.0f;%d;%.1f;%.1f;%.0f;%.0f;%d;%d;%d;%d;%s;%d;%d;%d;%.1f;%.2f;%d;%d;%s;%d;%d\r\n",
+        snprintf(line, sizeof line, "%02d:%02d:%02d;%.1f;%.1f;%d;%.1f;%.1f;%.1f;%.0f;%d;%.1f;%.1f;%.0f;%.0f;%d;%d;%d;%d;%s;%d;%d;%d;%.1f;%.2f;%d;%d;%s;%d;%d;%d;%d;%s;%.0f\r\n",
                  st.wHour, st.wMinute, st.wSecond, T, emaT, Te, pkgW, sumW, maxW, G, aW, heat, pv, maxMhz, load, busy, gL, gT,
-                 nurLesen ? -1 : curveD, grundName[grund], r1, r2, r3, vorh, versatz, felder(), capNow, lageName[lg], ec[3], nurLesen ? -1 : di);
+                 nurLesen ? -1 : curveD, grundName[grund], r1, r2, r3, vorh, versatz, felder(), capNow, lageName[lg], ec[3], nurLesen ? -1 : di, ssdT, ssdS, ssdEinzeln, io);
         csv_line(line);
         if (console) printf("\r%02d:%02d:%02d  Tctl %5.1f (glatt %5.1f)  EC %3d  Kerne %5.1f W  GPU %5.1f W  -> Luefter %3d %% [%s] %d U/min  Takt %d MHz [%s]   ",
                             st.wHour, st.wMinute, st.wSecond, T, emaT, Te, sumW, G, nurLesen ? -1 : curveD, grundName[grund], r1, capNow, lageName[lg]);

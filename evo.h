@@ -5,16 +5,16 @@
 #include <stdint.h>
 #include <wchar.h>
 
-#define EVO_VERSION   "0.5.1"   // also AppVer in installer\evo-x2-cool.iss and the git tag v0.5.1
-#define EVO_VERSION_W L"0.5.1"
+#define EVO_VERSION   "0.6.0"   // also AppVer in installer\evo-x2-cool.iss and the git tag v0.6.0
+#define EVO_VERSION_W L"0.6.0"
 #define EVO_SHM    L"Global\\evo-x2-cool"
 #define EVO_STOPP  L"Global\\evo-x2-cool-stopp"   // set it and the controller restores everything and ends (service too)
-#define EVO_MAGIC  0x45564F33u   // "EVO3", changes with the layout below so an old window does not misread a new controller
+#define EVO_MAGIC  0x45564F36u   // "EVO6", changes with the layout below so an old window does not misread a new controller
 #define EVO_N      7200          // samples kept: 2 hours at 1 s
 #define EVO_EV     256           // events kept
 
-enum { LAGE_WENIGE, LAGE_VIELE, LAGE_GRAFIK };
-enum { GRUND_MODELL, GRUND_VORHERSAGE, GRUND_NACHREGELN, GRUND_NOTFALL, GRUND_NUR_LESEN };
+enum { LAGE_WENIGE, LAGE_VIELE, LAGE_GRAFIK, LAGE_BEIDE, EVO_NLAGE };   // BEIDE = GPU busy and many cores
+enum { GRUND_MODELL, GRUND_VORHERSAGE, GRUND_NACHREGELN, GRUND_NOTFALL, GRUND_NUR_LESEN, GRUND_ACHTUNG };
 
 // functions that can be switched off in einstellungen.ini, section [Funktionen] (1 = on). The emergency (fan 100 %
 // when overheating) cannot be switched off: it takes over even while the fan control is off.
@@ -47,6 +47,7 @@ typedef struct {
     uint8_t lage, modus, grund, leise;  // modus = EC power mode register 0x31
     int16_t ecFan, sysFan, sysEc;       // duty % the written EC curve gives at the current EC temperature (CPU fans), duty asked for
                                         // the system fan and what its curve gives; -1 = BIOS curve
+    int16_t ssdT, ssdS;                 // hottest SSD: composite and hottest single sensor (°C, -1 = unknown)
 } EvoSample;
 
 typedef struct { int64_t t; uint8_t wichtig; char text[119]; } EvoEvent;   // wichtig = hot spot / emergency, shown red; text UTF-8
@@ -56,8 +57,9 @@ typedef struct {
     uint32_t nurLesen;                  // 1 = read-only mode, nothing is controlled
     uint32_t funktionen;                // F_* bits currently active
     float ziel; int32_t minP, maxP, spitze;
+    int32_t achtung, alarm;             // yellow: fan climbs steadily; red: fan 100 % at once (°C)
     float versatz; int32_t felder;      // learned model: overall offset, number of learned cells
-    int32_t deckel[3];                  // learned clock cap per situation (MHz)
+    int32_t deckel[EVO_NLAGE];          // learned clock cap per situation (MHz)
     volatile uint32_t nSample, nEvent;  // totals written; slot = n % EVO_N / EVO_EV
     EvoSample s[EVO_N];
     EvoEvent e[EVO_EV];

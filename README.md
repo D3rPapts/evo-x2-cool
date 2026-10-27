@@ -32,7 +32,7 @@ EVO-X2-COOL watches the chip every second, predicts where the temperature is hea
 - **brakes the clock** depending on the load type (few cores / many cores / GPU busy). After a hot spot it drops to a safe clock for 30 s and remembers a lower limit for that load type. It tries the next higher step again only after a calm run with a core really at the limit: 10 minutes, then 1 hour, then 1 day after every further hot spot on that step;
 - **learns** how warm the machine really gets at a given chip power and fan duty, and corrects its own model. The starting model (end temperature = 34 + P × (0.58 − 0.30 × fan) + 6 × hottest core W, P = whole chip power) was fitted on the logs of two EVO-X2;
 - **switches the EC to the quiet power mode** (54 W) while many cores are busy and the GPU is idle;
-- has an **emergency mode** (fan to full) that cannot be switched off.
+- has two warning stages: **yellow** (default 90 °C: the fan climbs steadily, also beyond MaxProzent) and **red** (default 95 °C: fan to full at once). Red cannot be switched off.
 
 If the program crashes, the EC keeps regulating with the last (rising) curve. On a normal stop the BIOS fan curve is written back.
 
@@ -76,7 +76,7 @@ evo-x2-cool.exe --entfernen         stop and remove the service
 evo-x2-cool.exe --stopp             stop a console run, with restore
 ```
 
-Start `evo-x2-cool-front.exe` as a normal user. The target temperature can be changed with − / + in the window or in the tray menu (60 °C up to 3 °C below the hot-spot limit); a higher target means less fan. `--leiste` starts it hidden in the tray. Closing the window only hides it. The tray menu has **Exit** (window only) and **Exit all** (also stops the controller and gives the fans back to the BIOS curve).
+Start `evo-x2-cool-front.exe` as a normal user. The three temperatures target (green), attention (yellow) and alarm (red) can be changed with − / + in the window, the target also in the tray menu; each is at least 2 °C above the one before, alarm at most 97 °C. A higher target means less fan. `--leiste` starts it hidden in the tray. Closing the window only hides it. The tray menu has **Exit** (window only) and **Exit all** (also stops the controller and gives the fans back to the BIOS curve).
 
 ## Settings
 
@@ -89,6 +89,8 @@ MinProzent=30    ; fan duty range
 MinLeerlauf=10   ; lower floor while idle and far below the target
 MaxProzent=70
 Spitze=88        ; hot spot: brake the clock from here
+Achtung=90       ; yellow: fan climbs by 2 %/s, also beyond MaxProzent
+Alarm=95         ; red: fan 100 % at once (at most 97)
 SicherMHz=3600   ; clock cap left behind on stop
 Sprache=de       ; de / en, any sprache-<code>.ini next to the exe works
 

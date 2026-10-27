@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
+#include <math.h>
 #include <time.h>
 #include "evo.h"
 #pragma comment(lib, "user32.lib")
@@ -24,6 +25,23 @@
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "gdiplus.lib")
+
+// GDI+ flat API, only what the rounded shapes need (the official headers are C++ only). Plain GDI draws round corners
+// without anti-aliasing, so switches, tiles and buttons got jagged edges.
+typedef struct { UINT32 version; void *debugCallback; BOOL noBackgroundThread, noCodecs; } GpStartupInput;
+int WINAPI GdiplusStartup(ULONG_PTR *token, const GpStartupInput *in, void *out);
+int WINAPI GdipCreateFromHDC(HDC dc, void **g);
+int WINAPI GdipDeleteGraphics(void *g);
+int WINAPI GdipSetSmoothingMode(void *g, int mode);
+int WINAPI GdipSetPixelOffsetMode(void *g, int mode);
+int WINAPI GdipCreateSolidFill(DWORD argb, void **brush);
+int WINAPI GdipDeleteBrush(void *brush);
+int WINAPI GdipCreatePath(int fillMode, void **path);
+int WINAPI GdipAddPathArc(void *path, float x, float y, float w, float h, float start, float sweep);
+int WINAPI GdipClosePathFigure(void *path);
+int WINAPI GdipFillPath(void *g, void *brush, void *path);
+int WINAPI GdipDeletePath(void *path);
 #define WM_TRAY   (WM_APP + 1)   // mouse on the tray icon
 #define WM_ZEIGEN (WM_APP + 2)   // sent by a second start: show the window
 #define WM_UPDATE (WM_APP + 3)   // the update check found a newer version
@@ -34,7 +52,8 @@ static HANDLE map;
 static int spanIdx = 1, mouseX = -1, mouseY = -1, dpi = 96;
 static const int spans[4] = { 300, 900, 3600, 7200 };
 static const wchar_t *spanText[4] = { L"5 min", L"15 min", L"1 h", L"2 h" };
-static RECT btn[4], btnThema, btnSprache, btnUpdate;
+static RECT btn[4], btnThema, btnSprache, btnUpdate, btnZoom;
+static int zoom;   // 1 = every chart zooms on the values of the newest quarter of the shown time ([Anzeige] Zoom)
 static wchar_t updVer[16];   // newer version on GitHub, empty = none (or check switched off)
 static void open_releases(void);
 static HFONT fValue, fText, fSmall, fBold;
@@ -46,7 +65,12 @@ static void fill(HDC dc, RECT r, COLORREF c, int round);
 static int text(HDC dc, HFONT f, int x, int y, COLORREF c, int align, const wchar_t *fmt, ...);
 static RECT sw[EVO_NFUNK];                  // switch rectangles
 static unsigned swWant; static ULONGLONG swUntil, swErrUntil;   // clicked state shown until the controller has taken it over
-static RECT zielMinus, zielPlus; static float zielWant; static ULONGLONG zielUntil;   // target temperature - / +
+static RECT stMinus[3], stPlus[3]; static float stWant[3]; static ULONGLONG stUntil[3];   // target / attention / alarm - / +
+static float cur_stufe(int j)   // clicked value until the controller has taken it over
+{
+    if (GetTickCount64() < stUntil[j]) return stWant[j];
+    return !sh ? (j == 0 ? 80.0f : j == 1 ? 90.0f : 95.0f) : j == 0 ? sh->ziel : (float)(j == 1 ? sh->achtung : sh->alarm);
+}
 
 // ---------- texts: section [Anzeige] of sprache-<code>.ini (UTF-16), built-in German as fallback ----------
 static wchar_t iniFile[MAX_PATH], langFile[MAX_PATH];
@@ -82,6 +106,7 @@ static void load_lang(void)
     }
     wchar_t t[16]; GetPrivateProfileStringW(L"Anzeige", L"Thema", L"system", t, 16, iniFile);
     thema = !wcscmp(t, L"hell") ? 1 : !wcscmp(t, L"dunkel") ? 2 : 0;
+    zoom = GetPrivateProfileIntW(L"Anzeige", L"Zoom", 0, iniFile) != 0;
 }
 
 // theme and language buttons at the right end of a row; returns their left edge
@@ -133,7 +158,11 @@ static void apply_theme(HWND w)
     typedef HRESULT (WINAPI *DWMSET)(HWND, DWORD, const void *, DWORD);
     if (dwm && w) { DWMSET set = (DWMSET)(void (*)(void))GetProcAddress(dwm, "DwmSetWindowAttribute"); if (set) set(w, 20, &d, sizeof d); }
 }
-static const wchar_t *lageText(int i) { return i == LAGE_VIELE ? T(L"lage1", L"viele Kerne aktiv") : i == LAGE_GRAFIK ? T(L"lage2", L"Grafik (+ Abkühlen)") : T(L"lage0", L"wenige Kerne aktiv"); }
+static const wchar_t *lageText(int i)
+{
+    return i == LAGE_VIELE ? T(L"lage1", L"viele Kerne aktiv") : i == LAGE_GRAFIK ? T(L"lage2", L"Grafik (+ Abkühlen)")
+         : i == LAGE_BEIDE ? T(L"lage3", L"Grafik + viele Kerne") : T(L"lage0", L"wenige Kerne aktiv");
+}
 static const wchar_t *grundText(int i)
 {
     switch (i) {
@@ -141,6 +170,7 @@ static const wchar_t *grundText(int i)
     case GRUND_NACHREGELN: return T(L"grund2", L"nachgeregelt");
     case GRUND_NOTFALL: return T(L"grund3", L"NOTFALL");
     case GRUND_NUR_LESEN: return T(L"grund4", L"nur lesen");
+    case GRUND_ACHTUNG: return T(L"grund5", L"Achtung, steigt");
     default: return T(L"grund0", L"nach Modell");
     }
 }
@@ -166,9 +196,28 @@ static void open_shm(void)
 
 static void fill(HDC dc, RECT r, COLORREF c, int round)
 {
-    HBRUSH b = CreateSolidBrush(c), ob = SelectObject(dc, b); HPEN op = SelectObject(dc, GetStockObject(NULL_PEN));
-    if (round) RoundRect(dc, r.left, r.top, r.right + 1, r.bottom + 1, round, round); else FillRect(dc, &r, b);
-    SelectObject(dc, ob); SelectObject(dc, op); DeleteObject(b);
+    void *g = 0;
+    if (!round || GdipCreateFromHDC(dc, &g)) {   // square, or no GDI+: plain GDI
+        HBRUSH b = CreateSolidBrush(c), ob = SelectObject(dc, b); HPEN op = SelectObject(dc, GetStockObject(NULL_PEN));
+        if (round) RoundRect(dc, r.left, r.top, r.right + 1, r.bottom + 1, round, round); else FillRect(dc, &r, b);
+        SelectObject(dc, ob); SelectObject(dc, op); DeleteObject(b);
+        return;
+    }
+    // same area as RoundRect above (right/bottom included), corners as anti-aliased quarter circles
+    float x = (float)r.left, y = (float)r.top, w = (float)(r.right - r.left + 1), h = (float)(r.bottom - r.top + 1);
+    float d = fminf((float)round, fminf(w, h));
+    void *br = 0, *path = 0;
+    GdipSetSmoothingMode(g, 4);      // anti-alias
+    GdipSetPixelOffsetMode(g, 4);    // half: pixel edges on whole coordinates, like GDI
+    GdipCreateSolidFill(0xFF000000u | GetRValue(c) << 16 | GetGValue(c) << 8 | GetBValue(c), &br);
+    GdipCreatePath(0, &path);
+    GdipAddPathArc(path, x, y, d, d, 180, 90);
+    GdipAddPathArc(path, x + w - d, y, d, d, 270, 90);
+    GdipAddPathArc(path, x + w - d, y + h - d, d, d, 0, 90);
+    GdipAddPathArc(path, x, y + h - d, d, d, 90, 90);
+    GdipClosePathFigure(path);
+    GdipFillPath(g, br, path);
+    GdipDeletePath(path); GdipDeleteBrush(br); GdipDeleteGraphics(g);
 }
 
 // text at x,y (align: 0 left, 1 right edge at x, 2 centred); returns its width
@@ -220,18 +269,51 @@ static float gCap(const EvoSample *s) { return s->cap > 0 ? (float)s->cap : -1; 
 static float gMhz(const EvoSample *s) { return s->mhz; }
 
 typedef struct { Getter g; COLORREF c; int w; const wchar_t *name; } Series;
-typedef struct { const wchar_t *title; float lo, hi, step; Series s[4]; } Chart;
+typedef struct { const wchar_t *title; float lo, hi, step; Series s[4]; float minW, za, zb; int z; } Chart;   // za..zb = zoomed band
 
 static uint32_t first, count, span;
 static int xOf(RECT r, uint32_t i) { return r.left + (int)((int64_t)(r.right - r.left) * (int)(span - (count - 1 - i)) / (int)span); }
 static const EvoSample *sample(uint32_t i) { return &sh->s[(first + i) % EVO_N]; }
 
+// height 0..1 of value v in a chart. Zoom: the band za..zb gets the middle 70 % of the height, values below or above it
+// are squeezed logarithmically into the 15 % at either edge, so they stay visible without taking the room
+static float yfrac(const Chart *c, float v)
+{
+    float f;
+    if (!c->z) f = (v - c->lo) / (c->hi - c->lo);
+    else if (v < c->za) f = 0.15f * logf(1 + fmaxf(0, v - c->lo)) / logf(1 + fmaxf(c->za - c->lo, 0.001f));
+    else if (v > c->zb) f = 0.85f + 0.15f * logf(1 + (v - c->zb)) / logf(1 + fmaxf(c->hi - c->zb, 0.001f));
+    else f = 0.15f + 0.7f * (v - c->za) / (c->zb - c->za);
+    return f < 0 ? 0 : f > 1 ? 1 : f;
+}
+
+// zoomed band: range of all lines in the newest quarter of the shown samples, at least minW wide, plus a fifth margin
+static void zoom_setup(Chart *c)
+{
+    c->z = 0;
+    if (!zoom || count < 8) return;
+    float a = 1e9f, b = -1e9f;
+    for (uint32_t i = count - count / 4; i < count; i++)
+        for (int k = 0; k < 4; k++) {
+            if (!c->s[k].g) continue;
+            float v = c->s[k].g(sample(i));
+            if (v >= 0) { if (v < a) a = v; if (v > b) b = v; }
+        }
+    if (a > b) return;
+    float w = fmaxf(b - a, c->minW) * 1.4f, m = (a + b) / 2;
+    c->za = fmaxf(c->lo, m - w / 2); c->zb = fminf(c->hi, m + w / 2);
+    c->z = c->zb - c->za < (c->hi - c->lo) * 0.9f;   // nearly the whole range anyway: stay linear
+}
+
 static void chart(HDC dc, RECT r, const Chart *c)
 {
     // title row with legend on the right
     int x = r.right;
+    SelectObject(dc, fBold); SIZE tsz; GetTextExtentPoint32W(dc, c->title, (int)wcslen(c->title), &tsz);
     for (int k = 3; k >= 0; k--) {
         if (!c->s[k].g) continue;
+        SelectObject(dc, fSmall); SIZE lsz; GetTextExtentPoint32W(dc, c->s[k].name, (int)wcslen(c->s[k].name), &lsz);
+        if (x - lsz.cx - S(34) < r.left + tsz.cx + S(12)) break;   // narrow window: no room left next to the title
         x -= text(dc, fSmall, x, r.top, C_DIM, 1, L"%s", c->s[k].name) + S(6);
         line(dc, x - S(14), r.top + S(8), x, r.top + S(8), c->s[k].c, S(2), PS_SOLID);
         x -= S(28);
@@ -239,10 +321,23 @@ static void chart(HDC dc, RECT r, const Chart *c)
     text(dc, fBold, r.left, r.top - S(1), C_TEXT, 0, L"%s", c->title);
     RECT p = { r.left + S(34), r.top + S(20), r.right, r.bottom };
     fill(dc, p, C_CARD, 0);
-    for (float v = c->lo; v <= c->hi + 0.01f; v += c->step) {
-        int y = p.bottom - (int)((v - c->lo) / (c->hi - c->lo) * (p.bottom - p.top - 1)) - 1;
+    float st = c->step, v0 = c->lo, v1 = c->hi;
+    if (c->z) {   // zoomed: round steps inside the band, plus the chart's ends if their labels have room
+        float raw = (c->zb - c->za) / 4, p10 = powf(10, floorf(log10f(raw))), q = raw / p10;
+        st = (q > 5 ? 10 : q > 2 ? 5 : q > 1 ? 2 : 1) * p10; v0 = ceilf(c->za / st) * st; v1 = c->zb;
+    }
+    int yLo = 99999, yHi = -99999;
+    for (float v = v0; v <= v1 + 0.01f; v += st) {
+        int y = p.bottom - (int)(yfrac(c, v) * (p.bottom - p.top - 1)) - 1;
         line(dc, p.left, y, p.right, y, C_GRID, 1, PS_SOLID);
         text(dc, fSmall, p.left - S(6), y - S(7), C_DIM, 1, L"%g", v);
+        if (y < yLo) yLo = y; if (y > yHi) yHi = y;
+    }
+    if (c->z) {
+        int yb = p.bottom - 1, yt = p.top;
+        line(dc, p.left, yb, p.right, yb, C_GRID, 1, PS_SOLID); line(dc, p.left, yt, p.right, yt, C_GRID, 1, PS_SOLID);
+        if (yb - yHi > S(12)) text(dc, fSmall, p.left - S(6), yb - S(7), C_DIM, 1, L"%g", c->lo);
+        if (yLo - yt > S(12)) text(dc, fSmall, p.left - S(6), yt - S(7), C_DIM, 1, L"%g", c->hi);
     }
     for (int k = 0; k < 4; k++) {
         if (!c->s[k].g) continue;
@@ -253,7 +348,7 @@ static void chart(HDC dc, RECT r, const Chart *c)
             if (v < 0) { down = 0; continue; }   // -1 = no value
             int px = xOf(p, i);
             if (down && px == lastX && i + 1 < count) continue;   // more samples than pixels: one point per column is enough
-            float f = (v - c->lo) / (c->hi - c->lo); f = f < 0 ? 0 : f > 1 ? 1 : f;
+            float f = yfrac(c, v);
             int py = p.bottom - 1 - (int)(f * (p.bottom - p.top - 2));
             if (down) LineTo(dc, px, py); else MoveToEx(dc, px, py, 0);
             down = 1; lastX = px;
@@ -303,7 +398,7 @@ static void paint(HWND w, HDC dc)
     }
 
     // ---- tiles ----
-    wchar_t v[6][32], sub[6][80];
+    wchar_t v[7][32], sub[7][80];
     COLORREF tc = at->tctl >= sh->spitze ? C_HOT : at->tglatt > sh->ziel ? C_WARM : C_TEXT;
     // the same order for CPU and GPU: temperature large, power below
     swprintf(v[0], 32, L"%.1f °C", at->tctl);         swprintf(sub[0], 80, T(L"sub_cpu", L"geglättet %.1f (Ziel %.0f) · %.1f W"), at->tglatt, sh->ziel, at->coreW);
@@ -315,11 +410,16 @@ static void paint(HWND w, HDC dc)
     swprintf(sub[3], 80, T(L"sub_cap", L"Lastart: %s%s"), lageText(at->lage), at->leise ? T(L"leise", L" + EC leise") : L"");
     swprintf(v[4], 32, L"%.0f W", at->pkgW);          swprintf(sub[4], 80, T(L"sub_chip", L"stärkster Kern %.1f W · %d Kerne voll"), at->maxCoreW, at->busy);
     swprintf(v[5], 32, T(L"v_learn", L"%d Bereiche"), sh->felder); swprintf(sub[5], 80, T(L"sub_learn", L"real %+.1f °C wärmer als Formel"), sh->versatz);
-    const wchar_t *labels[6] = { T(L"t_cpu", L"CPU"), T(L"t_gpu", L"Grafik"), T(L"t_fan", L"Lüfter"), T(L"t_cap", L"Taktbremse"), T(L"t_chip", L"Chip gesamt"), T(L"t_learn", L"Gelernte Last-Bereiche") };
-    int tw = (rc.right - 2 * pad - 5 * gap) / 6;
-    for (int i = 0; i < 6; i++) {
+    // SSD: the composite large (the drive's own limits refer to it), the hottest sensor (controller) below; warm from
+    // 70 / 90 °C, hot from the 990 PRO's own warning level 82 °C or a controller at 100 °C
+    if (at->ssdT >= 0) swprintf(v[6], 32, L"%d °C", at->ssdT); else wcscpy(v[6], L"–");
+    swprintf(sub[6], 80, T(L"sub_ssd", L"Controller %d °C · System %d U/min"), at->ssdS, at->rpm[2]);
+    COLORREF ssdC = at->ssdT >= 82 || at->ssdS >= 100 ? C_HOT : at->ssdT >= 70 || at->ssdS >= 90 ? C_WARM : C_TEXT;
+    const wchar_t *labels[7] = { T(L"t_cpu", L"CPU"), T(L"t_gpu", L"Grafik"), T(L"t_fan", L"Lüfter"), T(L"t_cap", L"Taktbremse"), T(L"t_chip", L"Chip gesamt"), T(L"t_learn", L"Gelernte Last-Bereiche"), T(L"t_ssd", L"SSD") };
+    int tw = (rc.right - 2 * pad - 6 * gap) / 7;
+    for (int i = 0; i < 7; i++) {
         RECT t = { pad + i * (tw + gap), pad, pad + i * (tw + gap) + tw, pad + tileH };
-        tile(dc, t, labels[i], i == 0 ? tc : at->grund == GRUND_NOTFALL && i == 2 ? C_HOT : C_TEXT, v[i], sub[i]);
+        tile(dc, t, labels[i], i == 0 ? tc : i == 6 ? ssdC : at->grund == GRUND_NOTFALL && i == 2 ? C_HOT : at->grund == GRUND_ACHTUNG && i == 2 ? C_WARM : C_TEXT, v[i], sub[i]);
     }
 
     // ---- span buttons and status ----
@@ -333,11 +433,17 @@ static void paint(HWND w, HDC dc)
     }
     const wchar_t *status = stale ? T(L"stale", L"Keine neuen Werte – läuft der Regler?") : sh->nurLesen ? T(L"nurlesen", L"Nur lesen – es wird nichts gesteuert") : 0;
     int sx = top_buttons(dc, charts.right, by) - S(10);
-    if (status) text(dc, fSmall, sx, by + S(4), C_HOT, 1, L"%s", status);
-    else {
-        struct tm lt; time_t tt = (time_t)at->t; localtime_s(&lt, &tt);
-        text(dc, fSmall, sx, by + S(4), C_DIM, 1, T(L"status", L"%s%02d:%02d:%02d · Taktbremse gelernt – wenige %d · viele %d · Grafik %d MHz"),
-             hover >= 0 ? T(L"maus", L"Mauszeiger ") : L"", lt.tm_hour, lt.tm_min, lt.tm_sec, sh->deckel[0], sh->deckel[1], sh->deckel[2]);
+    {   // status right of the span buttons, cut with … when the window is narrow instead of running over them
+        wchar_t st[200];
+        if (status) wcsncpy(st, status, 199), st[199] = 0;
+        else {
+            struct tm lt; time_t tt = (time_t)at->t; localtime_s(&lt, &tt);
+            swprintf(st, 200, T(L"status", L"%s%02d:%02d:%02d · Taktbremse gelernt – wenige %d · viele %d · Grafik %d · Grafik + viele %d MHz"),
+                     hover >= 0 ? T(L"maus", L"Mauszeiger ") : L"", lt.tm_hour, lt.tm_min, lt.tm_sec, sh->deckel[0], sh->deckel[1], sh->deckel[2], sh->deckel[3]);
+        }
+        RECT sr = { bx + S(6), by + S(4), sx, by + S(22) };
+        SelectObject(dc, fSmall); SetTextColor(dc, status ? C_HOT : C_DIM);
+        if (sr.right > sr.left) DrawTextW(dc, st, -1, &sr, DT_RIGHT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
     }
 
     // ---- charts ----
@@ -360,17 +466,25 @@ static void paint(HWND w, HDC dc)
         { T(L"c_fan2", L"CPU-Lüfter 2 %"), 0, 100, 50, { { gRpm2, C_RPM, 1, lIst }, { gEcFan, C_WARM, 1, lEc }, { gFan, C_FAN, S(2), lSoll } } },
         { T(L"c_fan3", L"Systemlüfter (SSD, WLAN) %"), 0, 100, 50, { { gRpm3, C_RPM, 1, lIst }, { gSysEc, C_WARM, 1, lEc }, { gSysFan, C_FAN, S(2), lSoll } } },
     };
+    const float minW[6] = { 8, pmax / 6, 800, 15, 15, 15 };   // narrowest zoomed band: °C, W, MHz, %
+    for (int i = 0; i < 6; i++) { cs[i].minW = minW[i]; zoom_setup(&cs[i]); }
     static const int weight[6] = { 3, 3, 3, 2, 2, 2 };   // the three fan charts get 2/3 of the height of the others
     int unit = (charts.bottom - charts.top - 5 * gap) / 15, cy = charts.top;
     for (int i = 0; i < 6; i++) {
         RECT r = { charts.left, cy, charts.right, i == 5 ? charts.bottom : cy + weight[i] * unit };
         cy = r.bottom + gap;
         chart(dc, r, &cs[i]);
-        if (i == 0) {   // target and hot-spot lines
+        if (i == 0) {   // dashed lines: target, clock brake, attention, alarm; labels side by side so they do not overlap
             RECT p = { plot.left, r.top + S(20), plot.right, r.bottom };
-            int y1 = p.bottom - (int)((sh->ziel - tmin) / (tmax - tmin) * (p.bottom - p.top)), y2 = p.bottom - (int)((sh->spitze - tmin) / (tmax - tmin) * (p.bottom - p.top));
-            line(dc, p.left, y1, p.right, y1, C_OK, 1, PS_DASH); text(dc, fSmall, p.left + S(4), y1 - S(15), C_OK, 0, L"%s", T(L"ziel", L"Ziel"));
-            line(dc, p.left, y2, p.right, y2, C_HOT, 1, PS_DASH); text(dc, fSmall, p.left + S(4), y2 - S(15), C_HOT, 0, L"%s", T(L"spitze", L"Spitze"));
+            const float lv[4] = { sh->ziel, (float)sh->spitze, (float)sh->achtung, (float)sh->alarm };
+            const COLORREF lcol[4] = { C_OK, C_DIM, C_CAP, C_HOT };
+            const wchar_t *lname[4] = { T(L"ziel", L"Ziel"), T(L"spitze", L"Taktbremse"), T(L"l_achtung", L"Achtung"), T(L"l_alarm", L"Alarm") };
+            int lx = p.left + S(4);
+            for (int j = 0; j < 4; j++) {
+                int yy = p.bottom - 1 - (int)(yfrac(&cs[0], lv[j]) * (p.bottom - p.top - 2));
+                line(dc, p.left, yy, p.right, yy, lcol[j], 1, PS_DASH);
+                lx += text(dc, fSmall, lx, yy - S(15), lcol[j], 0, L"%s", lname[j]) + S(10);
+            }
         }
     }
 
@@ -379,11 +493,12 @@ static void paint(HWND w, HDC dc)
     fill(dc, strip, C_CARD, 0);
     for (uint32_t i = 0; i < count; i++) {
         const EvoSample *s = sample(i);
-        COLORREF c = s->grund == GRUND_NOTFALL ? C_HOT : s->lage == LAGE_GRAFIK ? C_GRAFIK : s->lage == LAGE_VIELE ? C_VIELE : C_CARD;
+        COLORREF c = s->grund == GRUND_NOTFALL ? C_HOT : s->grund == GRUND_ACHTUNG ? C_CAP : s->lage == LAGE_GRAFIK || s->lage == LAGE_BEIDE ? C_GRAFIK : s->lage == LAGE_VIELE ? C_VIELE : C_CARD;
         if (c == C_CARD) continue;
         int x0 = i ? xOf(strip, i - 1) : xOf(strip, 0) - 1, x1 = xOf(strip, i);
         RECT t = { x0, strip.top, x1 > x0 ? x1 : x0 + 1, strip.bottom };
         fill(dc, t, c, 0);
+        if (s->lage == LAGE_BEIDE && c == C_GRAFIK) { t.top = (strip.top + strip.bottom) / 2; fill(dc, t, C_VIELE, 0); }   // GPU + many cores: both colours
     }
     static const int tick[4] = { 1, 5, 15, 30 };   // minutes between time labels
     for (int m = (int)span / 60; m >= 0; m -= tick[spanIdx]) {
@@ -413,24 +528,30 @@ static void paint(HWND w, HDC dc)
     }
 
     // ---- switches: single functions on/off (a click writes einstellungen.ini) ----
-    RECT sc = { rc.right - pad - evW, pad + tileH + gap, rc.right - pad, pad + tileH + gap + S(74) + EVO_NFUNK * S(28) + S(28) };
+    RECT sc = { rc.right - pad - evW, pad + tileH + gap, rc.right - pad, pad + tileH + gap + S(134) + EVO_NFUNK * S(28) + S(28) };
     fill(dc, sc, C_CARD, S(10));
     text(dc, fBold, sc.left + S(14), sc.top + S(12), C_TEXT, 0, L"%s", T(L"funktionen", L"Funktionen"));
     ULONGLONG now = GetTickCount64();
     unsigned on = now < swUntil ? swWant : sh->funktionen;
-    // target temperature, 1 °C per click (written to [Regler] Ziel, the controller takes it over within 5 s)
+    // three temperature steps, 1 °C per click (written to [Regler], the controller takes them over within 5 s):
+    // green = target (as quiet as possible below it), yellow = attention (fan climbs), red = alarm (fan full)
     {
-        int zy = sc.top + S(40); COLORREF bc = sh->nurLesen ? C_GRID : C_OFF;
-        text(dc, fText, sc.left + S(14), zy + S(2), C_TEXT, 0, L"%s", T(L"z_ziel", L"Zieltemperatur"));
-        zielPlus = (RECT){ sc.right - S(38), zy, sc.right - S(14), zy + S(24) };
-        zielMinus = (RECT){ zielPlus.left - S(94), zy, zielPlus.left - S(70), zy + S(24) };
-        fill(dc, zielMinus, bc, S(8)); fill(dc, zielPlus, bc, S(8));
-        text(dc, fBold, (zielMinus.left + zielMinus.right) / 2, zy + S(2), C_TEXT, 2, L"−");
-        text(dc, fBold, (zielPlus.left + zielPlus.right) / 2, zy + S(2), C_TEXT, 2, L"+");
-        text(dc, fBold, (zielMinus.right + zielPlus.left) / 2, zy + S(2), now < zielUntil ? C_WARM : C_TEXT, 2, L"%.0f °C", now < zielUntil ? zielWant : sh->ziel);
+        static const wchar_t *stKey[3] = { L"z_ziel", L"z_achtung", L"z_alarm" }, *stDef[3] = { L"Ziel", L"Achtung (Lüfter steigt)", L"Alarm (Lüfter voll)" };
+        const COLORREF stC[3] = { C_OK, C_CAP, C_HOT }; COLORREF bc = sh->nurLesen ? C_GRID : C_OFF;
+        for (int j = 0; j < 3; j++) {
+            int zy = sc.top + S(40) + (2 - j) * S(30);   // red on top, like the temperature scale
+            RECT dot = { sc.left + S(14), zy + S(7), sc.left + S(24), zy + S(17) }; fill(dc, dot, stC[j], S(10));
+            text(dc, fText, sc.left + S(32), zy + S(2), C_TEXT, 0, L"%s", T(stKey[j], stDef[j]));
+            stPlus[j] = (RECT){ sc.right - S(38), zy, sc.right - S(14), zy + S(24) };
+            stMinus[j] = (RECT){ stPlus[j].left - S(94), zy, stPlus[j].left - S(70), zy + S(24) };
+            fill(dc, stMinus[j], bc, S(8)); fill(dc, stPlus[j], bc, S(8));
+            text(dc, fBold, (stMinus[j].left + stMinus[j].right) / 2, zy + S(2), C_TEXT, 2, L"−");
+            text(dc, fBold, (stPlus[j].left + stPlus[j].right) / 2, zy + S(2), C_TEXT, 2, L"+");
+            text(dc, fBold, (stMinus[j].right + stPlus[j].left) / 2, zy + S(2), now < stUntil[j] ? C_WARM : C_TEXT, 2, L"%.0f °C", cur_stufe(j));
+        }
     }
     for (int i = 0; i < EVO_NFUNK; i++) {
-        int y = sc.top + S(74) + i * S(28), isOn = on >> i & 1;
+        int y = sc.top + S(134) + i * S(28), isOn = on >> i & 1;
         sw[i] = (RECT){ sc.left + S(14), y, sc.left + S(50), y + S(20) };
         fill(dc, sw[i], sh->nurLesen ? C_GRID : isOn ? C_OK : C_OFF, S(20));
         RECT knob = { isOn ? sw[i].right - S(18) : sw[i].left + S(2), y + S(2), isOn ? sw[i].right - S(2) : sw[i].left + S(18), y + S(18) };
@@ -460,13 +581,22 @@ static void paint(HWND w, HDC dc)
         ey += S(16) + h + S(10);
     }
     // what the colours of the strip under the curves mean
-    int lx2 = ev.left + S(14), ly = ev.bottom - S(28);
+    int lx2 = ev.left + S(14), ly = ev.bottom - S(44);   // two rows: load type, then the warning stages
     text(dc, fSmall, lx2, ly - S(18), C_DIM, 0, L"%s", T(L"streifen", L"Farbstreifen unten = Lastart:"));
-    const COLORREF lc[3] = { C_GRAFIK, C_VIELE, C_HOT };
-    const wchar_t *ln[3] = { T(L"s_gpu", L"Grafik arbeitet"), T(L"s_viele", L"viele Kerne"), T(L"s_notfall", L"Notfall") };
-    for (int i = 0; i < 3; i++) {
+    const COLORREF lc[4] = { C_GRAFIK, C_VIELE, C_CAP, C_HOT };
+    const wchar_t *ln[4] = { T(L"s_gpu", L"Grafik arbeitet"), T(L"s_viele", L"viele Kerne"), T(L"s_achtung", L"Achtung"), T(L"s_notfall", L"Notfall") };
+    for (int i = 0; i < 4; i++) {
+        if (i == 2) { lx2 = ev.left + S(14); ly += S(16); }
         RECT q = { lx2, ly + S(3), lx2 + S(10), ly + S(13) }; fill(dc, q, lc[i], 0);
         lx2 += S(16) + text(dc, fSmall, lx2 + S(14), ly, C_DIM, 0, L"%s", ln[i]) + S(10);
+    }
+    // zoom switch, bottom right
+    {
+        const wchar_t *zl = T(L"zoom", L"🔍 Zoom");
+        SelectObject(dc, fSmall); SIZE sz; GetTextExtentPoint32W(dc, zl, (int)wcslen(zl), &sz);
+        btnZoom = (RECT){ ev.right - S(14) - sz.cx - S(16), ly - S(2), ev.right - S(14), ly + S(16) };
+        fill(dc, btnZoom, zoom ? RGB(58, 92, 160) : C_GRID, S(8));
+        text(dc, fSmall, (btnZoom.left + btnZoom.right) / 2, ly, zoom ? C_TEXT : C_DIM, 2, L"%s", zl);
     }
 }
 
@@ -483,19 +613,23 @@ static void toggle_funk(HWND w, int i)
     InvalidateRect(w, 0, FALSE);
 }
 
-// target temperature: 60 °C up to 3 °C below the hot-spot limit (above that the clock brake would fight the fan)
-static void set_ziel(HWND w, float z)
+// the three steps, each at least 2 °C apart: target 60 °C up to 3 °C below the hot-spot limit (above that the clock
+// brake would fight the fan), attention from 70 °C, alarm 80-97 °C (the freezes came at ~100 °C)
+static void set_stufe(HWND w, int j, float z)
 {
     if (!sh || sh->nurLesen) return;
     ULONGLONG now = GetTickCount64();
-    float hi = (float)(sh->spitze - 3 < 90 ? sh->spitze - 3 : 90);
-    z = z < 60 ? 60 : z > hi ? hi : z;
+    static const wchar_t *key[3] = { L"Ziel", L"Achtung", L"Alarm" };
+    float lo = j == 0 ? 60 : j == 1 ? fmaxf(70, cur_stufe(0) + 2) : fmaxf(80, cur_stufe(1) + 2);
+    float hi = j == 0 ? fminf((float)sh->spitze - 3, cur_stufe(1) - 2) : j == 1 ? cur_stufe(2) - 2 : 97;
+    z = z < lo ? lo : z > hi ? hi : z;
     wchar_t v[8]; swprintf(v, 8, L"%.0f", z);
-    if (WritePrivateProfileStringW(L"Regler", L"Ziel", v, iniFile)) { zielWant = z; zielUntil = now + 8000; }
+    if (WritePrivateProfileStringW(L"Regler", key[j], v, iniFile)) { stWant[j] = z; stUntil[j] = now + 8000; }
     else swErrUntil = now + 5000;
     InvalidateRect(w, 0, FALSE);
 }
-static float cur_ziel(void) { return GetTickCount64() < zielUntil ? zielWant : sh ? sh->ziel : 80; }
+static void set_ziel(HWND w, float z) { set_stufe(w, 0, z); }
+static float cur_ziel(void) { return cur_stufe(0); }
 
 // ---------- tray icon ----------
 static NOTIFYICONDATAW tray;
@@ -653,10 +787,14 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         InvalidateRect(w, 0, FALSE); return 0;
     }
     case WM_MOUSELEAVE: mouseX = mouseY = -1; InvalidateRect(w, 0, FALSE); return 0;
+    case WM_GETMINMAXINFO: {   // below this the charts get too narrow next to the fixed right column
+        MINMAXINFO *mm = (MINMAXINFO *)lp; mm->ptMinTrackSize.x = S(900); mm->ptMinTrackSize.y = S(700); return 0;
+    }
     case WM_LBUTTONDOWN: {
         POINT p = { (short)LOWORD(lp), (short)HIWORD(lp) };
         for (int i = 0; i < 4; i++) if (PtInRect(&btn[i], p)) { spanIdx = i; InvalidateRect(w, 0, FALSE); }
         if (PtInRect(&btnUpdate, p)) open_releases();
+        if (PtInRect(&btnZoom, p)) { zoom = !zoom; WritePrivateProfileStringW(L"Anzeige", L"Zoom", zoom ? L"1" : L"0", iniFile); InvalidateRect(w, 0, FALSE); }
         if (PtInRect(&btnThema, p) || PtInRect(&btnSprache, p)) {
             int ok;
             if (PtInRect(&btnThema, p)) { thema = (thema + 1) % 3; ok = WritePrivateProfileStringW(L"Anzeige", L"Thema", themaKey[thema], iniFile); apply_theme(w); }
@@ -668,8 +806,10 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp)
             load_lang(); set_title(w); InvalidateRect(w, 0, FALSE);
         }
         for (int i = 0; i < EVO_NFUNK; i++) if (PtInRect(&sw[i], p)) toggle_funk(w, i);
-        if (PtInRect(&zielMinus, p)) set_ziel(w, cur_ziel() - 1);
-        if (PtInRect(&zielPlus, p)) set_ziel(w, cur_ziel() + 1);
+        for (int j = 0; j < 3; j++) {
+            if (PtInRect(&stMinus[j], p)) set_stufe(w, j, cur_stufe(j) - 1);
+            if (PtInRect(&stPlus[j], p)) set_stufe(w, j, cur_stufe(j) + 1);
+        }
         return 0;
     }
     case WM_KEYDOWN: if (wp >= '1' && wp <= '4') { spanIdx = (int)(wp - '1'); InvalidateRect(w, 0, FALSE); } return 0;
@@ -719,6 +859,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     HWND old = FindWindowW(L"evo-x2-cool-front", 0);   // already running: bring it to the front instead of a second copy
     if (old) { DWORD pid; GetWindowThreadProcessId(old, &pid); AllowSetForegroundWindow(pid); PostMessageW(old, WM_ZEIGEN, 0, 0); return 0; }
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    ULONG_PTR gdipToken; GpStartupInput gin = { 1, 0, FALSE, TRUE };   // only for anti-aliased round corners (fill)
+    GdiplusStartup(&gdipToken, &gin, 0);
     dpi = (int)GetDpiForSystem();
     ExpandEnvironmentStringsW(EVO_INI, iniFile, MAX_PATH);
     load_lang();
