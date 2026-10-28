@@ -46,7 +46,7 @@
 #define SVC L"evo-x2-cool"
 
 // ---------- settings (einstellungen.ini) ----------
-static float ziel = 80; static int minP = 30, minLeer = 10, maxP = 70, spitze = 88, achtung = 90, alarm = 95, sicherMhz = 3600, nurLesen;
+static float ziel = 80; static int minP = 30, minLeer = 10, maxP = 70, spitze = 88, achtung = 90, alarm = 95, sicherMhz = 3600, taktPlus, nurLesen;
 static unsigned fn = F_ALLE;   // functions switched on
 static const int stufen[] = { 3000, 3300, 3600, 3900, 4200, 4500 };   // clock cap steps, MHz
 #define NSTUFEN 6
@@ -107,6 +107,9 @@ static unsigned load_settings(void)
     achtung = GetPrivateProfileIntW(L"Regler", L"Achtung", 90, iniFile);
     alarm = GetPrivateProfileIntW(L"Regler", L"Alarm", 95, iniFile);
     sicherMhz = GetPrivateProfileIntW(L"Regler", L"SicherMHz", 3600, iniFile);
+    // test switch: added to every clock cap the brake writes (0 = as learned); limited to -600..+600 MHz
+    taktPlus = GetPrivateProfileIntW(L"Regler", L"TaktPlus", 0, iniFile);
+    taktPlus = taktPlus < -600 ? -600 : taktPlus > 600 ? 600 : taktPlus;
     // sane limits, whatever is in the file
     ziel = ziel < 50 ? 50 : ziel > 92 ? 92 : ziel; minP = minP < 0 ? 0 : minP > 100 ? 100 : minP;
     minLeer = minLeer < 0 ? 0 : minLeer > minP ? minP : minLeer;
@@ -751,7 +754,7 @@ static int run(void)
             if (T >= spitze) {
                 // hot spot: lowest step at once; this situation loses one step (learned from danger), and the step that
                 // caused it is tried again only after a longer calm run each time
-                if (k > sicherBis && lage[lg].stufe > unten[lg] && capNow > stufen[unten[lg]]) {
+                if (k > sicherBis && lage[lg].stufe > unten[lg] && capNow - taktPlus > stufen[unten[lg]]) {
                     int s = lage[lg].stufe;
                     if (lage[lg].fehl[s] < 9) lage[lg].fehl[s]++;
                     lage[lg].stufe--;
@@ -775,7 +778,7 @@ static int run(void)
                     event(L_("ruhig", "%d min am Limit ohne Spitze bei „%s“: probiert %d MHz"), w / 60, lage_text(lg), stufen[s]);
                 }
             }
-            int want = k <= sicherBis ? (sicherCap < stufen[unten[lg]] ? sicherCap : stufen[unten[lg]]) : stufen[lage[lg].stufe];
+            int want = (k <= sicherBis ? (sicherCap < stufen[unten[lg]] ? sicherCap : stufen[unten[lg]]) : stufen[lage[lg].stufe]) + taktPlus;
             if (want != capNow && write_cap(want)) { event(L_("takt", "Taktbremse %d → %d MHz%s"), capNow, want, k <= sicherBis ? L_("takt_spitze", " (nach Hitzespitze)") : ""); capNow = want; }
         }
         if (!nurLesen) {
