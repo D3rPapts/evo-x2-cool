@@ -681,11 +681,15 @@ static int run(void)
             }
             ReleaseMutex(mPci);
         }
-        // EC temperature and fan 1 every 2 s (the EC temperature is only the second emergency path and the slow curve
-        // anchor; Tctl is read every second), the rest every 10 s
-        int nEc = k % 10 == 0 ? 8 : k % 2 == 0 ? 3 : 0;
+        // as few EC reads as possible: Windows' ACPI driver talks to the EC as well, and every access of ours can
+        // collide with it. EC temperature every 5 s (only the second emergency path and the slow curve anchor; Tctl
+        // comes every second), fan speeds every 30 s (shown only), the power mode never (we know what we wrote).
+        // Before: ~7000 reads an hour, now ~1000.
         // a value that is not confirmed or impossible (case above 110 °C) keeps the last reading
-        for (int i = 0; i < nEc; i++) { int v = ec_read_sicher(regs[i], ec[i]); if (v >= 0 && !(i == 0 && v > 110)) ec[i] = v; }
+        for (int i = 0; i < 8; i++) {
+            if (i == 3 || (i == 0 ? k % 5 : k % 30)) continue;
+            int v = ec_read_sicher(regs[i], ec[i]); if (v >= 0 && !(i == 0 && v > 110)) ec[i] = v;
+        }
         int Te = ec[0];
         // GPU every second while it works, every 2 s while it rests (a start is noticed at most 1 s later)
         static int gW = -1, gL = -1, gT = -1, aW = -1;
@@ -869,8 +873,13 @@ static int run(void)
         sysWant = sw > 100 ? 100 : sw;
         int fanOn = !nurLesen && ((fn & F_LUEFTER) || grund == GRUND_NOTFALL || nachNotfall);   // the emergency takes over even when switched off
         // (yellow does not: switched off, the BIOS curve is already at full from 85 °C)
-        if (fanOn && (abs(di - curveD) >= 2 || abs(sysWant - curveSys) >= 2 || fabsf(emaTe - curveAnchor) > 3)) write_curve(di, emaTe, 0);
-        else if (fanOn && k % 60 == 30 && curveD >= 0) write_curve(curveD, curveAnchor, 1);
+        // written only on a change of 5 % or an anchor 5 °C away (an emergency at once): the fans need ~10 s per step
+        // anyway, and every write is EC traffic (2 % / 3 °C wrote the curve ~100 times an hour, now ~40). The check
+        // against an EC reset (after sleep) reads all 12 registers, every 5 min instead of every minute
+        int kurveNeu = curveD < 0 || abs(di - curveD) >= 5 || abs(sysWant - curveSys) >= 5 || fabsf(emaTe - curveAnchor) > 5
+                       || (grund == GRUND_NOTFALL && di != curveD);
+        if (fanOn && kurveNeu) write_curve(di, emaTe, 0);
+        else if (fanOn && k % 300 == 30 && curveD >= 0) write_curve(curveD, curveAnchor, 1);
         else if (!fanOn && curveD >= 0) restore_bios(orig);
         if (nurLesen) grund = GRUND_NUR_LESEN;
 
@@ -884,7 +893,7 @@ static int run(void)
             s->gpuW = G; s->apuW = (float)aW; s->heatW = heat; s->pVorher = pv; s->mhz = (float)maxMhz; s->load = (float)load;
             s->ecT = (int16_t)Te; s->busy = (int16_t)busy; s->gpuLoad = (int16_t)gL; s->gpuT = (int16_t)gT; s->fan = (int16_t)(nurLesen ? -1 : curveD);
             s->cap = (int16_t)capNow; s->rpm[0] = (int16_t)r1; s->rpm[1] = (int16_t)r2; s->rpm[2] = (int16_t)r3;
-            s->lage = (uint8_t)lg; s->modus = (uint8_t)ec[3]; s->grund = (uint8_t)grund; s->leise = modusJetzt == 2;
+            s->lage = (uint8_t)lg; s->modus = (uint8_t)modusJetzt; s->grund = (uint8_t)grund; s->leise = modusJetzt == 2;
             s->ecFan = (int16_t)(nurLesen || Te < 0 ? -1 : curve_duty(Te, 0));
             s->sysEc = (int16_t)(nurLesen || Te < 0 ? -1 : curve_duty(Te, 6)); s->sysFan = (int16_t)(nurLesen ? -1 : curveSys);
             s->ssdT = (int16_t)ssdT; s->ssdS = (int16_t)ssdS;
@@ -895,7 +904,7 @@ static int run(void)
         char line[400];
         snprintf(line, sizeof line, "%02d:%02d:%02d;%.1f;%.1f;%d;%.1f;%.1f;%.1f;%.0f;%d;%.1f;%.1f;%.0f;%.0f;%d;%d;%d;%d;%s;%d;%d;%d;%.1f;%.2f;%d;%d;%s;%d;%d;%d;%d;%s;%.0f\r\n",
                  st.wHour, st.wMinute, st.wSecond, T, emaT, Te, pkgW, sumW, maxW, G, aW, heat, pv, maxMhz, load, busy, gL, gT,
-                 nurLesen ? -1 : curveD, grundName[grund], r1, r2, r3, vorh, versatz, felder(), capNow, lageName[lg], ec[3], nurLesen ? -1 : di, ssdT, ssdS, ssdEinzeln, io);
+                 nurLesen ? -1 : curveD, grundName[grund], r1, r2, r3, vorh, versatz, felder(), capNow, lageName[lg], modusJetzt, nurLesen ? -1 : di, ssdT, ssdS, ssdEinzeln, io);
         csv_line(line);
         if (console) printf("\r%02d:%02d:%02d  Tctl %5.1f (glatt %5.1f)  EC %3d  Kerne %5.1f W  GPU %5.1f W  -> Luefter %3d %% [%s] %d U/min  Takt %d MHz [%s]   ",
                             st.wHour, st.wMinute, st.wSecond, T, emaT, Te, sumW, G, nurLesen ? -1 : curveD, grundName[grund], r1, capNow, lageName[lg]);
