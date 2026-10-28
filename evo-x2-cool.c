@@ -851,7 +851,15 @@ static int run(void)
         ioSek = io >= 100 ? ioSek + 1 : 0;
         float ioWant = ioSek >= 5 ? (float)fmin(100, 50 + (io - 100) / 20) : 0;
         ioHalt = fmaxf(ioWant, ioHalt - 1);
-        int aus = leer && grund != GRUND_NOTFALL && ioHalt <= 0 && ssdT >= 0 && ssdT < (sysAus ? 50 : 47) && ssdS < (sysAus ? 75 : 70);
+        int ssdWarm = grund == GRUND_NOTFALL || ioHalt > 0 || ssdT < 0 || ssdT >= (sysAus ? 50 : 47) || ssdS >= (sysAus ? 75 : 70);
+        // own idle check with a wider gap (off below target - 30, on above target - 17) and on for at least 5 min, off for
+        // at least 2 min (warm SSD, data or an emergency: on at once). The CPU fans' idle check (60/65 °C) followed short
+        // CPU bursts: 8 switches in 24 min. Replayed on that morning: 3 instead of 10, still off two thirds of the time
+        static int sysLeer, sysSeit = -1000;
+        if (emaT < ziel - 30 && pSlow < 30) sysLeer = 1; else if (emaT > ziel - 17 || pSlow > 40) sysLeer = 0;
+        int aus = sysLeer && !ssdWarm;
+        if (aus != sysAus && !ssdWarm && k - sysSeit < (sysAus ? 120 : 300)) aus = sysAus;
+        if (aus != sysAus) sysSeit = k;
         if (aus != sysAus && !nurLesen && (fn & F_LUEFTER)) event(aus ? L_("sys_aus", "Systemlüfter aus (Leerlauf, SSD %d °C)") : L_("sys_an", "Systemlüfter wieder an (SSD %d °C)"), ssdT);
         sysAus = aus;
         int sw = aus ? 0 : di + 10 > 30 ? di + 10 : 30;
