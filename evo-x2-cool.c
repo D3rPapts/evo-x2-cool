@@ -123,7 +123,7 @@ static unsigned load_settings(void)
     if (wcscmp(lf, langFile)) { wcscpy(langFile, lf); nLang = 0; }
     unsigned old = fn; fn = 0;
     for (int i = 0; i < EVO_NFUNK; i++) if (GetPrivateProfileIntW(L"Funktionen", evoFunkKey[i], 1, iniFile)) fn |= 1u << i;
-    if (sh) { sh->ziel = ziel; sh->minP = minP; sh->maxP = maxP; sh->spitze = spitze; sh->achtung = achtung; sh->alarm = alarm; sh->funktionen = nurLesen ? 0 : fn; }
+    if (sh) { sh->ziel = ziel; sh->minP = minP; sh->maxP = maxP; sh->spitze = spitze; sh->achtung = achtung; sh->alarm = alarm; sh->taktPlus = taktPlus; sh->funktionen = nurLesen ? 0 : fn; }
     return old;
 }
 
@@ -595,7 +595,7 @@ static int run(void)
     int modusOrig = ec_read_sicher(0x31, -1), modusJetzt = modusOrig;
     if (modusOrig == 2 || modusOrig < 0) modusOrig = 0;   // "leise" at start is most likely left over from a killed run
     if (sh) {
-        sh->nurLesen = nurLesen; sh->funktionen = nurLesen ? 0 : fn; sh->ziel = ziel; sh->minP = minP; sh->maxP = maxP; sh->spitze = spitze; sh->achtung = achtung; sh->alarm = alarm;
+        sh->nurLesen = nurLesen; sh->funktionen = nurLesen ? 0 : fn; sh->ziel = ziel; sh->minP = minP; sh->maxP = maxP; sh->spitze = spitze; sh->achtung = achtung; sh->alarm = alarm; sh->taktPlus = taktPlus;
         sh->versatz = versatz; sh->felder = felder();
         for (int i = 0; i < EVO_NLAGE; i++) sh->deckel[i] = stufen[lage[i].stufe];
     }
