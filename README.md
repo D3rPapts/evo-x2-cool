@@ -92,6 +92,8 @@ Spitze=88        ; hot spot: brake the clock from here
 Achtung=90       ; yellow: fan climbs by 2 %/s, also beyond MaxProzent
 Alarm=95         ; red: fan 100 % at once (at most 97)
 SicherMHz=3600   ; clock cap left behind on stop
+MinDauerlast=45  ; fan at least this % after 2 min above DauerlastW (0 = off)
+DauerlastW=70    ; lasting load from this many watts (smoothed); off again 10 W below
 Sprache=de       ; de / en, any sprache-<code>.ini next to the exe works
 
 [Funktionen]     ; 1 = on, also switchable in the window
