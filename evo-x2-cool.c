@@ -47,6 +47,7 @@
 
 // ---------- settings (einstellungen.ini) ----------
 static float ziel = 80; static int minP = 30, minLeer = 10, maxP = 70, spitze = 88, achtung = 90, alarm = 95, sicherMhz = 3600, taktPlus, nurLesen;
+static int minDauer = 45, dauerW = 70;   // fan floor under lasting high load (0 = off), and from how many watts
 static unsigned fn = F_ALLE;   // functions switched on
 static const int stufen[] = { 3000, 3300, 3600, 3900, 4200, 4500 };   // clock cap steps, MHz
 #define NSTUFEN 6
@@ -87,7 +88,7 @@ static unsigned load_settings(void)
     if (GetFileAttributesW(iniFile) == INVALID_FILE_ATTRIBUTES) {
         static const char def[] =
             "; evo-x2-cool settings, re-read within 5 s after a change\r\n"
-            "[Regler]\r\nZiel=80\r\nMinProzent=30\r\nMinLeerlauf=10\r\nMaxProzent=70\r\nSpitze=88\r\nAchtung=90\r\nAlarm=95\r\nSicherMHz=3600\r\nSprache=de\r\n\r\n"
+            "[Regler]\r\nZiel=80\r\nMinProzent=30\r\nMinLeerlauf=10\r\nMaxProzent=70\r\nSpitze=88\r\nAchtung=90\r\nAlarm=95\r\nSicherMHz=3600\r\nMinDauerlast=45\r\nDauerlastW=70\r\nSprache=de\r\n\r\n"
             "; 1 = on, 0 = off. The emergency (fan 100 % when overheating) always stays on.\r\n"
             "[Funktionen]\r\nLuefter=1\r\nTaktbremse=1\r\nEcLeise=1\r\nLernen=1\r\nVorhersage=1\r\n\r\n"
             "; window: Thema = system / hell / dunkel; UpdatePruefen = 1: ask GitHub once a day for a newer version (only shown, nothing installed)\r\n"
@@ -110,6 +111,11 @@ static unsigned load_settings(void)
     // test switch: added to every clock cap the brake writes (0 = as learned); limited to -600..+600 MHz
     taktPlus = GetPrivateProfileIntW(L"Regler", L"TaktPlus", 0, iniFile);
     taktPlus = taktPlus < -600 ? -600 : taktPlus > 600 ? 600 : taktPlus;
+    // lasting high load: fan at least MinDauerlast % once the power stayed above DauerlastW for two minutes (0 = off)
+    minDauer = GetPrivateProfileIntW(L"Regler", L"MinDauerlast", 45, iniFile);
+    minDauer = minDauer < 0 ? 0 : minDauer > 100 ? 100 : minDauer;
+    dauerW = GetPrivateProfileIntW(L"Regler", L"DauerlastW", 70, iniFile);
+    dauerW = dauerW < 30 ? 30 : dauerW > 150 ? 150 : dauerW;
     // sane limits, whatever is in the file
     ziel = ziel < 50 ? 50 : ziel > 92 ? 92 : ziel; minP = minP < 0 ? 0 : minP > 100 ? 100 : minP;
     minLeer = minLeer < 0 ? 0 : minLeer > minP ? minP : minLeer;
@@ -816,6 +822,16 @@ static int run(void)
         // cores take its power and it falls below 20 W
         int vorbeugen = (lg == LAGE_BEIDE || lg == LAGE_GRAFIK) && busy > 4 && sumW > 15 && wantD < 50;
         if (vorbeugen) wantD = 50;
+        // lasting high load: hours at 75-85 W left the fan at ~30 % (chip ~78 °C, fine), but the heatsink is soaked then,
+        // and a burst on the cores on top took the chip to 97-98 °C within seconds (5 emergencies on 29.10.). A floor
+        // keeps a reserve. On after two minutes of the smoothed power above DauerlastW, off after a minute 10 W below
+        static int dauerSek, dauer;
+        if (pSlow >= dauerW) dauerSek = dauerSek < 120 ? dauerSek + 1 : 120; else if (pSlow < dauerW - 10) dauerSek = dauerSek > 60 ? 60 : dauerSek - 1;
+        int dauerNeu = minDauer > 0 && (dauer ? dauerSek > 0 : dauerSek >= 120);
+        if (dauerNeu != dauer && !nurLesen && (fn & F_LUEFTER))
+            event(dauerNeu ? L_("dauer_an", "Dauerlast über %d W: Lüfter mindestens %d %%") : L_("dauer_aus", "Dauerlast vorbei (unter %d W), Untergrenze %d %% aufgehoben"), dauerNeu ? dauerW : dauerW - 10, minDauer);
+        dauer = dauerNeu;
+        if (dauer && wantD < minDauer) wantD = (float)minDauer;
         int grund = boost >= 1 ? GRUND_NACHREGELN : (fn & F_VORHERSAGE) && pv > pSlow + 5 ? GRUND_VORHERSAGE : GRUND_MODELL;
         // two stages above the noise limit. Yellow (smoothed CPU or case sensor >= Achtung, default 90 °C, off 2 °C below; a 1-s boost spike is
         // the clock brake's job): the fan climbs by 2 %/s,
