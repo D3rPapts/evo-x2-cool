@@ -521,10 +521,20 @@ static double ssd_io(void)
 // Each EC write costs a write plus a read-back (~2 ms of spinning), so only registers that change are written (usually
 // start/full/pwm). check = 1 reads every register first instead of trusting the cache (done once a minute, in case the
 // EC was reset, e.g. after sleep).
+// quiet time after writing to the EC: ACPI event 13 (Windows: "EC did not respond within the timeout") came exactly 5 s
+// after an EC power mode switch in 11 of 14 cases (27.-29.10.), and piled up 5 s after fan curve writes too. So after a
+// write the controller leaves the EC alone for 6 s (no reads, no further writes) and Windows' own requests get through.
+// The emergency and the yellow stage write anyway; the stop writes back anyway
+#define EC_RUHE_MS 6000
+static ULONGLONG ecRuheBis;
+static int ec_ruhig(void) { return GetTickCount64() < ecRuheBis; }
+static void ec_ruhe(void) { ecRuheBis = GetTickCount64() + EC_RUHE_MS; }
+
 static int curveD = -1, sysWant = -1, curveSys = -1; static float curveAnchor = -1;
 static int curveReg[12] = { -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 };
 static void write_curve(int d, float teSmooth, int check)
 {
+    int geschrieben = 0;
     int start = (int)floorf(teSmooth) - 3; start = start < 25 ? 25 : start > 92 ? 92 : start;
     int pwm = d - 6 < 0 ? 0 : d - 6;
     int full = start + (100 - pwm + 1) / 2 + 1; if (full > 105) full = 105;
@@ -535,11 +545,12 @@ static void write_curve(int d, float teSmooth, int check)
     for (int b = 0; b <= 6; b += 6)
         for (int j = 0; j < 6; j++) {
             int i = b + order[j];
-            if ((check ? ec_read((uint8_t)(0x60 + i)) : curveReg[i]) != val[i])
-                curveReg[i] = ec_write((uint8_t)(0x60 + i), (uint8_t)val[i]) ? val[i] : -1;
-            else curveReg[i] = val[i];
+            if ((check ? ec_read((uint8_t)(0x60 + i)) : curveReg[i]) != val[i]) {
+                curveReg[i] = ec_write((uint8_t)(0x60 + i), (uint8_t)val[i]) ? val[i] : -1; geschrieben++;
+            } else curveReg[i] = val[i];
         }
     curveD = d; curveSys = s; curveAnchor = teSmooth;
+    if (geschrieben) ec_ruhe();
 }
 
 // duty % the written curve gives at EC temperature t: pwm up to start, then linear to 100 % at full; -1 = BIOS curve.
@@ -697,6 +708,7 @@ static int run(void)
         // a value that is not confirmed or impossible (case above 110 °C) keeps the last reading
         for (int i = 0; i < 8; i++) {
             if (i == 3 || (i == 0 ? k % 5 : k % 30)) continue;
+            if (ec_ruhig()) break;   // quiet time after a write: keep the last values
             int v = ec_read_sicher(regs[i], ec[i]); if (v >= 0 && !(i == 0 && v > 110)) ec[i] = v;
         }
         int Te = ec[0];
@@ -794,7 +806,7 @@ static int run(void)
             int modus = (fn & F_LEISE) && lg == LAGE_VIELE && G < 5 ? 2 : modusOrig;
             if (modus == modusJetzt || modus == 2) modusLocker = 0;
             else if (modusJetzt == 2 && ++modusLocker < 30) modus = 2;
-            if (modus != modusJetzt && ec_write(0x31, (uint8_t)modus)) { event(L_("modus", "EC-Leistungsmodus → %s"), modus == 2 ? L_("modus2", "leise (54 W)") : modus == 1 ? L_("modus1", "Leistung") : L_("modus0", "ausgewogen")); modusJetzt = modus; }
+            if (modus != modusJetzt && !ec_ruhig() && ec_write(0x31, (uint8_t)modus)) { ec_ruhe(); event(L_("modus", "EC-Leistungsmodus → %s"), modus == 2 ? L_("modus2", "leise (54 W)") : modus == 1 ? L_("modus1", "Leistung") : L_("modus0", "ausgewogen")); modusJetzt = modus; }
         }
 
         // --- learn: only when calm (power steady, temperature hardly moving) and not during boost hot spots (>= 90 °C:
@@ -897,8 +909,9 @@ static int run(void)
         // against an EC reset (after sleep) reads all 12 registers, every 5 min instead of every minute
         int kurveNeu = curveD < 0 || abs(di - curveD) >= 5 || abs(sysWant - curveSys) >= 5 || fabsf(emaTe - curveAnchor) > 5
                        || (grund == GRUND_NOTFALL && di != curveD);
-        if (fanOn && kurveNeu) write_curve(di, emaTe, 0);
-        else if (fanOn && k % 300 == 30 && curveD >= 0) write_curve(curveD, curveAnchor, 1);
+        int dringend = grund == GRUND_NOTFALL || grund == GRUND_ACHTUNG;
+        if (fanOn && kurveNeu) { if (!ec_ruhig() || dringend) write_curve(di, emaTe, 0); }
+        else if (fanOn && k % 300 == 30 && curveD >= 0) { if (!ec_ruhig()) write_curve(curveD, curveAnchor, 1); }
         else if (!fanOn && curveD >= 0) restore_bios(orig);
         if (nurLesen) grund = GRUND_NUR_LESEN;
 
