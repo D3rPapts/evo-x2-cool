@@ -65,10 +65,11 @@ static void fill(HDC dc, RECT r, COLORREF c, int round);
 static int text(HDC dc, HFONT f, int x, int y, COLORREF c, int align, const wchar_t *fmt, ...);
 static RECT sw[EVO_NFUNK];                  // switch rectangles
 static unsigned swWant; static ULONGLONG swUntil, swErrUntil;   // clicked state shown until the controller has taken it over
-static RECT stMinus[3], stPlus[3]; static float stWant[3]; static ULONGLONG stUntil[3];   // target / attention / alarm - / +
+static RECT stMinus[4], stPlus[4]; static float stWant[4]; static ULONGLONG stUntil[4];   // target / attention / alarm / clock plus - / +
 static float cur_stufe(int j)   // clicked value until the controller has taken it over
 {
     if (GetTickCount64() < stUntil[j]) return stWant[j];
+    if (j == 3) return sh ? (float)sh->taktPlus : 0;
     return !sh ? (j == 0 ? 80.0f : j == 1 ? 90.0f : 95.0f) : j == 0 ? sh->ziel : (float)(j == 1 ? sh->achtung : sh->alarm);
 }
 
@@ -528,7 +529,7 @@ static void paint(HWND w, HDC dc)
     }
 
     // ---- switches: single functions on/off (a click writes einstellungen.ini) ----
-    RECT sc = { rc.right - pad - evW, pad + tileH + gap, rc.right - pad, pad + tileH + gap + S(134) + EVO_NFUNK * S(28) + S(28) };
+    RECT sc = { rc.right - pad - evW, pad + tileH + gap, rc.right - pad, pad + tileH + gap + S(164) + EVO_NFUNK * S(28) + S(28) };
     fill(dc, sc, C_CARD, S(10));
     text(dc, fBold, sc.left + S(14), sc.top + S(12), C_TEXT, 0, L"%s", T(L"funktionen", L"Funktionen"));
     ULONGLONG now = GetTickCount64();
@@ -549,9 +550,18 @@ static void paint(HWND w, HDC dc)
             text(dc, fBold, (stPlus[j].left + stPlus[j].right) / 2, zy + S(2), C_TEXT, 2, L"+");
             text(dc, fBold, (stMinus[j].right + stPlus[j].left) / 2, zy + S(2), now < stUntil[j] ? C_WARM : C_TEXT, 2, L"%.0f °C", cur_stufe(j));
         }
+        // clock plus (test switch TaktPlus): added to every cap of the clock brake, 100 MHz per click, -600..+600
+        int zy = sc.top + S(130);
+        text(dc, fText, sc.left + S(32), zy + S(2), C_TEXT, 0, L"%s", T(L"z_takt", L"Taktgrenze (MHz)"));
+        stPlus[3] = (RECT){ sc.right - S(38), zy, sc.right - S(14), zy + S(24) };
+        stMinus[3] = (RECT){ stPlus[3].left - S(94), zy, stPlus[3].left - S(70), zy + S(24) };
+        fill(dc, stMinus[3], bc, S(8)); fill(dc, stPlus[3], bc, S(8));
+        text(dc, fBold, (stMinus[3].left + stMinus[3].right) / 2, zy + S(2), C_TEXT, 2, L"−");
+        text(dc, fBold, (stPlus[3].left + stPlus[3].right) / 2, zy + S(2), C_TEXT, 2, L"+");
+        text(dc, fBold, (stMinus[3].right + stPlus[3].left) / 2, zy + S(2), now < stUntil[3] ? C_WARM : cur_stufe(3) ? C_CAP : C_TEXT, 2, L"%+.0f", cur_stufe(3));
     }
     for (int i = 0; i < EVO_NFUNK; i++) {
-        int y = sc.top + S(134) + i * S(28), isOn = on >> i & 1;
+        int y = sc.top + S(164) + i * S(28), isOn = on >> i & 1;
         sw[i] = (RECT){ sc.left + S(14), y, sc.left + S(50), y + S(20) };
         fill(dc, sw[i], sh->nurLesen ? C_GRID : isOn ? C_OK : C_OFF, S(20));
         RECT knob = { isOn ? sw[i].right - S(18) : sw[i].left + S(2), y + S(2), isOn ? sw[i].right - S(2) : sw[i].left + S(18), y + S(18) };
@@ -619,9 +629,9 @@ static void set_stufe(HWND w, int j, float z)
 {
     if (!sh || sh->nurLesen) return;
     ULONGLONG now = GetTickCount64();
-    static const wchar_t *key[3] = { L"Ziel", L"Achtung", L"Alarm" };
-    float lo = j == 0 ? 60 : j == 1 ? fmaxf(70, cur_stufe(0) + 2) : fmaxf(80, cur_stufe(1) + 2);
-    float hi = j == 0 ? fminf((float)sh->spitze - 3, cur_stufe(1) - 2) : j == 1 ? cur_stufe(2) - 2 : 97;
+    static const wchar_t *key[4] = { L"Ziel", L"Achtung", L"Alarm", L"TaktPlus" };
+    float lo = j == 3 ? -600 : j == 0 ? 60 : j == 1 ? fmaxf(70, cur_stufe(0) + 2) : fmaxf(80, cur_stufe(1) + 2);
+    float hi = j == 3 ? 600 : j == 0 ? fminf((float)sh->spitze - 3, cur_stufe(1) - 2) : j == 1 ? cur_stufe(2) - 2 : 97;
     z = z < lo ? lo : z > hi ? hi : z;
     wchar_t v[8]; swprintf(v, 8, L"%.0f", z);
     if (WritePrivateProfileStringW(L"Regler", key[j], v, iniFile)) { stWant[j] = z; stUntil[j] = now + 8000; }
@@ -806,9 +816,10 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp)
             load_lang(); set_title(w); InvalidateRect(w, 0, FALSE);
         }
         for (int i = 0; i < EVO_NFUNK; i++) if (PtInRect(&sw[i], p)) toggle_funk(w, i);
-        for (int j = 0; j < 3; j++) {
-            if (PtInRect(&stMinus[j], p)) set_stufe(w, j, cur_stufe(j) - 1);
-            if (PtInRect(&stPlus[j], p)) set_stufe(w, j, cur_stufe(j) + 1);
+        for (int j = 0; j < 4; j++) {
+            int step = j == 3 ? 100 : 1;
+            if (PtInRect(&stMinus[j], p)) set_stufe(w, j, cur_stufe(j) - step);
+            if (PtInRect(&stPlus[j], p)) set_stufe(w, j, cur_stufe(j) + step);
         }
         return 0;
     }

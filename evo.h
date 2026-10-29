@@ -5,11 +5,11 @@
 #include <stdint.h>
 #include <wchar.h>
 
-#define EVO_VERSION   "0.6.0"   // also AppVer in installer\evo-x2-cool.iss and the git tag v0.6.0
-#define EVO_VERSION_W L"0.6.0"
+#define EVO_VERSION   "0.6.3"   // also AppVer in installer\evo-x2-cool.iss and the git tag v0.6.3
+#define EVO_VERSION_W L"0.6.3"
 #define EVO_SHM    L"Global\\evo-x2-cool"
 #define EVO_STOPP  L"Global\\evo-x2-cool-stopp"   // set it and the controller restores everything and ends (service too)
-#define EVO_MAGIC  0x45564F36u   // "EVO6", changes with the layout below so an old window does not misread a new controller
+#define EVO_MAGIC  0x45564F37u   // "EVO7", changes with the layout below so an old window does not misread a new controller
 #define EVO_N      7200          // samples kept: 2 hours at 1 s
 #define EVO_EV     256           // events kept
 
@@ -58,6 +58,7 @@ typedef struct {
     uint32_t funktionen;                // F_* bits currently active
     float ziel; int32_t minP, maxP, spitze;
     int32_t achtung, alarm;             // yellow: fan climbs steadily; red: fan 100 % at once (°C)
+    int32_t taktPlus;                   // MHz added to every clock cap (test switch TaktPlus)
     float versatz; int32_t felder;      // learned model: overall offset, number of learned cells
     int32_t deckel[EVO_NLAGE];          // learned clock cap per situation (MHz)
     volatile uint32_t nSample, nEvent;  // totals written; slot = n % EVO_N / EVO_EV
