@@ -37,7 +37,7 @@ EVO-X2-COOL watches the chip every second, predicts where the temperature is hea
 
 If the program crashes, the EC keeps regulating with the last (rising) curve. On a normal stop the BIOS fan curve is written back.
 
-It talks to the EC as little as possible (about 1,500 accesses per hour since 0.6.3, before ~8,000): EC temperature every 5 s, fan speeds every 30 s, the fan curve only when it changes by at least 5 % / 5 °C, a full check every 5 minutes. Every access waits until Windows' own ACPI driver is done with the EC, and values that change are read twice. Since 0.6.5 it leaves the EC alone for 6 s after every write (no reads, no further writes; the emergency writes anyway): Windows' "EC did not respond" (ACPI event 13) came exactly 5 s after an EC power mode switch in 11 of 14 cases.
+It talks to the EC as little as possible (about 1,500 accesses per hour since 0.6.3, before ~8,000): EC temperature every 5 s, fan speeds every 30 s, the fan curve only when it changes by at least 5 % / 5 °C, a full check every 5 minutes. Every access waits until Windows' own ACPI driver is done with the EC, and values that change are read twice. Since 0.6.5 it leaves the EC alone for 6 s after every write (no reads, no further writes; the emergency writes anyway): Windows' "EC did not respond" (ACPI event 13) came exactly 5 s after an EC power mode switch in 11 of 14 cases. Since 0.6.6 it never sends a burst: the fan curve goes out 2 registers a second, the fan speeds and the full check 1 register a second (after 0.6.5 the remaining events came 5 s after such bursts), and it goes back from the quiet power mode only after 2 minutes of calm (before 30 s).
 
 **Measured on the 64 GB machine**, one core at 100 % for 3 minutes:
 
@@ -116,7 +116,7 @@ Data in the same folder: `modell.txt` (learned model), `regler-<date>.csv` (one 
 
 ## Known issues
 
-- **ACPI event 13 ("EC did not respond within the timeout")** in the Windows system log. On our machines it started on the day the EC firmware 1.10 / BIOS 1.12 was installed. Since 0.6.3 it shows up about once per hour; we have not seen any effect beyond the log entry.
+- **ACPI event 13 ("EC did not respond within the timeout")** in the Windows system log. On our machines it started on the day the EC firmware 1.10 / BIOS 1.12 was installed. Since 0.6.3 it showed up about once per hour, with 0.6.5 about every two hours; we have not seen any effect beyond the log entry.
 - **Samsung 990 PRO without heatsink:** under heavy data load its controller reached 96 °C even with the system fan at full speed, and one drive dropped out under such load. A thin heatsink or a thermal pad to the case helps more than any fan curve. Check the space above the M.2 slot first, and do not remove the label.
 
 ## Update check
