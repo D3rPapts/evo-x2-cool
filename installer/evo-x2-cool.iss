@@ -2,7 +2,7 @@
 ; Installs both programs to Program Files, the PawnIO driver if it is missing, the controller as a service and
 ; optionally the window in the tray at logon. Uninstall puts the BIOS fan curve back and may keep the learned data.
 
-#define AppVer "0.6.4"
+#define AppVer "0.6.6"
 
 [Setup]
 AppId={{7464B3D3-23BC-4840-B095-EC3434E506D4}
@@ -93,9 +93,13 @@ function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   rc: Integer;
   exe: String;
+  wnd: HWND;
 begin
   ExtractTemporaryFile('evo-x2-cool.exe');
   exe := ExpandConstant('{tmp}\evo-x2-cool.exe');
+  // ask the window to end itself first (WM_APP + 4): a killed one leaves a dead icon next to the clock
+  wnd := FindWindowByClassName('evo-x2-cool-front');
+  if wnd <> 0 then begin PostMessage(wnd, $8004, 0, 0); Sleep(1500); end;
   Exec(ExpandConstant('{sys}\taskkill.exe'), '/im evo-x2-cool-front.exe /f', '', SW_HIDE, ewWaitUntilTerminated, rc);
   Exec(exe, '--entfernen', '', SW_HIDE, ewWaitUntilTerminated, rc);
   Exec(exe, '--stopp', '', SW_HIDE, ewWaitUntilTerminated, rc);

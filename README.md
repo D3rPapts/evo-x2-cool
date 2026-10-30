@@ -28,13 +28,16 @@ There was no way to control the fans of this machine under Windows, so we built 
 
 EVO-X2-COOL watches the chip every second, predicts where the temperature is heading, and:
 
-- **controls the fans** through the fan curve inside the EC: as quiet as possible while the predicted end temperature stays below the target (default 80 °C). Rising power is counted ahead, but only while it still rises and never beyond the measured power; far below the target the fan ramps up slowly, so a short burst stays quiet. The 120 mm system fan on the back (SSDs, WLAN) is off while idle and the SSDs are cool, and runs at least 30 % from 55 °C SSD temperature;
+- **controls the fans** through the fan curve inside the EC: as quiet as possible while the predicted end temperature stays below the target (default 80 °C). Rising power is counted ahead, but only while it still rises and never beyond the measured power; far below the target the fan ramps up slowly, so a short burst stays quiet. Under **lasting high load** (default: 2 minutes above 70 W) the fan keeps at least 45 %, so a burst on the cores on top of a heat-soaked cooler does not reach the emergency;
+- **cools the SSDs** with the 120 mm system fan on the back (SSDs, WLAN): it watches the SSD temperature including the hotter controller sensor (a Samsung 990 PRO reported 96 °C on the controller while its main value said 70 °C) and the amount of data moved. It switches on ahead of the heat after 5 s of more than 100 MB/s, runs at least 30 % and 10 % above the CPU fans, and is off while idle with cool SSDs (on at 68 °C controller / 55 °C main value; at least 5 min on, 2 min off, so it does not flap);
 - **brakes the clock** depending on the load type (few cores / many cores / GPU busy). After a hot spot it drops to a safe clock for 30 s and remembers a lower limit for that load type. It tries the next higher step again only after a calm run with a core really at the limit: 10 minutes, then 1 hour, then 1 day after every further hot spot on that step;
 - **learns** how warm the machine really gets at a given chip power and fan duty, and corrects its own model. The starting model (end temperature = 34 + P × (0.58 − 0.30 × fan) + 6 × hottest core W, P = whole chip power) was fitted on the logs of two EVO-X2;
 - **switches the EC to the quiet power mode** (54 W) while many cores are busy and the GPU is idle;
 - has two warning stages: **yellow** (default 90 °C: the fan climbs steadily, also beyond MaxProzent) and **red** (default 95 °C: fan to full at once). Red cannot be switched off.
 
 If the program crashes, the EC keeps regulating with the last (rising) curve. On a normal stop the BIOS fan curve is written back.
+
+It talks to the EC as little as possible (about 1,500 accesses per hour since 0.6.3, before ~8,000): EC temperature every 5 s, fan speeds every 30 s, the fan curve only when it changes by at least 5 % / 5 °C, a full check every 5 minutes. Every access waits until Windows' own ACPI driver is done with the EC, and values that change are read twice. Since 0.6.5 it leaves the EC alone for 6 s after every write (no reads, no further writes; the emergency writes anyway): Windows' "EC did not respond" (ACPI event 13) came exactly 5 s after an EC power mode switch in 11 of 14 cases. Since 0.6.6 it never sends a burst: the fan curve goes out 2 registers a second, the fan speeds and the full check 1 register a second (after 0.6.5 the remaining events came 5 s after such bursts), and it goes back from the quiet power mode only after 2 minutes of calm (before 30 s).
 
 **Measured on the 64 GB machine**, one core at 100 % for 3 minutes:
 
@@ -50,8 +53,8 @@ So the single-core performance drops by about 7 %, the fans stay quiet, and the 
 
 | File | What it does | Size |
 |---|---|---|
-| `evo-x2-cool.exe` | Controller. Runs in a console or as the Windows service `evo-x2-cool`. | ~58 KB, ~2 MB RAM, < 1 % of one core, never goes online |
-| `evo-x2-cool-front.exe` | Window with tiles, curves, events and on/off switches, plus a tray icon (tooltip with current values, red when hot). Reads the controller's shared memory. Once a day it asks GitHub whether a newer version exists (see below). | ~70 KB, ~2 MB RAM |
+| `evo-x2-cool.exe` | Controller. Runs in a console or as the Windows service `evo-x2-cool`. | ~62 KB, ~2 MB RAM, < 1 % of one core, never goes online |
+| `evo-x2-cool-front.exe` | Window with tiles (CPU, GPU, fans, clock brake, chip power, SSD with controller temperature and system fan), curves, events and on/off switches, plus a tray icon (tooltip with current values, red when hot). Reads the controller's shared memory. Once a day it asks GitHub whether a newer version exists (see below). | ~78 KB, ~2 MB RAM |
 
 ## Requirements
 
@@ -94,6 +97,7 @@ Alarm=95         ; red: fan 100 % at once (at most 97)
 SicherMHz=3600   ; clock cap left behind on stop
 MinDauerlast=45  ; fan at least this % after 2 min above DauerlastW (0 = off)
 DauerlastW=70    ; lasting load from this many watts (smoothed); off again 10 W below
+TaktPlus=0       ; test switch: MHz added to every clock cap (-600..+600), also +/- in the window
 Sprache=de       ; de / en, any sprache-<code>.ini next to the exe works
 
 [Funktionen]     ; 1 = on, also switchable in the window
@@ -108,7 +112,12 @@ Thema=system     ; system / hell / dunkel
 UpdatePruefen=1  ; 0 = never ask GitHub for a newer version
 ```
 
-Data in the same folder: `modell.txt` (learned model), `regler-<date>.csv` (one line per second), `ereignisse.txt` (decisions).
+Data in the same folder: `modell.txt` (learned model), `regler-<date>.csv` (one line per second, including SSD temperatures and data rate), `ereignisse.txt` (decisions).
+
+## Known issues
+
+- **ACPI event 13 ("EC did not respond within the timeout")** in the Windows system log. On our machines it started on the day the EC firmware 1.10 / BIOS 1.12 was installed. Since 0.6.3 it showed up about once per hour, with 0.6.5 about every two hours; we have not seen any effect beyond the log entry.
+- **Samsung 990 PRO without heatsink:** under heavy data load its controller reached 96 °C even with the system fan at full speed, and one drive dropped out under such load. A thin heatsink or a thermal pad to the case helps more than any fan curve. Check the space above the M.2 slot first, and do not remove the label.
 
 ## Update check
 
@@ -141,8 +150,11 @@ Lernende Lüfter- und Taktsteuerung für die GMKtec EVO-X2 unter Windows. Inoffi
 
 **Ergebnis** bei einem Kern auf 100 %: Vorher 88 °C nach 4 Sekunden. Mit der gelernten Taktgrenze (etwa 7 % weniger Ein-Kern-Takt) bleibt die CPU stabil bei 78–80 °C, und die Lüfter laufen leise mit 30 %.
 
-- Regelt die Lüfter so leise wie möglich unter einer Zieltemperatur (Standard 80 °C) und sagt den Temperaturverlauf voraus.
+- Regelt die Lüfter so leise wie möglich unter einer Zieltemperatur (Standard 80 °C) und sagt den Temperaturverlauf voraus. Unter Dauerlast (2 Minuten über 70 W) läuft der Lüfter mit mindestens 45 %.
+- Kühlt die SSDs mit dem Systemlüfter: achtet auch auf den heißeren Controller-Sensor und schaltet bei viel Datenverkehr schon vorher ein.
+- Greift nur selten auf den EC zu (etwa 1.500 Mal pro Stunde) und stört den Windows-Treiber dabei nicht.
 - Bremst den Takt je nach Lastart, nach einer Hitzespitze 30 s stark, und merkt sich eine sichere Grenze.
 - Lernt aus Erfahrung. Den Notfall (Lüfter auf voll) kann man nicht abschalten.
 - Fenster und Meldungen auf Deutsch oder Englisch, hell oder dunkel, Funktionen einzeln schaltbar.
 - Braucht EC-Firmware 1.10 und den Treiber PawnIO. Bedienung und Einstellungen wie oben.
+- Bekannt: ACPI-Ereignis 13 im Windows-Protokoll (seit EC 1.10, etwa einmal pro Stunde, bisher ohne Folgen). Eine Samsung 990 PRO ohne Kühlkörper wird unter Datenlast trotz vollem Systemlüfter sehr heiß – Kühlkörper oder Wärmeleitpad zum Gehäuse helfen.

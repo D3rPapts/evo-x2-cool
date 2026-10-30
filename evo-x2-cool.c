@@ -521,25 +521,54 @@ static double ssd_io(void)
 // Each EC write costs a write plus a read-back (~2 ms of spinning), so only registers that change are written (usually
 // start/full/pwm). check = 1 reads every register first instead of trusting the cache (done once a minute, in case the
 // EC was reset, e.g. after sleep).
+// quiet time after writing to the EC: ACPI event 13 (Windows: "EC did not respond within the timeout") came exactly 5 s
+// after an EC power mode switch in 11 of 14 cases (27.-29.10.), and piled up 5 s after fan curve writes too. So after a
+// write the controller leaves the EC alone for 6 s (no reads, no further writes) and Windows' own requests get through.
+// The emergency and the yellow stage write anyway; the stop writes back anyway
+#define EC_RUHE_MS 6000
+static ULONGLONG ecRuheBis;
+static int ec_ruhig(void) { return GetTickCount64() < ecRuheBis; }
+static void ec_ruhe(void) { ecRuheBis = GetTickCount64() + EC_RUHE_MS; }
+
 static int curveD = -1, sysWant = -1, curveSys = -1; static float curveAnchor = -1;
 static int curveReg[12] = { -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 };
-static void write_curve(int d, float teSmooth, int check)
+// the curve is written in steps of at most 2 registers a second (an emergency writes all at once): after the quiet
+// time (0.6.5) the ACPI 13 events still came 5 s after a curve write of up to 12 registers or the speed read of 6
+// registers in a row (5 of 6 events, 29./30.10.), single reads (EC temperature every 5 s) hardly ever. The quiet time
+// starts when the curve is complete
+static int curveZiel[12], curveOffen, pruefNr = -1;
+static void curve_schritt(int max)
+{
+    static const int order[6] = { 1, 2, 3, 4, 5, 0 };   // the mode byte (curve on) last
+    int geschrieben = 0;
+    curveOffen = 0;
+    for (int b = 0; b <= 6; b += 6)
+        for (int j = 0; j < 6; j++) {
+            int i = b + order[j];
+            if (curveReg[i] == curveZiel[i]) continue;
+            if (geschrieben < max) { curveReg[i] = ec_write((uint8_t)(0x60 + i), (uint8_t)curveZiel[i]) ? curveZiel[i] : -1; geschrieben++; }
+            if (curveReg[i] != curveZiel[i]) curveOffen++;
+        }
+    if (geschrieben && !curveOffen) ec_ruhe();
+}
+// check against an EC reset (after sleep): one register a second instead of all 12 at once
+static void curve_pruefen(void)
+{
+    int v = ec_read((uint8_t)(0x60 + pruefNr));
+    if (v >= 0 && v != curveReg[pruefNr]) { curveReg[pruefNr] = v; curveOffen++; }
+    if (++pruefNr >= 12) pruefNr = -1;
+}
+static void write_curve(int d, float teSmooth, int max)
 {
     int start = (int)floorf(teSmooth) - 3; start = start < 25 ? 25 : start > 92 ? 92 : start;
     int pwm = d - 6 < 0 ? 0 : d - 6;
     int full = start + (100 - pwm + 1) / 2 + 1; if (full > 105) full = 105;
-    static const int order[6] = { 1, 2, 3, 4, 5, 0 };   // the mode byte (curve on) last
     int s = sysWant < 0 ? d : sysWant, spwm = s - 6 < 0 ? 0 : s - 6;
     int sfull = start + (100 - spwm + 1) / 2 + 1; if (sfull > 105) sfull = 105;
     int val[12] = { 1, 20, start, full, pwm, 2, 1, 20, s ? start : 85, s ? sfull : 105, s ? spwm : 0, 2 };
-    for (int b = 0; b <= 6; b += 6)
-        for (int j = 0; j < 6; j++) {
-            int i = b + order[j];
-            if ((check ? ec_read((uint8_t)(0x60 + i)) : curveReg[i]) != val[i])
-                curveReg[i] = ec_write((uint8_t)(0x60 + i), (uint8_t)val[i]) ? val[i] : -1;
-            else curveReg[i] = val[i];
-        }
+    memcpy(curveZiel, val, sizeof val);
     curveD = d; curveSys = s; curveAnchor = teSmooth;
+    curve_schritt(max);
 }
 
 // duty % the written curve gives at EC temperature t: pwm up to start, then linear to 100 % at full; -1 = BIOS curve.
@@ -555,7 +584,7 @@ static int restore_bios(const uint8_t orig[12])
 {
     int ok = 1;
     for (int i = 11; i >= 0; i--) { ok &= ec_write((uint8_t)(0x60 + i), orig[i]); curveReg[i] = -1; }
-    curveD = curveSys = -1; curveAnchor = -1;
+    curveD = curveSys = -1; curveAnchor = -1; curveOffen = 0; pruefNr = -1;
     return ok;
 }
 
@@ -693,10 +722,12 @@ static int run(void)
         // as few EC reads as possible: Windows' ACPI driver talks to the EC as well, and every access of ours can
         // collide with it. EC temperature every 5 s (only the second emergency path and the slow curve anchor; Tctl
         // comes every second), fan speeds every 30 s (shown only), the power mode never (we know what we wrote).
-        // Before: ~7000 reads an hour, now ~1000.
+        // Before: ~7000 reads an hour, now ~1000. The speed registers one a second (seconds 11-17 of each 30), not 6 in a
+        // row: such a burst came 5 s before ACPI 13 events (0.6.6)
         // a value that is not confirmed or impossible (case above 110 °C) keeps the last reading
         for (int i = 0; i < 8; i++) {
-            if (i == 3 || (i == 0 ? k % 5 : k % 30)) continue;
+            if (i == 3 || (i == 0 ? k % 5 : k % 30 != 10 + i)) continue;
+            if (ec_ruhig()) break;   // quiet time after a write: keep the last values
             int v = ec_read_sicher(regs[i], ec[i]); if (v >= 0 && !(i == 0 && v > 110)) ec[i] = v;
         }
         int Te = ec[0];
@@ -748,7 +779,9 @@ static int run(void)
         if (nachlauf && emaT < 65) nachlauf = 0;   // the heat of the GPU phase is gone
         // a GPU pause under a minute stays "GPU": an image job on machine 2 switched GPU <-> few cores every ~10 s for
         // minutes, and each switch moved the clock cap 3300 <-> 3600 MHz
-        int lg = G > 20 || nachlauf || k < grafikBis ? (G > 20 && busy > 4 ? LAGE_BEIDE : LAGE_GRAFIK) : busy > 4 ? LAGE_VIELE : LAGE_WENIGE;
+        // in a GPU pause many busy cores with real power count as "GPU + many cores" too: on 30.10. 11:46 the GPU rested
+        // while the cores drew 57 W, the situation stayed "GPU" (cap 3300 MHz) and Tctl reached 97.8 °C (0.6.6)
+        int lg = G > 20 || nachlauf || k < grafikBis ? (busy > 4 && (G > 20 || sumW > 15) ? LAGE_BEIDE : LAGE_GRAFIK) : busy > 4 ? LAGE_VIELE : LAGE_WENIGE;
         // a situation with a lower cap counts at once, one with a higher or the same cap only after 10 s: a few busy
         // threads that come and go must not flip the cap (and the EC mode) every second; with the same cap machine 2
         // switched "GPU + many cores" <-> "GPU" every second and filled the log
@@ -788,13 +821,13 @@ static int run(void)
             if (want != capNow && write_cap(want)) { event(L_("takt", "Taktbremse %d → %d MHz%s"), capNow, want, k <= sicherBis ? L_("takt_spitze", " (nach Hitzespitze)") : ""); capNow = want; }
         }
         if (!nurLesen) {
-            // quiet applies at once (it limits the heat), going back waits 30 s, so a short GPU blip does not flip the
+            // quiet applies at once (it limits the heat), going back waits 2 min (0.6.6, before 30 s: machine 2 switched 126 times in 35 h), so a short GPU blip does not flip the
             // power limit; with 10 s machine 2 switched quiet <-> balanced every ~20 s under on-and-off core load
             static int modusLocker;
             int modus = (fn & F_LEISE) && lg == LAGE_VIELE && G < 5 ? 2 : modusOrig;
             if (modus == modusJetzt || modus == 2) modusLocker = 0;
-            else if (modusJetzt == 2 && ++modusLocker < 30) modus = 2;
-            if (modus != modusJetzt && ec_write(0x31, (uint8_t)modus)) { event(L_("modus", "EC-Leistungsmodus → %s"), modus == 2 ? L_("modus2", "leise (54 W)") : modus == 1 ? L_("modus1", "Leistung") : L_("modus0", "ausgewogen")); modusJetzt = modus; }
+            else if (modusJetzt == 2 && ++modusLocker < 120) modus = 2;
+            if (modus != modusJetzt && !ec_ruhig() && ec_write(0x31, (uint8_t)modus)) { ec_ruhe(); event(L_("modus", "EC-Leistungsmodus → %s"), modus == 2 ? L_("modus2", "leise (54 W)") : modus == 1 ? L_("modus1", "Leistung") : L_("modus0", "ausgewogen")); modusJetzt = modus; }
         }
 
         // --- learn: only when calm (power steady, temperature hardly moving) and not during boost hot spots (>= 90 °C:
@@ -894,11 +927,14 @@ static int run(void)
         // (yellow does not: switched off, the BIOS curve is already at full from 85 °C)
         // written only on a change of 5 % or an anchor 5 °C away (an emergency at once): the fans need ~10 s per step
         // anyway, and every write is EC traffic (2 % / 3 °C wrote the curve ~100 times an hour, now ~40). The check
-        // against an EC reset (after sleep) reads all 12 registers, every 5 min instead of every minute
+        // against an EC reset (after sleep) reads the 12 registers every 5 min, one a second
         int kurveNeu = curveD < 0 || abs(di - curveD) >= 5 || abs(sysWant - curveSys) >= 5 || fabsf(emaTe - curveAnchor) > 5
                        || (grund == GRUND_NOTFALL && di != curveD);
-        if (fanOn && kurveNeu) write_curve(di, emaTe, 0);
-        else if (fanOn && k % 300 == 30 && curveD >= 0) write_curve(curveD, curveAnchor, 1);
+        int dringend = grund == GRUND_NOTFALL || grund == GRUND_ACHTUNG;
+        if (fanOn && kurveNeu) { if (!ec_ruhig() || dringend) write_curve(di, emaTe, dringend ? 12 : 2); }
+        else if (fanOn && curveOffen) { if (!ec_ruhig()) curve_schritt(2); }
+        else if (fanOn && pruefNr >= 0) { if (!ec_ruhig()) curve_pruefen(); }
+        else if (fanOn && k % 300 == 30 && curveD >= 0) pruefNr = 0;
         else if (!fanOn && curveD >= 0) restore_bios(orig);
         if (nurLesen) grund = GRUND_NUR_LESEN;
 

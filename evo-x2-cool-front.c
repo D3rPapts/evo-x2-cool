@@ -6,8 +6,9 @@
 // situation (GPU / many cores / emergency), the event list, and a tooltip with the values under the mouse.
 // Keys 1-4 or the buttons change the time span. The switches on the right turn single functions of the controller on and off
 // (written to einstellungen.ini, which the controller re-reads within 5 s). Texts come from sprache-<code>.ini next to the exe.
-// An icon next to the clock shows the current values as tooltip and turns red while it is too hot; closing the window only
-// hides it there (then nothing is drawn). --leiste starts hidden. A second start brings the running window to the front.
+// An icon next to the clock shows the current values as tooltip and turns red while it is too hot. Closing the window ends
+// the viewer (the controller keeps running); --leiste starts with the icon only. A second start brings the running window
+// to the front.
 #define WIN32_LEAN_AND_MEAN
 #define UNICODE
 #define _CRT_SECURE_NO_WARNINGS
@@ -45,6 +46,7 @@ int WINAPI GdipDeletePath(void *path);
 #define WM_TRAY   (WM_APP + 1)   // mouse on the tray icon
 #define WM_ZEIGEN (WM_APP + 2)   // sent by a second start: show the window
 #define WM_UPDATE (WM_APP + 3)   // the update check found a newer version
+#define WM_ENDE   (WM_APP + 4)   // sent by the installer before an update: end cleanly, so no dead icon stays next to the clock
 #define RELEASES L"https://github.com/D3rPapts/evo-x2-cool/releases"
 
 static const EvoShared *sh;
@@ -675,7 +677,7 @@ static void tray_update(void)   // once per second; talks to explorer only when 
 static void show_window(HWND w, int show)
 {
     if (show) { ShowWindow(w, IsIconic(w) ? SW_RESTORE : SW_SHOW); SetForegroundWindow(w); InvalidateRect(w, 0, FALSE); }
-    else { ShowWindow(w, SW_HIDE); SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1); }   // give the drawing memory back
+    else { ShowWindow(w, SW_MINIMIZE); SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1); }   // give the drawing memory back
 }
 
 // ends the controller as well (service or not): it puts the BIOS fan curve back, keeps the safe clock cap, then exits
@@ -699,7 +701,7 @@ static void tray_menu(HWND w)
     AppendMenuW(m, MF_STRING | MF_GRAYED, 0, L"EVO-X2-COOL " EVO_VERSION_W);
     if (updVer[0]) { wchar_t ul[64]; swprintf(ul, 64, T(L"upd_menu", L"⬆ Version %s herunterladen …"), updVer); AppendMenuW(m, MF_STRING, 103, ul); }
     AppendMenuW(m, MF_SEPARATOR, 0, 0);
-    AppendMenuW(m, MF_STRING, 100, visible ? T(L"m_verstecken", L"Fenster verstecken") : T(L"m_oeffnen", L"Fenster öffnen"));
+    AppendMenuW(m, MF_STRING, 100, visible ? T(L"m_verstecken", L"Fenster minimieren") : T(L"m_oeffnen", L"Fenster öffnen"));
     AppendMenuW(m, MF_SEPARATOR, 0, 0);
     unsigned on = cur_funk(), off = !sh || sh->nurLesen ? MF_GRAYED : 0;
     for (int i = 0; i < EVO_NFUNK; i++) AppendMenuW(m, MF_STRING | off | (on >> i & 1 ? MF_CHECKED : 0), 200 + i, funkText(i));
@@ -857,7 +859,8 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         }
         InvalidateRect(w, 0, FALSE); return 0;
     }
-    case WM_CLOSE: show_window(w, 0); return 0;   // only hide; "Beenden" in the tray menu really ends
+    // closing ends the viewer: a hidden window could not be brought back from a taskbar pin (30.10., clicks did nothing)
+    case WM_CLOSE: case WM_ENDE: DestroyWindow(w); return 0;
     case WM_DESTROY: Shell_NotifyIconW(NIM_DELETE, &tray); PostQuitMessage(0); return 0;
     }
     if (m == msgTaskbar && m) { tray_add(w); return 0; }
@@ -886,8 +889,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     icoNormal = LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, cx, cy, 0);
     icoHeiss = LoadImageW(inst, MAKEINTRESOURCEW(2), IMAGE_ICON, cx, cy, 0);
     msgTaskbar = RegisterWindowMessageW(L"TaskbarCreated");
-    UINT allow[3] = { msgTaskbar, WM_TRAY, WM_ZEIGEN };   // also when started as admin, explorer and a second start may talk to us
-    for (int i = 0; i < 3; i++) ChangeWindowMessageFilterEx(w, allow[i], MSGFLT_ALLOW, 0);
+    UINT allow[4] = { msgTaskbar, WM_TRAY, WM_ZEIGEN, WM_ENDE };   // also when started as admin, explorer and a second start may talk to us
+    for (int i = 0; i < 4; i++) ChangeWindowMessageFilterEx(w, allow[i], MSGFLT_ALLOW, 0);
     tray_add(w);
     if (!(cmd && wcsstr(cmd, L"--leiste"))) ShowWindow(w, show);
     tray_update();
