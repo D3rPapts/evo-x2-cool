@@ -321,6 +321,16 @@ static void zoom_setup(Chart *c)
     c->z = c->zb - c->za < (c->hi - c->lo) * 0.9f;   // nearly the whole range anyway: stay linear
 }
 
+// value at height f (0..1) of a chart: yfrac backwards (it only grows, so halving the interval finds it)
+static float vOf(const Chart *c, float f)
+{
+    float a = c->lo, b = c->hi;
+    for (int i = 0; i < 30; i++) { float m = (a + b) / 2; if (yfrac(c, m) < f) a = m; else b = m; }
+    return (a + b) / 2;
+}
+static wchar_t stripTip[3][96];
+static int stripTipOn;
+
 static void chart(HDC dc, RECT r, const Chart *c)
 {
     // title row with legend on the right
@@ -362,6 +372,18 @@ static void chart(HDC dc, RECT r, const Chart *c)
             int b = (int)(yfrac(c, v) * (hgt - 1)) / band;
             if (b >= bands) b = bands - 1;
             if (++nb[b] > most) most = nb[b];
+        }
+        // mouse over this strip (or the gap left of it, the strips are narrow): remember a tooltip (drawn after all charts): the band under the mouse and the most frequent one
+        if (mouseX >= sr.left - sg && mouseX < sr.right && mouseY >= sr.top && mouseY < sr.bottom && most) {
+            uint32_t total = 0; int bm = 0;
+            for (int b = 0; b < bands; b++) { total += nb[b]; if (nb[b] > nb[bm]) bm = b; }
+            int bh = (sr.bottom - 1 - mouseY) / band; if (bh >= bands) bh = bands - 1;
+            float h0 = vOf(c, (float)(bh * band) / (hgt - 1)), h1 = vOf(c, (float)((bh + 1) * band) / (hgt - 1));
+            float m0 = vOf(c, (float)(bm * band) / (hgt - 1)), m1 = vOf(c, (float)((bm + 1) * band) / (hgt - 1));
+            swprintf(stripTip[0], 96, T(L"st_titel", L"%s: wo die Werte lagen"), c->s[k].name);
+            swprintf(stripTip[1], 96, T(L"st_hier", L"hier %.0f–%.0f: %.0f %% der Zeit"), h0, h1, 100.0f * nb[bh] / total);
+            swprintf(stripTip[2], 96, T(L"st_meist", L"am häufigsten %.0f–%.0f: %.0f %% der Zeit"), m0, m1, 100.0f * nb[bm] / total);
+            stripTipOn = 1;
         }
         COLORREF sc = c->s[k].c;
         for (int b = 0; b < bands && most; b++) {
@@ -520,6 +542,7 @@ static void paint(HWND w, HDC dc)
         { T(L"c_fan2", L"CPU-Lüfter 2 %"), 0, 100, 50, { { gRpm2, C_RPM, 1, lIst }, { gEcFan, C_WARM, 1, lEc }, { gFan, C_FAN, S(2), lSoll } } },
         { T(L"c_fan3", L"Systemlüfter (SSD, WLAN) %"), 0, 100, 50, { { gRpm3, C_RPM, 1, lIst }, { gSysEc, C_WARM, 1, lEc }, { gSysFan, C_FAN, S(2), lSoll } } },
     };
+    stripTipOn = 0;
     const float minW[6] = { 8, pmax / 6, 800, 15, 15, 15 };   // narrowest zoomed band: °C, W, MHz, %
     for (int i = 0; i < 6; i++) { cs[i].minW = minW[i]; zoom_setup(&cs[i]); }
     static const int weight[6] = { 3, 3, 3, 2, 2, 2 };   // the three fan charts get 2/3 of the height of the others
@@ -561,6 +584,16 @@ static void paint(HWND w, HDC dc)
     }
     int lx = charts.left;
     text(dc, fSmall, lx, strip.top - S(5), C_DIM, 0, L"%s", T(L"lastart", L"Lastart"));
+
+    // ---- tooltip of a distribution strip (set by chart() when the mouse is over one) ----
+    if (stripTipOn) {
+        int tw3 = 0; SelectObject(dc, fSmall);
+        for (int i = 0; i < 3; i++) { SIZE sz; GetTextExtentPoint32W(dc, stripTip[i], (int)wcslen(stripTip[i]), &sz); if (sz.cx > tw3) tw3 = sz.cx; }
+        RECT box = { mouseX + S(14), mouseY + S(12), mouseX + S(14) + tw3 + S(20), mouseY + S(12) + 3 * S(16) + S(14) };
+        if (box.bottom > rc.bottom - pad) OffsetRect(&box, 0, -(box.bottom - box.top) - S(24));
+        fill(dc, box, C_TIP, S(8));
+        for (int i = 0; i < 3; i++) text(dc, fSmall, box.left + S(10), box.top + S(7) + i * S(16), i ? C_TEXT : C_DIM, 0, L"%s", stripTip[i]);
+    }
 
     // ---- hover line and tooltip ----
     if (hover >= 0) {
