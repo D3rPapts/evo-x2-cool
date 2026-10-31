@@ -402,11 +402,11 @@ static void chart(HDC dc, RECT r, const Chart *c)
         float raw = (c->zb - c->za) / 4, p10 = powf(10, floorf(log10f(raw))), q = raw / p10;
         st = (q > 5 ? 10 : q > 2 ? 5 : q > 1 ? 2 : 1) * p10; v0 = ceilf(c->za / st) * st; v1 = c->zb;
     }
-    int yLo = 99999, yHi = -99999;
+    int yLo = 99999, yHi = -99999, yText = 99999;
     for (float v = v0; v <= v1 + 0.01f; v += st) {
         int y = p.bottom - (int)(yfrac(c, v) * (p.bottom - p.top - 1)) - 1;
         line(dc, p.left, y, p.right, y, C_GRID, 1, PS_SOLID);
-        text(dc, fSmall, hs.left - S(4), y - S(7), C_DIM, 1, L"%g", v);
+        if (yText - y >= S(13)) { text(dc, fSmall, hs.left - S(4), y - S(7), C_DIM, 1, L"%g", v); yText = y; }   // low chart: skip labels that would overlap
         if (y < yLo) yLo = y; if (y > yHi) yHi = y;
     }
     if (c->z) {
@@ -438,9 +438,9 @@ static void tile(HDC dc, RECT r, const wchar_t *label, COLORREF vc, const wchar_
     fill(dc, r, C_CARD, S(10));
     text(dc, fSmall, r.left + S(12), r.top + S(8), C_DIM, 0, L"%s", label);
     text(dc, fValue, r.left + S(12), r.top + S(22), vc, 0, L"%s", value);
-    RECT s = { r.left + S(12), r.bottom - S(20), r.right - S(8), r.bottom };   // cut with … if the tile is narrow
+    RECT s = { r.left + S(12), r.top + S(56), r.right - S(8), r.bottom - S(4) };   // two lines, cut with … only if still too long
     SelectObject(dc, fSmall); SetTextColor(dc, C_DIM);
-    DrawTextW(dc, sub, -1, &s, DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+    DrawTextW(dc, sub, -1, &s, DT_WORDBREAK | DT_END_ELLIPSIS | DT_NOPREFIX | DT_EDITCONTROL);
 }
 
 static void paint(HWND w, HDC dc)
@@ -462,7 +462,10 @@ static void paint(HWND w, HDC dc)
     int stale = (int)(time(0) - cur->t) > 5;
 
     // ---- layout: tiles on top, charts left, events right ----
-    int evW = S(300), tileH = S(80), gap = S(12);
+    int gap = S(12), tileH = S(92);
+    // narrow window: the right column (switches and events) goes, the charts take the width; the switches are in the
+    // tray menu as well. Tiles drop out by importance when they would get narrower than 150 px (0.6.7)
+    int rechts = rc.right >= S(1000), evW = rechts ? S(300) : -gap;
     RECT charts = { pad, pad + tileH + gap + S(30), rc.right - pad - evW - gap, rc.bottom - pad - S(30) };
     RECT plot = { charts.left + S(72), 0, charts.right, 0 };   // x extent of all plots (axis labels and side strips on the left)
 
@@ -481,20 +484,28 @@ static void paint(HWND w, HDC dc)
     if (at->gpuT >= 0) swprintf(v[1], 32, L"%d °C", at->gpuT); else wcscpy(v[1], L"–");
     swprintf(sub[1], 80, T(L"sub_gpu", L"%.0f W · Last %d %%"), at->gpuW, at->gpuLoad);
     if (at->fan >= 0) swprintf(v[2], 32, L"%d %%", at->fan); else wcscpy(v[2], T(L"bios", L"BIOS"));
-    swprintf(sub[2], 80, T(L"sub_fan", L"%d U/min · %s"), at->rpm[0], grundText(at->grund));
+    if (at->rpm[0] >= 0) swprintf(sub[2], 80, T(L"sub_fan", L"%d U/min · %s"), at->rpm[0], grundText(at->grund));
+    else swprintf(sub[2], 80, T(L"sub_fan0", L"Drehzahl noch nicht gelesen · %s"), grundText(at->grund));
     if (at->cap > 0) swprintf(v[3], 32, L"%d MHz", at->cap); else wcscpy(v[3], T(L"cap_aus", L"aus"));
     swprintf(sub[3], 80, T(L"sub_cap", L"Lastart: %s%s"), lageText(at->lage), at->leise ? T(L"leise", L" + EC leise") : L"");
     swprintf(v[4], 32, L"%.0f W", at->pkgW);          swprintf(sub[4], 80, T(L"sub_chip", L"stärkster Kern %.1f W · %d Kerne voll"), at->maxCoreW, at->busy);
-    swprintf(v[5], 32, T(L"v_learn", L"%d Bereiche"), sh->felder); swprintf(sub[5], 80, T(L"sub_learn", L"real %+.1f °C wärmer als Formel"), sh->versatz);
+    swprintf(v[5], 32, T(L"v_learn", L"%d Bereiche"), sh->felder);
+    if (sh->versatz >= 0) swprintf(sub[5], 80, T(L"sub_learn_w", L"Chip läuft %.1f °C wärmer als berechnet"), sh->versatz);
+    else swprintf(sub[5], 80, T(L"sub_learn_k", L"Chip läuft %.1f °C kühler als berechnet"), -sh->versatz);
     // SSD: the composite large (the drive's own limits refer to it), the hottest sensor (controller) below; warm from
     // 70 / 90 °C, hot from the 990 PRO's own warning level 82 °C or a controller at 100 °C
     if (at->ssdT >= 0) swprintf(v[6], 32, L"%d °C", at->ssdT); else wcscpy(v[6], L"–");
-    swprintf(sub[6], 80, T(L"sub_ssd", L"Controller %d °C · System %d U/min"), at->ssdS, at->rpm[2]);
+    if (at->rpm[2] >= 0) swprintf(sub[6], 80, T(L"sub_ssd", L"Controller %d °C · System %d U/min"), at->ssdS, at->rpm[2]);
+    else swprintf(sub[6], 80, T(L"sub_ssd0", L"Controller %d °C · Systemlüfter noch nicht gelesen"), at->ssdS);
     COLORREF ssdC = at->ssdT >= 82 || at->ssdS >= 100 ? C_HOT : at->ssdT >= 70 || at->ssdS >= 90 ? C_WARM : C_TEXT;
-    const wchar_t *labels[7] = { T(L"t_cpu", L"CPU"), T(L"t_gpu", L"Grafik"), T(L"t_fan", L"Lüfter"), T(L"t_cap", L"Taktbremse"), T(L"t_chip", L"Chip gesamt"), T(L"t_learn", L"Gelernte Last-Bereiche"), T(L"t_ssd", L"SSD") };
-    int tw = (rc.right - 2 * pad - 6 * gap) / 7;
-    for (int i = 0; i < 7; i++) {
-        RECT t = { pad + i * (tw + gap), pad, pad + i * (tw + gap) + tw, pad + tileH };
+    const wchar_t *labels[7] = { T(L"t_cpu", L"CPU"), T(L"t_gpu", L"Grafik"), T(L"t_fan", L"Lüfter"), T(L"t_cap", L"Taktbremse"), T(L"t_chip", L"Chip gesamt"), T(L"t_learn2", L"Lernmodell"), T(L"t_ssd", L"SSD") };
+    static const int tPrio[7] = { 0, 2, 1, 3, 6, 4, 5 };   // CPU, fan, GPU, clock brake, SSD, whole chip, learned model
+    int nt = (rc.right - 2 * pad + gap) / (S(150) + gap); nt = nt < 3 ? 3 : nt > 7 ? 7 : nt;
+    int tShow[7] = { 0 }; for (int j = 0; j < nt; j++) tShow[tPrio[j]] = 1;
+    int tw = (rc.right - 2 * pad - (nt - 1) * gap) / nt;
+    for (int i = 0, slot = 0; i < 7; i++) {
+        if (!tShow[i]) continue;
+        RECT t = { pad + slot * (tw + gap), pad, pad + slot * (tw + gap) + tw, pad + tileH }; slot++;
         tile(dc, t, labels[i], i == 0 ? tc : i == 6 ? ssdC : at->grund == GRUND_NOTFALL && i == 2 ? C_HOT : at->grund == GRUND_ACHTUNG && i == 2 ? C_WARM : C_TEXT, v[i], sub[i]);
     }
 
@@ -514,7 +525,7 @@ static void paint(HWND w, HDC dc)
         if (status) wcsncpy(st, status, 199), st[199] = 0;
         else {
             struct tm lt; time_t tt = (time_t)at->t; localtime_s(&lt, &tt);
-            swprintf(st, 200, T(L"status", L"%s%02d:%02d:%02d · Taktbremse gelernt – wenige %d · viele %d · Grafik %d · Grafik + viele %d MHz"),
+            swprintf(st, 200, T(L"status2", L"%s%02d:%02d:%02d · gelernte Taktgrenzen: wenige Kerne %d · viele %d · Grafik %d · Grafik + viele %d MHz"),
                      hover >= 0 ? T(L"maus", L"Mauszeiger ") : L"", lt.tm_hour, lt.tm_min, lt.tm_sec, sh->deckel[0], sh->deckel[1], sh->deckel[2], sh->deckel[3]);
         }
         RECT sr = { bx + S(6), by + S(4), sx, by + S(22) };
@@ -532,23 +543,34 @@ static void paint(HWND w, HDC dc)
     tmax = (float)((int)((tmax + 9.99f) / 10) * 10); tmin = (float)((int)(tmin / 10) * 10);
     const wchar_t *lIst = T(L"l_ist", L"Ist (aus Drehzahl)"), *lEc = T(L"l_ecfan", L"EC-Kurve (mit Aufschlag)"), *lSoll = T(L"l_soll", L"Soll");
     Chart cs[6] = {
-        { T(L"c_temp", L"Temperatur °C"), tmin, tmax, 10, { { gVorh, C_DIM, 1, T(L"l_erwartet", L"erwartet") }, { gEc, C_WARM, 1, T(L"l_ec", L"Gehäuse-Fühler (EC)") },
+        { T(L"c_temp2", L"Temperatur (°C)"), tmin, tmax, 10, { { gVorh, C_DIM, 1, T(L"l_erwartet", L"erwartet") }, { gEc, C_WARM, 1, T(L"l_ec", L"Gehäuse-Fühler (EC)") },
                                            { gTctl, C_RAW, 1, T(L"l_roh", L"CPU roh") }, { gGlatt, C_HOT, S(2), T(L"l_glatt", L"CPU geglättet (Regelgröße)") } } },
-        { T(L"c_power", L"Leistung W"), 0, pmax, pmax / 4, { { gPkg, C_PKG, 1, T(L"l_chip", L"ganzer Chip") }, { gGpu, RGB(165, 124, 255), S(2), T(L"l_gpu", L"Grafik") },
+        { T(L"c_power2", L"Leistung (W)"), 0, pmax, pmax / 4, { { gPkg, C_PKG, 1, T(L"l_chip", L"ganzer Chip") }, { gGpu, RGB(165, 124, 255), S(2), T(L"l_gpu", L"Grafik") },
                                               { gCore, RGB(78, 161, 255), S(2), T(L"l_kerne", L"Kerne") } } },
-        { T(L"c_clock", L"CPU-Takt MHz"), 0, 6000, 1500, { { gMhz, C_MHZ, 1, T(L"l_kern", L"schnellster Kern (Mittel je Sekunde)") }, { gCap, C_CAP, S(2), T(L"l_bremse", L"Taktbremse") } } },
+        { T(L"c_clock2", L"CPU-Takt (MHz)"), 0, 6000, 1500, { { gMhz, C_MHZ, 1, T(L"l_kern", L"schnellster Kern (Mittel je Sekunde)") }, { gCap, C_CAP, S(2), T(L"l_bremse", L"Taktbremse") } } },
         // one chart per fan at the bottom, smaller: CPU fans 1 and 2 share the curve (block 0x60), the system fan has its own (0x66)
-        { T(L"c_fan1", L"CPU-Lüfter 1 %"), 0, 100, 50, { { gRpm1, C_RPM, 1, lIst }, { gEcFan, C_WARM, 1, lEc }, { gFan, C_FAN, S(2), lSoll } } },
-        { T(L"c_fan2", L"CPU-Lüfter 2 %"), 0, 100, 50, { { gRpm2, C_RPM, 1, lIst }, { gEcFan, C_WARM, 1, lEc }, { gFan, C_FAN, S(2), lSoll } } },
-        { T(L"c_fan3", L"Systemlüfter (SSD, WLAN) %"), 0, 100, 50, { { gRpm3, C_RPM, 1, lIst }, { gSysEc, C_WARM, 1, lEc }, { gSysFan, C_FAN, S(2), lSoll } } },
+        { T(L"c_fan1b", L"CPU-Lüfter 1 (%)"), 0, 100, 50, { { gRpm1, C_RPM, 1, lIst }, { gEcFan, C_WARM, 1, lEc }, { gFan, C_FAN, S(2), lSoll } } },
+        { T(L"c_fan2b", L"CPU-Lüfter 2 (%)"), 0, 100, 50, { { gRpm2, C_RPM, 1, lIst }, { gEcFan, C_WARM, 1, lEc }, { gFan, C_FAN, S(2), lSoll } } },
+        { T(L"c_fan3b", L"Systemlüfter für SSD und WLAN (%)"), 0, 100, 50, { { gRpm3, C_RPM, 1, lIst }, { gSysEc, C_WARM, 1, lEc }, { gSysFan, C_FAN, S(2), lSoll } } },
     };
     stripTipOn = 0;
     const float minW[6] = { 8, pmax / 6, 800, 15, 15, 15 };   // narrowest zoomed band: °C, W, MHz, %
     for (int i = 0; i < 6; i++) { cs[i].minW = minW[i]; zoom_setup(&cs[i]); }
     static const int weight[6] = { 3, 3, 3, 2, 2, 2 };   // the three fan charts get 2/3 of the height of the others
-    int unit = (charts.bottom - charts.top - 5 * gap) / 15, cy = charts.top;
+    // a low window drops charts, the least important first: CPU fan 2 (same curve as fan 1), system fan, clock, CPU fan 1;
+    // each chart keeps at least 70 px (fans 50 px), so what is shown stays readable (0.6.7)
+    static const int prio[6] = { 0, 1, 3, 2, 5, 4 };
+    int show[6] = { 0 }, avail = charts.bottom - charts.top, need = 0, units = 0, nShow = 0, last = 0;
+    for (int j = 0; j < 6; j++) {
+        int i = prio[j], m = (weight[i] == 3 ? S(70) : S(50)) + (need ? gap : 0);
+        if (need + m > avail && j > 0) break;
+        need += m; show[i] = 1;
+    }
+    for (int i = 0; i < 6; i++) if (show[i]) { units += weight[i]; nShow++; last = i; }
+    int unit = (avail - (nShow - 1) * gap) / units, cy = charts.top;
     for (int i = 0; i < 6; i++) {
-        RECT r = { charts.left, cy, charts.right, i == 5 ? charts.bottom : cy + weight[i] * unit };
+        if (!show[i]) continue;
+        RECT r = { charts.left, cy, charts.right, i == last ? charts.bottom : cy + weight[i] * unit };
         cy = r.bottom + gap;
         chart(dc, r, &cs[i]);
         if (i == 0) {   // dashed lines: target, clock brake, attention, alarm; labels side by side so they do not overlap
@@ -560,7 +582,10 @@ static void paint(HWND w, HDC dc)
             for (int j = 0; j < 4; j++) {
                 int yy = p.bottom - 1 - (int)(yfrac(&cs[0], lv[j]) * (p.bottom - p.top - 2));
                 line(dc, p.left, yy, p.right, yy, lcol[j], 1, PS_DASH);
-                lx += text(dc, fSmall, lx, yy - S(15), lcol[j], 0, L"%s", lname[j]) + S(10);
+                SelectObject(dc, fSmall); SIZE ls; GetTextExtentPoint32W(dc, lname[j], (int)wcslen(lname[j]), &ls);
+                RECT lb = { lx - S(3), yy - S(16), lx + ls.cx + S(3), yy - S(2) };   // on a small card: readable on top of the lines
+                fill(dc, lb, C_CARD, S(3));
+                lx += text(dc, fSmall, lx, yy - S(16), lcol[j], 0, L"%s", lname[j]) + S(12);
             }
         }
     }
@@ -614,6 +639,10 @@ static void paint(HWND w, HDC dc)
         for (int i = 0; i < 4; i++) text(dc, fSmall, box.left + S(10), box.top + S(7) + i * S(16), C_TEXT, 0, L"%s", tip[i]);
     }
 
+    if (!rechts) {   // narrow window: no right column, and nothing of it stays clickable
+        memset(sw, 0, sizeof sw); memset(stMinus, 0, sizeof stMinus); memset(stPlus, 0, sizeof stPlus); SetRectEmpty(&btnZoom);
+        return;
+    }
     // ---- switches: single functions on/off (a click writes einstellungen.ini) ----
     RECT sc = { rc.right - pad - evW, pad + tileH + gap, rc.right - pad, pad + tileH + gap + S(164) + EVO_NFUNK * S(28) + S(28) };
     fill(dc, sc, C_CARD, S(10));
@@ -949,8 +978,8 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         InvalidateRect(w, 0, FALSE); return 0;
     }
     case WM_MOUSELEAVE: mouseX = mouseY = -1; InvalidateRect(w, 0, FALSE); return 0;
-    case WM_GETMINMAXINFO: {   // below this the charts get too narrow next to the fixed right column
-        MINMAXINFO *mm = (MINMAXINFO *)lp; mm->ptMinTrackSize.x = S(900); mm->ptMinTrackSize.y = S(700); return 0;
+    case WM_GETMINMAXINFO: {   // below this even the narrow layout (no right column, fewer tiles and charts) gets cramped
+        MINMAXINFO *mm = (MINMAXINFO *)lp; mm->ptMinTrackSize.x = S(640); mm->ptMinTrackSize.y = S(480); return 0;
     }
     case WM_LBUTTONDOWN: {
         POINT p = { (short)LOWORD(lp), (short)HIWORD(lp) };
