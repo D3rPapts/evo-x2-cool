@@ -285,7 +285,7 @@ static float gCap(const EvoSample *s) { return s->cap > 0 ? (float)s->cap : -1; 
 static float gMhz(const EvoSample *s) { return s->mhz; }
 
 typedef struct { Getter g; COLORREF c; int w; const wchar_t *name; } Series;
-typedef struct { const wchar_t *title; float lo, hi, step; Series s[4]; float minW, za, zb; int z, h; } Chart;   // za..zb = zoomed band, h = series of the side strip
+typedef struct { const wchar_t *title; float lo, hi, step; Series s[4]; float minW, za, zb; int z; } Chart;   // za..zb = zoomed band
 
 static uint32_t first, count, span;
 static int xOf(RECT r, uint32_t i) { return r.left + (int)((int64_t)(r.right - r.left) * (int)(span - (count - 1 - i)) / (int)span); }
@@ -335,36 +335,44 @@ static void chart(HDC dc, RECT r, const Chart *c)
         x -= S(28);
     }
     text(dc, fBold, r.left, r.top - S(1), C_TEXT, 0, L"%s", c->title);
-    // axis labels, then a narrow strip, then the plot. The strip shows where the values of series h were during the
-    // shown time: one band per 3 pixels of height, the more seconds there, the stronger the colour (0.6.7)
-    RECT hs = { r.left + S(34), r.top + S(20), r.left + S(46), r.bottom };
+    // axis labels, then one narrow strip per line of the chart, then the plot. A strip shows where the values of its line
+    // were during the shown time: one band per 3 pixels of height, the more seconds there, the stronger the colour. The
+    // strips sit right next to the plot in the order of the legend; room for four, so all plots start at the same x (0.6.7)
+    RECT hs = { r.left + S(34), r.top + S(20), r.left + S(68), r.bottom };
     RECT p = { hs.right + S(4), r.top + S(20), r.right, r.bottom };
     fill(dc, p, C_CARD, 0);
-    fill(dc, hs, C_CARD, 0);
-    if (c->s[c->h].g && count) {
+    int ns = 0;
+    for (int k = 0; k < 4; k++) ns += c->s[k].g != 0;
+    int stw = S(7), sg = S(2), sx = hs.right - ns * stw - (ns - 1) * sg;
+    for (int k = 0; k < 4; k++) {
+        if (!c->s[k].g) continue;
+        RECT sr = { sx, hs.top, sx + stw, hs.bottom };
+        sx += stw + sg;
+        fill(dc, sr, C_CARD, 0);
+        if (!count) continue;
         enum { NB = 512 };
         static uint32_t nb[NB];
-        int band = S(3) > 1 ? S(3) : 2, hgt = hs.bottom - hs.top, bands = hgt / band + 1;
+        int band = S(3) > 1 ? S(3) : 2, hgt = sr.bottom - sr.top, bands = hgt / band + 1;
         if (bands > NB) bands = NB;
         uint32_t most = 0;
         memset(nb, 0, sizeof nb);
         for (uint32_t i = 0; i < count; i++) {
-            float v = c->s[c->h].g(sample(i));
+            float v = c->s[k].g(sample(i));
             if (v < 0) continue;
             int b = (int)(yfrac(c, v) * (hgt - 1)) / band;
             if (b >= bands) b = bands - 1;
             if (++nb[b] > most) most = nb[b];
         }
-        COLORREF sc = c->s[c->h].c;
+        COLORREF sc = c->s[k].c;
         for (int b = 0; b < bands && most; b++) {
             if (!nb[b]) continue;
             float a = 0.15f + 0.85f * sqrtf((float)nb[b] / most);   // square root: rare values stay visible
             COLORREF m = RGB((int)(GetRValue(C_CARD) + a * (GetRValue(sc) - GetRValue(C_CARD))),
                              (int)(GetGValue(C_CARD) + a * (GetGValue(sc) - GetGValue(C_CARD))),
                              (int)(GetBValue(C_CARD) + a * (GetBValue(sc) - GetBValue(C_CARD))));
-            RECT t = { hs.left, hs.bottom - (b + 1) * band, hs.right, hs.bottom - b * band };
-            if (t.top < hs.top) t.top = hs.top;
-            fill(dc, t, m, 0);
+            RECT tb = { sr.left, sr.bottom - (b + 1) * band, sr.right, sr.bottom - b * band };
+            if (tb.top < sr.top) tb.top = sr.top;
+            fill(dc, tb, m, 0);
         }
     }
     float st = c->step, v0 = c->lo, v1 = c->hi;
@@ -434,7 +442,7 @@ static void paint(HWND w, HDC dc)
     // ---- layout: tiles on top, charts left, events right ----
     int evW = S(300), tileH = S(80), gap = S(12);
     RECT charts = { pad, pad + tileH + gap + S(30), rc.right - pad - evW - gap, rc.bottom - pad - S(30) };
-    RECT plot = { charts.left + S(50), 0, charts.right, 0 };   // x extent of all plots (axis labels and side strip on the left)
+    RECT plot = { charts.left + S(72), 0, charts.right, 0 };   // x extent of all plots (axis labels and side strips on the left)
 
     // sample under the mouse
     const EvoSample *at = cur; int hover = -1;
@@ -513,7 +521,6 @@ static void paint(HWND w, HDC dc)
         { T(L"c_fan3", L"Systemlüfter (SSD, WLAN) %"), 0, 100, 50, { { gRpm3, C_RPM, 1, lIst }, { gSysEc, C_WARM, 1, lEc }, { gSysFan, C_FAN, S(2), lSoll } } },
     };
     const float minW[6] = { 8, pmax / 6, 800, 15, 15, 15 };   // narrowest zoomed band: °C, W, MHz, %
-    cs[0].h = 2;   // side strip of the temperature chart: the raw CPU value (the measurement); the others use their first line
     for (int i = 0; i < 6; i++) { cs[i].minW = minW[i]; zoom_setup(&cs[i]); }
     static const int weight[6] = { 3, 3, 3, 2, 2, 2 };   // the three fan charts get 2/3 of the height of the others
     int unit = (charts.bottom - charts.top - 5 * gap) / 15, cy = charts.top;
