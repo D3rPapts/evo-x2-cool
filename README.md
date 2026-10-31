@@ -123,7 +123,7 @@ Data in the same folder: `modell.txt` (learned model), `regler-<date>.csv` (one 
 
 We tune EVO-X2-COOL with the logs of two machines. Logs from other EVO-X2 (other BIOS versions, SSDs, cases, workloads) help a lot. If you want to help:
 
-1. Open PowerShell and run this. It packs the last three days into `evo-x2-cool-logs.zip` on your desktop, together with the times of the ACPI 13 events:
+1. Since 0.6.7: right-click the icon next to the clock, "Save logs (ZIP on the desktop)". With an older version, open PowerShell and run this. It packs the last three days into `evo-x2-cool-logs.zip` on your desktop, together with the times of the ACPI 13 events:
 
    ```powershell
    $d = "$env:ProgramData\evo-x2-cool"; $t = "$env:TEMP\evo-x2-cool-logs"
@@ -135,7 +135,7 @@ We tune EVO-X2-COOL with the logs of two machines. Logs from other EVO-X2 (other
      Where-Object { Test-Path $_ } | ForEach-Object {
        $in = [IO.File]::Open($_, 'Open', 'Read', 'ReadWrite'); $out = [IO.File]::Create("$t\" + (Split-Path $_ -Leaf))
        $in.CopyTo($out); $out.Close(); $in.Close() }
-   Compress-Archive -Path "$t\*" -DestinationPath "$env:USERPROFILE\Desktop\evo-x2-cool-logs.zip" -Force
+   Compress-Archive -Path "$t\*" -DestinationPath (Join-Path ([Environment]::GetFolderPath('Desktop')) 'evo-x2-cool-logs.zip') -Force
    ```
 
 2. Open a [new issue with the "Share logs" form](../../issues/new?template=logs.yml) and drag the ZIP file into it.
@@ -181,4 +181,4 @@ Lernende Lüfter- und Taktsteuerung für die GMKtec EVO-X2 unter Windows. Inoffi
 - Fenster und Meldungen auf Deutsch oder Englisch, hell oder dunkel, Funktionen einzeln schaltbar.
 - Braucht EC-Firmware 1.10 und den Treiber PawnIO. Bedienung und Einstellungen wie oben.
 - Bekannt: ACPI-Ereignis 13 im Windows-Protokoll (seit EC 1.10, etwa alle ein bis zwei Stunden, meist unter Grafiklast, seit 0.6.6 nicht mehr an unsere Zugriffe gekoppelt, bisher ohne Folgen). Eine Samsung 990 PRO ohne Kühlkörper wird unter Datenlast trotz vollem Systemlüfter sehr heiß – Kühlkörper oder Wärmeleitpad zum Gehäuse helfen.
-- **Logs teilen:** Mit den Logs anderer EVO-X2 können wir weiter verbessern. Der PowerShell-Befehl oben unter „Share your logs“ packt die letzten drei Tage als ZIP auf den Desktop. Die ZIP-Datei bitte über das Formular „Logs teilen“ als Issue hochladen. Enthalten sind nur Messwerte (Temperaturen, Leistung, Lüfter, Takt, SSD), keine Namen, Dateien oder Programme. Issues sind öffentlich.
+- **Logs teilen:** Mit den Logs anderer EVO-X2 können wir weiter verbessern. Ab 0.6.7: Rechtsklick auf das Symbol neben der Uhr → „Logs speichern (ZIP auf dem Desktop)“; bei älteren Versionen packt der PowerShell-Befehl oben unter „Share your logs“ die letzten drei Tage als ZIP auf den Desktop. Die ZIP-Datei bitte über das Formular „Logs teilen“ als Issue hochladen. Enthalten sind nur Messwerte (Temperaturen, Leistung, Lüfter, Takt, SSD), keine Namen, Dateien oder Programme. Issues sind öffentlich.

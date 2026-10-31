@@ -14,6 +14,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <winhttp.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -25,6 +26,7 @@
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "gdiplus.lib")
 
@@ -58,6 +60,8 @@ static RECT btn[4], btnThema, btnSprache, btnUpdate, btnZoom;
 static int zoom;   // 1 = every chart zooms on the values of the newest quarter of the shown time ([Anzeige] Zoom)
 static wchar_t updVer[16];   // newer version on GitHub, empty = none (or check switched off)
 static void open_releases(void);
+static DWORD WINAPI logs_thread(void *p);
+static const char *endeGrund;
 static HFONT fValue, fText, fSmall, fBold;
 static wchar_t langs[8][16], langCode[16]; static int nLangs;   // available sprache-<code>.ini next to the exe
 static int thema, dark;   // thema: 0 system, 1 light, 2 dark
@@ -691,6 +695,7 @@ static void stop_all(HWND w)
         MessageBoxW(w, T(L"m_alles_err", L"Keine Rechte, den Regler zu beenden. In einer Admin-Shell: evo-x2-cool --stopp"), L"EVO-X2-COOL", MB_ICONWARNING);
         return;
     }
+    endeGrund = "tray menu: exit all";
     DestroyWindow(w);
 }
 
@@ -711,6 +716,7 @@ static void tray_menu(HWND w)
     wchar_t zt[48]; swprintf(zt, 48, T(L"z_menu", L"Zieltemperatur (%.0f °C)"), cur_ziel());
     AppendMenuW(m, MF_POPUP | off, (UINT_PTR)zm, zt);
     AppendMenuW(m, MF_SEPARATOR, 0, 0);
+    AppendMenuW(m, MF_STRING, 104, T(L"m_logs", L"Logs speichern (ZIP auf dem Desktop)"));
     AppendMenuW(m, MF_STRING, 101, T(L"m_ende", L"Beenden (Regler läuft weiter)"));
     AppendMenuW(m, MF_STRING | (sh ? 0 : MF_GRAYED), 102, T(L"m_alles", L"Alles beenden (auch den Regler)"));
     POINT p; GetCursorPos(&p);
@@ -719,9 +725,10 @@ static void tray_menu(HWND w)
     PostMessageW(w, WM_NULL, 0, 0);
     DestroyMenu(m);
     if (id == 100) show_window(w, !visible);
-    else if (id == 101) DestroyWindow(w);
+    else if (id == 101) { endeGrund = "tray menu: exit"; DestroyWindow(w); }
     else if (id == 102) stop_all(w);
     else if (id == 103) open_releases();
+    else if (id == 104) CloseHandle(CreateThread(0, 0, logs_thread, w, 0, 0));
     else if (id >= 300) set_ziel(w, (float)(id - 300));
     else if (id >= 200) toggle_funk(w, id - 200);
 }
@@ -772,6 +779,67 @@ static DWORD WINAPI update_thread(void *w)
 }
 
 static void open_releases(void) { ShellExecuteW(0, L"open", RELEASES, 0, 0, SW_SHOWNORMAL); }
+
+// own small log of the window (%LOCALAPPDATA%\evo-x2-cool\anzeige.txt): when it starts and why it ends. On 30.10. a
+// taskbar button stayed without a program behind it, and nothing told when or how the window had ended (0.6.7)
+static const char *endeGrund = "unknown (process ended without WM_DESTROY?)";
+static void anz_log(const char *fmt, ...)
+{
+    wchar_t pfad[MAX_PATH]; char text[200], line[240]; va_list a;
+    ExpandEnvironmentStringsW(L"%LOCALAPPDATA%\\evo-x2-cool", pfad, MAX_PATH);
+    CreateDirectoryW(pfad, 0);
+    wcscat(pfad, L"\\anzeige.txt");
+    va_start(a, fmt); vsnprintf(text, sizeof text, fmt, a); va_end(a);
+    SYSTEMTIME st; GetLocalTime(&st);
+    int n = snprintf(line, sizeof line, "%04d-%02d-%02d %02d:%02d:%02d  pid %lu  %s\r\n", st.wYear, st.wMonth, st.wDay, st.wHour,
+                     st.wMinute, st.wSecond, GetCurrentProcessId(), text);
+    HANDLE f = CreateFileW(pfad, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, 0, OPEN_ALWAYS, 0, 0);
+    if (f != INVALID_HANDLE_VALUE) { DWORD w; WriteFile(f, line, (DWORD)n, &w, 0); CloseHandle(f); }
+}
+
+// "save logs": the same as the PowerShell command in the README, run hidden, the ZIP lands on the desktop and is shown
+// in Explorer. The controller keeps writing today's file, so the files are copied with shared read first (0.6.7)
+static const char LOGS_PS[] =
+    "$d = \"$env:ProgramData\\evo-x2-cool\"; $t = \"$env:TEMP\\evo-x2-cool-logs\"\r\n"
+    "$z = Join-Path ([Environment]::GetFolderPath('Desktop')) 'evo-x2-cool-logs.zip'\r\n"
+    "New-Item -ItemType Directory -Force $t | Out-Null; Remove-Item \"$t\\*\" -ErrorAction SilentlyContinue\r\n"
+    "Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName='ACPI'; Id=13} -MaxEvents 500 -ErrorAction SilentlyContinue |\r\n"
+    "  Select-Object TimeCreated | Export-Csv \"$t\\acpi13.csv\" -NoTypeInformation\r\n"
+    "@(\"$d\\ereignisse.txt\", \"$d\\modell.txt\", \"$d\\einstellungen.ini\", \"$env:LOCALAPPDATA\\evo-x2-cool\\anzeige.txt\") +\r\n"
+    "  (Get-ChildItem \"$d\\regler-*.csv\" | Sort-Object Name | Select-Object -Last 3).FullName |\r\n"
+    "  Where-Object { $_ -and (Test-Path $_) } | ForEach-Object {\r\n"
+    "    $in = [IO.File]::Open($_, 'Open', 'Read', 'ReadWrite'); $out = [IO.File]::Create(\"$t\\\" + (Split-Path $_ -Leaf))\r\n"
+    "    $in.CopyTo($out); $out.Close(); $in.Close() }\r\n"
+    "Compress-Archive -Path \"$t\\*\" -DestinationPath $z -Force\r\n"
+    "if (-not (Test-Path $z)) { exit 1 }\r\n";
+static DWORD WINAPI logs_thread(void *p)
+{
+    HWND w = (HWND)p;
+    wchar_t ps[MAX_PATH], cmd[MAX_PATH + 128], zip[MAX_PATH], arg[MAX_PATH + 32];
+    GetTempPathW(MAX_PATH, ps); wcscat(ps, L"evo-x2-cool-logs.ps1");
+    HANDLE f = CreateFileW(ps, GENERIC_WRITE, 0, 0, CREATE_ALWAYS, 0, 0);
+    if (f == INVALID_HANDLE_VALUE) return 1;
+    DWORD n; WriteFile(f, LOGS_PS, sizeof LOGS_PS - 1, &n, 0); CloseHandle(f);
+    swprintf(cmd, MAX_PATH + 128, L"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"%s\"", ps);
+    STARTUPINFOW si = { sizeof si }; PROCESS_INFORMATION pi; DWORD rc = 1;
+    if (CreateProcessW(0, cmd, 0, 0, FALSE, CREATE_NO_WINDOW, 0, 0, &si, &pi)) {
+        WaitForSingleObject(pi.hProcess, 120000); GetExitCodeProcess(pi.hProcess, &rc);
+        CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+    }
+    DeleteFileW(ps);
+    PWSTR desk = 0;
+    if (rc == 0 && SHGetKnownFolderPath(&FOLDERID_Desktop, 0, 0, &desk) == S_OK) {
+        swprintf(zip, MAX_PATH, L"%s\\evo-x2-cool-logs.zip", desk);
+        swprintf(arg, MAX_PATH + 32, L"/select,\"%s\"", zip);
+        ShellExecuteW(0, L"open", L"explorer.exe", arg, 0, SW_SHOWNORMAL);
+        anz_log("logs saved to the desktop");
+    } else {
+        MessageBoxW(w, T(L"logs_err", L"Die Logs konnten nicht gespeichert werden."), L"EVO-X2-COOL", MB_ICONWARNING);
+        anz_log("saving the logs failed (exit code %lu)", rc);
+    }
+    CoTaskMemFree(desk);
+    return 0;
+}
 
 static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp)
 {
@@ -860,8 +928,10 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         InvalidateRect(w, 0, FALSE); return 0;
     }
     // closing ends the viewer: a hidden window could not be brought back from a taskbar pin (30.10., clicks did nothing)
-    case WM_CLOSE: case WM_ENDE: DestroyWindow(w); return 0;
-    case WM_DESTROY: Shell_NotifyIconW(NIM_DELETE, &tray); PostQuitMessage(0); return 0;
+    case WM_CLOSE: endeGrund = "window closed (X)"; DestroyWindow(w); return 0;
+    case WM_ENDE: endeGrund = "asked by the installer"; DestroyWindow(w); return 0;
+    case WM_ENDSESSION: if (wp) anz_log("ends: Windows logs off or shuts down"); return 0;
+    case WM_DESTROY: anz_log("ends: %s", endeGrund); Shell_NotifyIconW(NIM_DELETE, &tray); PostQuitMessage(0); return 0;
     }
     if (m == msgTaskbar && m) { tray_add(w); return 0; }
     return DefWindowProcW(w, m, wp, lp);
@@ -870,8 +940,15 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp)
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 {
     (void)prev;
+    if (cmd && wcsstr(cmd, L"--logs")) { ExpandEnvironmentStringsW(EVO_INI, iniFile, MAX_PATH); load_lang(); return (int)logs_thread(0); }   // only save the logs
     HWND old = FindWindowW(L"evo-x2-cool-front", 0);   // already running: bring it to the front instead of a second copy
-    if (old) { DWORD pid; GetWindowThreadProcessId(old, &pid); AllowSetForegroundWindow(pid); PostMessageW(old, WM_ZEIGEN, 0, 0); return 0; }
+    if (old) {
+        DWORD pid; GetWindowThreadProcessId(old, &pid); AllowSetForegroundWindow(pid);
+        BOOL ok = PostMessageW(old, WM_ZEIGEN, 0, 0);
+        anz_log("second start: asked window of pid %lu to show itself (%s)", pid, ok ? "sent" : "sending failed");
+        return 0;
+    }
+    anz_log("start " EVO_VERSION "%s", cmd && wcsstr(cmd, L"--leiste") ? " (--leiste, icon only)" : "");
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     ULONG_PTR gdipToken; GpStartupInput gin = { 1, 0, FALSE, TRUE };   // only for anti-aliased round corners (fill)
     GdiplusStartup(&gdipToken, &gin, 0);
