@@ -56,7 +56,8 @@ static HANDLE map;
 static int spanIdx = 1, mouseX = -1, mouseY = -1, dpi = 96;
 static const int spans[4] = { 300, 900, 3600, 7200 };
 static const wchar_t *spanText[4] = { L"5 min", L"15 min", L"1 h", L"2 h" };
-static RECT btn[4], btnThema, btnSprache, btnUpdate, btnZoom;
+static RECT btn[4], btnThema, btnSprache, btnUpdate, btnZoom, btnLogs;
+static volatile LONG logsLaeuft;   // "save logs" is running (button shows it, a second click does nothing)
 static int zoom;   // 1 = every chart zooms on the values of the newest quarter of the shown time ([Anzeige] Zoom)
 static wchar_t updVer[16];   // newer version on GitHub, empty = none (or check switched off)
 static void open_releases(void);
@@ -128,6 +129,14 @@ static int top_buttons(HDC dc, int right, int y)
         fill(dc, *rb[i], C_CARD, S(8));
         text(dc, fText, (rb[i]->left + rb[i]->right) / 2, y + S(3), C_TEXT, 2, L"%s", lb[i]);
         right = rb[i]->left - S(6);
+    }
+    {   // save the logs as ZIP on the desktop (also in the tray menu), so people can send them to us
+        const wchar_t *ll = logsLaeuft ? T(L"logs_laeuft", L"⏳ Logs werden gespeichert …") : T(L"logs_knopf", L"💾 Logs speichern");
+        SelectObject(dc, fText); SIZE sz; GetTextExtentPoint32W(dc, ll, (int)wcslen(ll), &sz);
+        btnLogs = (RECT){ right - sz.cx - S(20), y, right, y + S(22) };
+        fill(dc, btnLogs, C_CARD, S(8));
+        text(dc, fText, (btnLogs.left + btnLogs.right) / 2, y + S(3), C_TEXT, 2, L"%s", ll);
+        right = btnLogs.left - S(6);
     }
     if (updVer[0]) {   // newer version on GitHub: one more button, opens the release page
         wchar_t ul[48]; swprintf(ul, 48, T(L"upd_knopf", L"⬆ Version %s"), updVer);
@@ -728,7 +737,7 @@ static void tray_menu(HWND w)
     else if (id == 101) { endeGrund = "tray menu: exit"; DestroyWindow(w); }
     else if (id == 102) stop_all(w);
     else if (id == 103) open_releases();
-    else if (id == 104) CloseHandle(CreateThread(0, 0, logs_thread, w, 0, 0));
+    else if (id == 104 && !logsLaeuft) CloseHandle(CreateThread(0, 0, logs_thread, w, 0, 0));
     else if (id >= 300) set_ziel(w, (float)(id - 300));
     else if (id >= 200) toggle_funk(w, id - 200);
 }
@@ -816,9 +825,10 @@ static DWORD WINAPI logs_thread(void *p)
 {
     HWND w = (HWND)p;
     wchar_t ps[MAX_PATH], cmd[MAX_PATH + 128], zip[MAX_PATH], arg[MAX_PATH + 32];
+    InterlockedExchange(&logsLaeuft, 1); if (w) InvalidateRect(w, 0, FALSE);
     GetTempPathW(MAX_PATH, ps); wcscat(ps, L"evo-x2-cool-logs.ps1");
     HANDLE f = CreateFileW(ps, GENERIC_WRITE, 0, 0, CREATE_ALWAYS, 0, 0);
-    if (f == INVALID_HANDLE_VALUE) return 1;
+    if (f == INVALID_HANDLE_VALUE) { InterlockedExchange(&logsLaeuft, 0); return 1; }
     DWORD n; WriteFile(f, LOGS_PS, sizeof LOGS_PS - 1, &n, 0); CloseHandle(f);
     swprintf(cmd, MAX_PATH + 128, L"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"%s\"", ps);
     STARTUPINFOW si = { sizeof si }; PROCESS_INFORMATION pi; DWORD rc = 1;
@@ -838,7 +848,8 @@ static DWORD WINAPI logs_thread(void *p)
         anz_log("saving the logs failed (exit code %lu)", rc);
     }
     CoTaskMemFree(desk);
-    return 0;
+    InterlockedExchange(&logsLaeuft, 0); if (w) InvalidateRect(w, 0, FALSE);
+    return rc;
 }
 
 static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp)
@@ -874,6 +885,7 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         POINT p = { (short)LOWORD(lp), (short)HIWORD(lp) };
         for (int i = 0; i < 4; i++) if (PtInRect(&btn[i], p)) { spanIdx = i; InvalidateRect(w, 0, FALSE); }
         if (PtInRect(&btnUpdate, p)) open_releases();
+        if (PtInRect(&btnLogs, p) && !logsLaeuft) CloseHandle(CreateThread(0, 0, logs_thread, w, 0, 0));
         if (PtInRect(&btnZoom, p)) { zoom = !zoom; WritePrivateProfileStringW(L"Anzeige", L"Zoom", zoom ? L"1" : L"0", iniFile); InvalidateRect(w, 0, FALSE); }
         if (PtInRect(&btnThema, p) || PtInRect(&btnSprache, p)) {
             int ok;
