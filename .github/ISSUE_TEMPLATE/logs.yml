@@ -1,0 +1,47 @@
+name: Share logs / Logs teilen
+description: Send the EVO-X2-COOL logs of your machine, so the controller can be tuned for more machines.
+title: "Logs: "
+labels: ["logs"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you! The README explains how to make the ZIP file (section "Share your logs").
+        Danke! Wie die ZIP-Datei entsteht, steht in der README unter „Share your logs“.
+        Issues are public / Issues sind öffentlich.
+  - type: input
+    id: version
+    attributes:
+      label: EVO-X2-COOL version
+      placeholder: "0.6.6"
+    validations:
+      required: true
+  - type: input
+    id: geraet
+    attributes:
+      label: Machine (RAM, BIOS and EC version)
+      placeholder: "EVO-X2 128 GB, BIOS 1.12, EC 1.10"
+    validations:
+      required: true
+  - type: input
+    id: ssd
+    attributes:
+      label: SSD(s), with or without heatsink
+      placeholder: "Samsung 990 PRO 2 TB, no heatsink"
+  - type: textarea
+    id: last
+    attributes:
+      label: What runs on the machine? / Was läuft darauf?
+      description: e.g. games, local AI models, compiling, mostly idle
+  - type: textarea
+    id: auffaellig
+    attributes:
+      label: Anything you noticed? / Etwas aufgefallen?
+      description: freezes, loud fans, hot SSD, ACPI 13 events, with date and time if you know it
+  - type: textarea
+    id: zip
+    attributes:
+      label: ZIP file
+      description: Drag evo-x2-cool-logs.zip from your desktop into this field.
+    validations:
+      required: true

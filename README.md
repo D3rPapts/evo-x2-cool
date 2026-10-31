@@ -116,8 +116,31 @@ Data in the same folder: `modell.txt` (learned model), `regler-<date>.csv` (one 
 
 ## Known issues
 
-- **ACPI event 13 ("EC did not respond within the timeout")** in the Windows system log. On our machines it started on the day the EC firmware 1.10 / BIOS 1.12 was installed. Since 0.6.3 it showed up about once per hour, with 0.6.5 about every two hours; we have not seen any effect beyond the log entry.
+- **ACPI event 13 ("EC did not respond within the timeout")** in the Windows system log. On our machines it started on the day the EC firmware 1.10 / BIOS 1.12 was installed. Before 0.6.5 most of these events came exactly 5 s after an access of ours; since 0.6.6 they no longer line up with our accesses (1 of 15), but still come about every one to two hours, mostly under GPU load. We have not seen any effect beyond the log entry. Logs from other machines would help to find out whether this happens without EVO-X2-COOL as well (see below).
 - **Samsung 990 PRO without heatsink:** under heavy data load its controller reached 96 °C even with the system fan at full speed, and one drive dropped out under such load. A thin heatsink or a thermal pad to the case helps more than any fan curve. Check the space above the M.2 slot first, and do not remove the label.
+
+## Share your logs
+
+We tune EVO-X2-COOL with the logs of two machines. Logs from other EVO-X2 (other BIOS versions, SSDs, cases, workloads) help a lot. If you want to help:
+
+1. Open PowerShell and run this. It packs the last three days into `evo-x2-cool-logs.zip` on your desktop, together with the times of the ACPI 13 events:
+
+   ```powershell
+   $d = "$env:ProgramData\evo-x2-cool"; $t = "$env:TEMP\evo-x2-cool-logs"
+   New-Item -ItemType Directory -Force $t | Out-Null; Remove-Item "$t\*" -ErrorAction SilentlyContinue
+   Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName='ACPI'; Id=13} -MaxEvents 500 -ErrorAction SilentlyContinue |
+     Select-Object TimeCreated | Export-Csv "$t\acpi13.csv" -NoTypeInformation
+   # copied while the controller keeps writing today's file
+   @("$d\ereignisse.txt", "$d\modell.txt", "$d\einstellungen.ini") + (Get-ChildItem "$d\regler-*.csv" | Sort-Object Name | Select-Object -Last 3).FullName |
+     Where-Object { Test-Path $_ } | ForEach-Object {
+       $in = [IO.File]::Open($_, 'Open', 'Read', 'ReadWrite'); $out = [IO.File]::Create("$t\" + (Split-Path $_ -Leaf))
+       $in.CopyTo($out); $out.Close(); $in.Close() }
+   Compress-Archive -Path "$t\*" -DestinationPath "$env:USERPROFILE\Desktop\evo-x2-cool-logs.zip" -Force
+   ```
+
+2. Open a [new issue with the "Share logs" form](../../issues/new?template=logs.yml) and drag the ZIP file into it.
+
+**What is inside:** temperatures, power, fan speeds, clock limits, SSD temperatures and data rates, one line per second; the controller's decisions; your settings; the times of the ACPI events. No user names, file names, programs or network data. The files are plain text, so you can open them before you send them. Note that an issue is public.
 
 ## Update check
 
@@ -157,4 +180,5 @@ Lernende Lüfter- und Taktsteuerung für die GMKtec EVO-X2 unter Windows. Inoffi
 - Lernt aus Erfahrung. Den Notfall (Lüfter auf voll) kann man nicht abschalten.
 - Fenster und Meldungen auf Deutsch oder Englisch, hell oder dunkel, Funktionen einzeln schaltbar.
 - Braucht EC-Firmware 1.10 und den Treiber PawnIO. Bedienung und Einstellungen wie oben.
-- Bekannt: ACPI-Ereignis 13 im Windows-Protokoll (seit EC 1.10, etwa einmal pro Stunde, bisher ohne Folgen). Eine Samsung 990 PRO ohne Kühlkörper wird unter Datenlast trotz vollem Systemlüfter sehr heiß – Kühlkörper oder Wärmeleitpad zum Gehäuse helfen.
+- Bekannt: ACPI-Ereignis 13 im Windows-Protokoll (seit EC 1.10, etwa alle ein bis zwei Stunden, meist unter Grafiklast, seit 0.6.6 nicht mehr an unsere Zugriffe gekoppelt, bisher ohne Folgen). Eine Samsung 990 PRO ohne Kühlkörper wird unter Datenlast trotz vollem Systemlüfter sehr heiß – Kühlkörper oder Wärmeleitpad zum Gehäuse helfen.
+- **Logs teilen:** Mit den Logs anderer EVO-X2 können wir weiter verbessern. Der PowerShell-Befehl oben unter „Share your logs“ packt die letzten drei Tage als ZIP auf den Desktop. Die ZIP-Datei bitte über das Formular „Logs teilen“ als Issue hochladen. Enthalten sind nur Messwerte (Temperaturen, Leistung, Lüfter, Takt, SSD), keine Namen, Dateien oder Programme. Issues sind öffentlich.
