@@ -820,7 +820,10 @@ static int run(void)
         // a situation with a lower cap counts at once, one with a higher or the same cap only after 10 s: a few busy
         // threads that come and go must not flip the cap (and the EC mode) every second; with the same cap machine 2
         // switched "GPU + many cores" <-> "GPU" every second and filled the log
-        if (lageNow >= 0 && lg != lageNow && lage[lg].stufe >= lage[lageNow].stufe && ++locker < 10) lg = lageNow;
+        // A higher cap waits 60 s (0.6.7): with 10 s the GPU work of image/video jobs flipped "GPU" <-> "GPU + many cores"
+        // every ~10 s (busy cores come and go), 32 situation and 22 cap changes an hour on .198, 381 a day on .56
+        if (lageNow >= 0 && lg != lageNow && lage[lg].stufe >= lage[lageNow].stufe
+            && ++locker < (lage[lg].stufe > lage[lageNow].stufe ? 60 : 10)) lg = lageNow;
         else locker = 0;
         if (lg != lageNow) { lage[lg].spitze = (int)T; if (lageNow >= 0 && !nurLesen) event(L_("lastart", "Lastart jetzt: %s"), lage_text(lg)); lageNow = lg; }
         else if (T > lage[lg].spitze) lage[lg].spitze = (int)T;
