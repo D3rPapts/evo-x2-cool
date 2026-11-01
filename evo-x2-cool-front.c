@@ -14,6 +14,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <winhttp.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -25,6 +26,7 @@
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "gdiplus.lib")
 
@@ -54,10 +56,13 @@ static HANDLE map;
 static int spanIdx = 1, mouseX = -1, mouseY = -1, dpi = 96;
 static const int spans[4] = { 300, 900, 3600, 7200 };
 static const wchar_t *spanText[4] = { L"5 min", L"15 min", L"1 h", L"2 h" };
-static RECT btn[4], btnThema, btnSprache, btnUpdate, btnZoom;
+static RECT btn[4], btnThema, btnSprache, btnUpdate, btnZoom, btnLogs;
+static volatile LONG logsLaeuft;   // "save logs" is running (button shows it, a second click does nothing)
 static int zoom;   // 1 = every chart zooms on the values of the newest quarter of the shown time ([Anzeige] Zoom)
 static wchar_t updVer[16];   // newer version on GitHub, empty = none (or check switched off)
 static void open_releases(void);
+static DWORD WINAPI logs_thread(void *p);
+static const char *endeGrund;
 static HFONT fValue, fText, fSmall, fBold;
 static wchar_t langs[8][16], langCode[16]; static int nLangs;   // available sprache-<code>.ini next to the exe
 static int thema, dark;   // thema: 0 system, 1 light, 2 dark
@@ -124,6 +129,14 @@ static int top_buttons(HDC dc, int right, int y)
         fill(dc, *rb[i], C_CARD, S(8));
         text(dc, fText, (rb[i]->left + rb[i]->right) / 2, y + S(3), C_TEXT, 2, L"%s", lb[i]);
         right = rb[i]->left - S(6);
+    }
+    {   // save the logs as ZIP on the desktop (also in the tray menu), so people can send them to us
+        const wchar_t *ll = logsLaeuft ? T(L"logs_laeuft", L"⏳ Logs werden gespeichert …") : T(L"logs_knopf", L"💾 Logs speichern");
+        SelectObject(dc, fText); SIZE sz; GetTextExtentPoint32W(dc, ll, (int)wcslen(ll), &sz);
+        btnLogs = (RECT){ right - sz.cx - S(20), y, right, y + S(22) };
+        fill(dc, btnLogs, C_CARD, S(8));
+        text(dc, fText, (btnLogs.left + btnLogs.right) / 2, y + S(3), C_TEXT, 2, L"%s", ll);
+        right = btnLogs.left - S(6);
     }
     if (updVer[0]) {   // newer version on GitHub: one more button, opens the release page
         wchar_t ul[48]; swprintf(ul, 48, T(L"upd_knopf", L"⬆ Version %s"), updVer);
@@ -308,6 +321,16 @@ static void zoom_setup(Chart *c)
     c->z = c->zb - c->za < (c->hi - c->lo) * 0.9f;   // nearly the whole range anyway: stay linear
 }
 
+// value at height f (0..1) of a chart: yfrac backwards (it only grows, so halving the interval finds it)
+static float vOf(const Chart *c, float f)
+{
+    float a = c->lo, b = c->hi;
+    for (int i = 0; i < 30; i++) { float m = (a + b) / 2; if (yfrac(c, m) < f) a = m; else b = m; }
+    return (a + b) / 2;
+}
+static wchar_t stripTip[3][96];
+static int stripTipOn;
+
 static void chart(HDC dc, RECT r, const Chart *c)
 {
     // title row with legend on the right
@@ -322,25 +345,75 @@ static void chart(HDC dc, RECT r, const Chart *c)
         x -= S(28);
     }
     text(dc, fBold, r.left, r.top - S(1), C_TEXT, 0, L"%s", c->title);
-    RECT p = { r.left + S(34), r.top + S(20), r.right, r.bottom };
+    // axis labels, then one narrow strip per line of the chart, then the plot. A strip shows where the values of its line
+    // were during the shown time: one band per 3 pixels of height, the more seconds there, the stronger the colour. The
+    // strips sit right next to the plot in the order of the legend; room for four, so all plots start at the same x (0.6.7)
+    RECT hs = { r.left + S(34), r.top + S(20), r.left + S(68), r.bottom };
+    RECT p = { hs.right + S(4), r.top + S(20), r.right, r.bottom };
     fill(dc, p, C_CARD, 0);
+    int ns = 0;
+    for (int k = 0; k < 4; k++) ns += c->s[k].g != 0;
+    int stw = S(7), sg = S(2), sx = hs.right - ns * stw - (ns - 1) * sg;
+    for (int k = 0; k < 4; k++) {
+        if (!c->s[k].g) continue;
+        RECT sr = { sx, hs.top, sx + stw, hs.bottom };
+        sx += stw + sg;
+        fill(dc, sr, C_CARD, 0);
+        if (!count) continue;
+        enum { NB = 512 };
+        static uint32_t nb[NB];
+        int band = S(3) > 1 ? S(3) : 2, hgt = sr.bottom - sr.top, bands = hgt / band + 1;
+        if (bands > NB) bands = NB;
+        uint32_t most = 0;
+        memset(nb, 0, sizeof nb);
+        for (uint32_t i = 0; i < count; i++) {
+            float v = c->s[k].g(sample(i));
+            if (v < 0) continue;
+            int b = (int)(yfrac(c, v) * (hgt - 1)) / band;
+            if (b >= bands) b = bands - 1;
+            if (++nb[b] > most) most = nb[b];
+        }
+        // mouse over this strip (or the gap left of it, the strips are narrow): remember a tooltip (drawn after all charts): the band under the mouse and the most frequent one
+        if (mouseX >= sr.left - sg && mouseX < sr.right && mouseY >= sr.top && mouseY < sr.bottom && most) {
+            uint32_t total = 0; int bm = 0;
+            for (int b = 0; b < bands; b++) { total += nb[b]; if (nb[b] > nb[bm]) bm = b; }
+            int bh = (sr.bottom - 1 - mouseY) / band; if (bh >= bands) bh = bands - 1;
+            float h0 = vOf(c, (float)(bh * band) / (hgt - 1)), h1 = vOf(c, (float)((bh + 1) * band) / (hgt - 1));
+            float m0 = vOf(c, (float)(bm * band) / (hgt - 1)), m1 = vOf(c, (float)((bm + 1) * band) / (hgt - 1));
+            swprintf(stripTip[0], 96, T(L"st_titel", L"%s: wo die Werte lagen"), c->s[k].name);
+            swprintf(stripTip[1], 96, T(L"st_hier", L"hier %.0f–%.0f: %.0f %% der Zeit"), h0, h1, 100.0f * nb[bh] / total);
+            swprintf(stripTip[2], 96, T(L"st_meist", L"am häufigsten %.0f–%.0f: %.0f %% der Zeit"), m0, m1, 100.0f * nb[bm] / total);
+            stripTipOn = 1;
+        }
+        COLORREF sc = c->s[k].c;
+        for (int b = 0; b < bands && most; b++) {
+            if (!nb[b]) continue;
+            float a = 0.15f + 0.85f * sqrtf((float)nb[b] / most);   // square root: rare values stay visible
+            COLORREF m = RGB((int)(GetRValue(C_CARD) + a * (GetRValue(sc) - GetRValue(C_CARD))),
+                             (int)(GetGValue(C_CARD) + a * (GetGValue(sc) - GetGValue(C_CARD))),
+                             (int)(GetBValue(C_CARD) + a * (GetBValue(sc) - GetBValue(C_CARD))));
+            RECT tb = { sr.left, sr.bottom - (b + 1) * band, sr.right, sr.bottom - b * band };
+            if (tb.top < sr.top) tb.top = sr.top;
+            fill(dc, tb, m, 0);
+        }
+    }
     float st = c->step, v0 = c->lo, v1 = c->hi;
     if (c->z) {   // zoomed: round steps inside the band, plus the chart's ends if their labels have room
         float raw = (c->zb - c->za) / 4, p10 = powf(10, floorf(log10f(raw))), q = raw / p10;
         st = (q > 5 ? 10 : q > 2 ? 5 : q > 1 ? 2 : 1) * p10; v0 = ceilf(c->za / st) * st; v1 = c->zb;
     }
-    int yLo = 99999, yHi = -99999;
+    int yLo = 99999, yHi = -99999, yText = 99999;
     for (float v = v0; v <= v1 + 0.01f; v += st) {
         int y = p.bottom - (int)(yfrac(c, v) * (p.bottom - p.top - 1)) - 1;
         line(dc, p.left, y, p.right, y, C_GRID, 1, PS_SOLID);
-        text(dc, fSmall, p.left - S(6), y - S(7), C_DIM, 1, L"%g", v);
+        if (yText - y >= S(13)) { text(dc, fSmall, hs.left - S(4), y - S(7), C_DIM, 1, L"%g", v); yText = y; }   // low chart: skip labels that would overlap
         if (y < yLo) yLo = y; if (y > yHi) yHi = y;
     }
     if (c->z) {
         int yb = p.bottom - 1, yt = p.top;
         line(dc, p.left, yb, p.right, yb, C_GRID, 1, PS_SOLID); line(dc, p.left, yt, p.right, yt, C_GRID, 1, PS_SOLID);
-        if (yb - yHi > S(12)) text(dc, fSmall, p.left - S(6), yb - S(7), C_DIM, 1, L"%g", c->lo);
-        if (yLo - yt > S(12)) text(dc, fSmall, p.left - S(6), yt - S(7), C_DIM, 1, L"%g", c->hi);
+        if (yb - yHi > S(12)) text(dc, fSmall, hs.left - S(4), yb - S(7), C_DIM, 1, L"%g", c->lo);
+        if (yLo - yt > S(12)) text(dc, fSmall, hs.left - S(4), yt - S(7), C_DIM, 1, L"%g", c->hi);
     }
     for (int k = 0; k < 4; k++) {
         if (!c->s[k].g) continue;
@@ -365,9 +438,9 @@ static void tile(HDC dc, RECT r, const wchar_t *label, COLORREF vc, const wchar_
     fill(dc, r, C_CARD, S(10));
     text(dc, fSmall, r.left + S(12), r.top + S(8), C_DIM, 0, L"%s", label);
     text(dc, fValue, r.left + S(12), r.top + S(22), vc, 0, L"%s", value);
-    RECT s = { r.left + S(12), r.bottom - S(20), r.right - S(8), r.bottom };   // cut with … if the tile is narrow
+    RECT s = { r.left + S(12), r.top + S(56), r.right - S(8), r.bottom - S(4) };   // two lines, cut with … only if still too long
     SelectObject(dc, fSmall); SetTextColor(dc, C_DIM);
-    DrawTextW(dc, sub, -1, &s, DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+    DrawTextW(dc, sub, -1, &s, DT_WORDBREAK | DT_END_ELLIPSIS | DT_NOPREFIX | DT_EDITCONTROL);
 }
 
 static void paint(HWND w, HDC dc)
@@ -389,9 +462,12 @@ static void paint(HWND w, HDC dc)
     int stale = (int)(time(0) - cur->t) > 5;
 
     // ---- layout: tiles on top, charts left, events right ----
-    int evW = S(300), tileH = S(80), gap = S(12);
+    int gap = S(12), tileH = S(92);
+    // narrow window: the right column (switches and events) goes, the charts take the width; the switches are in the
+    // tray menu as well. Tiles drop out by importance when they would get narrower than 150 px (0.6.7)
+    int rechts = rc.right >= S(1000), evW = rechts ? S(300) : -gap;
     RECT charts = { pad, pad + tileH + gap + S(30), rc.right - pad - evW - gap, rc.bottom - pad - S(30) };
-    RECT plot = { charts.left + S(34), 0, charts.right, 0 };   // x extent of all plots
+    RECT plot = { charts.left + S(72), 0, charts.right, 0 };   // x extent of all plots (axis labels and side strips on the left)
 
     // sample under the mouse
     const EvoSample *at = cur; int hover = -1;
@@ -408,20 +484,28 @@ static void paint(HWND w, HDC dc)
     if (at->gpuT >= 0) swprintf(v[1], 32, L"%d °C", at->gpuT); else wcscpy(v[1], L"–");
     swprintf(sub[1], 80, T(L"sub_gpu", L"%.0f W · Last %d %%"), at->gpuW, at->gpuLoad);
     if (at->fan >= 0) swprintf(v[2], 32, L"%d %%", at->fan); else wcscpy(v[2], T(L"bios", L"BIOS"));
-    swprintf(sub[2], 80, T(L"sub_fan", L"%d U/min · %s"), at->rpm[0], grundText(at->grund));
+    if (at->rpm[0] >= 0) swprintf(sub[2], 80, T(L"sub_fan", L"%d U/min · %s"), at->rpm[0], grundText(at->grund));
+    else swprintf(sub[2], 80, T(L"sub_fan0", L"Drehzahl noch nicht gelesen · %s"), grundText(at->grund));
     if (at->cap > 0) swprintf(v[3], 32, L"%d MHz", at->cap); else wcscpy(v[3], T(L"cap_aus", L"aus"));
     swprintf(sub[3], 80, T(L"sub_cap", L"Lastart: %s%s"), lageText(at->lage), at->leise ? T(L"leise", L" + EC leise") : L"");
     swprintf(v[4], 32, L"%.0f W", at->pkgW);          swprintf(sub[4], 80, T(L"sub_chip", L"stärkster Kern %.1f W · %d Kerne voll"), at->maxCoreW, at->busy);
-    swprintf(v[5], 32, T(L"v_learn", L"%d Bereiche"), sh->felder); swprintf(sub[5], 80, T(L"sub_learn", L"real %+.1f °C wärmer als Formel"), sh->versatz);
+    swprintf(v[5], 32, T(L"v_learn", L"%d Bereiche"), sh->felder);
+    if (sh->versatz >= 0) swprintf(sub[5], 80, T(L"sub_learn_w", L"Chip läuft %.1f °C wärmer als berechnet"), sh->versatz);
+    else swprintf(sub[5], 80, T(L"sub_learn_k", L"Chip läuft %.1f °C kühler als berechnet"), -sh->versatz);
     // SSD: the composite large (the drive's own limits refer to it), the hottest sensor (controller) below; warm from
     // 70 / 90 °C, hot from the 990 PRO's own warning level 82 °C or a controller at 100 °C
     if (at->ssdT >= 0) swprintf(v[6], 32, L"%d °C", at->ssdT); else wcscpy(v[6], L"–");
-    swprintf(sub[6], 80, T(L"sub_ssd", L"Controller %d °C · System %d U/min"), at->ssdS, at->rpm[2]);
+    if (at->rpm[2] >= 0) swprintf(sub[6], 80, T(L"sub_ssd", L"Controller %d °C · System %d U/min"), at->ssdS, at->rpm[2]);
+    else swprintf(sub[6], 80, T(L"sub_ssd0", L"Controller %d °C · Systemlüfter noch nicht gelesen"), at->ssdS);
     COLORREF ssdC = at->ssdT >= 82 || at->ssdS >= 100 ? C_HOT : at->ssdT >= 70 || at->ssdS >= 90 ? C_WARM : C_TEXT;
-    const wchar_t *labels[7] = { T(L"t_cpu", L"CPU"), T(L"t_gpu", L"Grafik"), T(L"t_fan", L"Lüfter"), T(L"t_cap", L"Taktbremse"), T(L"t_chip", L"Chip gesamt"), T(L"t_learn", L"Gelernte Last-Bereiche"), T(L"t_ssd", L"SSD") };
-    int tw = (rc.right - 2 * pad - 6 * gap) / 7;
-    for (int i = 0; i < 7; i++) {
-        RECT t = { pad + i * (tw + gap), pad, pad + i * (tw + gap) + tw, pad + tileH };
+    const wchar_t *labels[7] = { T(L"t_cpu", L"CPU"), T(L"t_gpu", L"Grafik"), T(L"t_fan", L"Lüfter"), T(L"t_cap", L"Taktbremse"), T(L"t_chip", L"Chip gesamt"), T(L"t_learn2", L"Lernmodell"), T(L"t_ssd", L"SSD") };
+    static const int tPrio[7] = { 0, 2, 1, 3, 6, 4, 5 };   // CPU, fan, GPU, clock brake, SSD, whole chip, learned model
+    int nt = (rc.right - 2 * pad + gap) / (S(150) + gap); nt = nt < 3 ? 3 : nt > 7 ? 7 : nt;
+    int tShow[7] = { 0 }; for (int j = 0; j < nt; j++) tShow[tPrio[j]] = 1;
+    int tw = (rc.right - 2 * pad - (nt - 1) * gap) / nt;
+    for (int i = 0, slot = 0; i < 7; i++) {
+        if (!tShow[i]) continue;
+        RECT t = { pad + slot * (tw + gap), pad, pad + slot * (tw + gap) + tw, pad + tileH }; slot++;
         tile(dc, t, labels[i], i == 0 ? tc : i == 6 ? ssdC : at->grund == GRUND_NOTFALL && i == 2 ? C_HOT : at->grund == GRUND_ACHTUNG && i == 2 ? C_WARM : C_TEXT, v[i], sub[i]);
     }
 
@@ -441,7 +525,7 @@ static void paint(HWND w, HDC dc)
         if (status) wcsncpy(st, status, 199), st[199] = 0;
         else {
             struct tm lt; time_t tt = (time_t)at->t; localtime_s(&lt, &tt);
-            swprintf(st, 200, T(L"status", L"%s%02d:%02d:%02d · Taktbremse gelernt – wenige %d · viele %d · Grafik %d · Grafik + viele %d MHz"),
+            swprintf(st, 200, T(L"status2", L"%s%02d:%02d:%02d · gelernte Taktgrenzen: wenige Kerne %d · viele %d · Grafik %d · Grafik + viele %d MHz"),
                      hover >= 0 ? T(L"maus", L"Mauszeiger ") : L"", lt.tm_hour, lt.tm_min, lt.tm_sec, sh->deckel[0], sh->deckel[1], sh->deckel[2], sh->deckel[3]);
         }
         RECT sr = { bx + S(6), by + S(4), sx, by + S(22) };
@@ -459,22 +543,34 @@ static void paint(HWND w, HDC dc)
     tmax = (float)((int)((tmax + 9.99f) / 10) * 10); tmin = (float)((int)(tmin / 10) * 10);
     const wchar_t *lIst = T(L"l_ist", L"Ist (aus Drehzahl)"), *lEc = T(L"l_ecfan", L"EC-Kurve (mit Aufschlag)"), *lSoll = T(L"l_soll", L"Soll");
     Chart cs[6] = {
-        { T(L"c_temp", L"Temperatur °C"), tmin, tmax, 10, { { gVorh, C_DIM, 1, T(L"l_erwartet", L"erwartet") }, { gEc, C_WARM, 1, T(L"l_ec", L"Gehäuse-Fühler (EC)") },
+        { T(L"c_temp2", L"Temperatur (°C)"), tmin, tmax, 10, { { gVorh, C_DIM, 1, T(L"l_erwartet", L"erwartet") }, { gEc, C_WARM, 1, T(L"l_ec", L"Gehäuse-Fühler (EC)") },
                                            { gTctl, C_RAW, 1, T(L"l_roh", L"CPU roh") }, { gGlatt, C_HOT, S(2), T(L"l_glatt", L"CPU geglättet (Regelgröße)") } } },
-        { T(L"c_power", L"Leistung W"), 0, pmax, pmax / 4, { { gPkg, C_PKG, 1, T(L"l_chip", L"ganzer Chip") }, { gGpu, RGB(165, 124, 255), S(2), T(L"l_gpu", L"Grafik") },
+        { T(L"c_power2", L"Leistung (W)"), 0, pmax, pmax / 4, { { gPkg, C_PKG, 1, T(L"l_chip", L"ganzer Chip") }, { gGpu, RGB(165, 124, 255), S(2), T(L"l_gpu", L"Grafik") },
                                               { gCore, RGB(78, 161, 255), S(2), T(L"l_kerne", L"Kerne") } } },
-        { T(L"c_clock", L"CPU-Takt MHz"), 0, 6000, 1500, { { gMhz, C_MHZ, 1, T(L"l_kern", L"schnellster Kern (Mittel je Sekunde)") }, { gCap, C_CAP, S(2), T(L"l_bremse", L"Taktbremse") } } },
+        { T(L"c_clock2", L"CPU-Takt (MHz)"), 0, 6000, 1500, { { gMhz, C_MHZ, 1, T(L"l_kern", L"schnellster Kern (Mittel je Sekunde)") }, { gCap, C_CAP, S(2), T(L"l_bremse", L"Taktbremse") } } },
         // one chart per fan at the bottom, smaller: CPU fans 1 and 2 share the curve (block 0x60), the system fan has its own (0x66)
-        { T(L"c_fan1", L"CPU-Lüfter 1 %"), 0, 100, 50, { { gRpm1, C_RPM, 1, lIst }, { gEcFan, C_WARM, 1, lEc }, { gFan, C_FAN, S(2), lSoll } } },
-        { T(L"c_fan2", L"CPU-Lüfter 2 %"), 0, 100, 50, { { gRpm2, C_RPM, 1, lIst }, { gEcFan, C_WARM, 1, lEc }, { gFan, C_FAN, S(2), lSoll } } },
-        { T(L"c_fan3", L"Systemlüfter (SSD, WLAN) %"), 0, 100, 50, { { gRpm3, C_RPM, 1, lIst }, { gSysEc, C_WARM, 1, lEc }, { gSysFan, C_FAN, S(2), lSoll } } },
+        { T(L"c_fan1b", L"CPU-Lüfter 1 (%)"), 0, 100, 50, { { gRpm1, C_RPM, 1, lIst }, { gEcFan, C_WARM, 1, lEc }, { gFan, C_FAN, S(2), lSoll } } },
+        { T(L"c_fan2b", L"CPU-Lüfter 2 (%)"), 0, 100, 50, { { gRpm2, C_RPM, 1, lIst }, { gEcFan, C_WARM, 1, lEc }, { gFan, C_FAN, S(2), lSoll } } },
+        { T(L"c_fan3b", L"Systemlüfter für SSD und WLAN (%)"), 0, 100, 50, { { gRpm3, C_RPM, 1, lIst }, { gSysEc, C_WARM, 1, lEc }, { gSysFan, C_FAN, S(2), lSoll } } },
     };
+    stripTipOn = 0;
     const float minW[6] = { 8, pmax / 6, 800, 15, 15, 15 };   // narrowest zoomed band: °C, W, MHz, %
     for (int i = 0; i < 6; i++) { cs[i].minW = minW[i]; zoom_setup(&cs[i]); }
     static const int weight[6] = { 3, 3, 3, 2, 2, 2 };   // the three fan charts get 2/3 of the height of the others
-    int unit = (charts.bottom - charts.top - 5 * gap) / 15, cy = charts.top;
+    // a low window drops charts, the least important first: CPU fan 2 (same curve as fan 1), system fan, clock, CPU fan 1;
+    // each chart keeps at least 70 px (fans 50 px), so what is shown stays readable (0.6.7)
+    static const int prio[6] = { 0, 1, 3, 2, 5, 4 };
+    int show[6] = { 0 }, avail = charts.bottom - charts.top, need = 0, units = 0, nShow = 0, last = 0;
+    for (int j = 0; j < 6; j++) {
+        int i = prio[j], m = (weight[i] == 3 ? S(70) : S(50)) + (need ? gap : 0);
+        if (need + m > avail && j > 0) break;
+        need += m; show[i] = 1;
+    }
+    for (int i = 0; i < 6; i++) if (show[i]) { units += weight[i]; nShow++; last = i; }
+    int unit = (avail - (nShow - 1) * gap) / units, cy = charts.top;
     for (int i = 0; i < 6; i++) {
-        RECT r = { charts.left, cy, charts.right, i == 5 ? charts.bottom : cy + weight[i] * unit };
+        if (!show[i]) continue;
+        RECT r = { charts.left, cy, charts.right, i == last ? charts.bottom : cy + weight[i] * unit };
         cy = r.bottom + gap;
         chart(dc, r, &cs[i]);
         if (i == 0) {   // dashed lines: target, clock brake, attention, alarm; labels side by side so they do not overlap
@@ -486,7 +582,10 @@ static void paint(HWND w, HDC dc)
             for (int j = 0; j < 4; j++) {
                 int yy = p.bottom - 1 - (int)(yfrac(&cs[0], lv[j]) * (p.bottom - p.top - 2));
                 line(dc, p.left, yy, p.right, yy, lcol[j], 1, PS_DASH);
-                lx += text(dc, fSmall, lx, yy - S(15), lcol[j], 0, L"%s", lname[j]) + S(10);
+                SelectObject(dc, fSmall); SIZE ls; GetTextExtentPoint32W(dc, lname[j], (int)wcslen(lname[j]), &ls);
+                RECT lb = { lx - S(3), yy - S(16), lx + ls.cx + S(3), yy - S(2) };   // on a small card: readable on top of the lines
+                fill(dc, lb, C_CARD, S(3));
+                lx += text(dc, fSmall, lx, yy - S(16), lcol[j], 0, L"%s", lname[j]) + S(12);
             }
         }
     }
@@ -511,6 +610,16 @@ static void paint(HWND w, HDC dc)
     int lx = charts.left;
     text(dc, fSmall, lx, strip.top - S(5), C_DIM, 0, L"%s", T(L"lastart", L"Lastart"));
 
+    // ---- tooltip of a distribution strip (set by chart() when the mouse is over one) ----
+    if (stripTipOn) {
+        int tw3 = 0; SelectObject(dc, fSmall);
+        for (int i = 0; i < 3; i++) { SIZE sz; GetTextExtentPoint32W(dc, stripTip[i], (int)wcslen(stripTip[i]), &sz); if (sz.cx > tw3) tw3 = sz.cx; }
+        RECT box = { mouseX + S(14), mouseY + S(12), mouseX + S(14) + tw3 + S(20), mouseY + S(12) + 3 * S(16) + S(14) };
+        if (box.bottom > rc.bottom - pad) OffsetRect(&box, 0, -(box.bottom - box.top) - S(24));
+        fill(dc, box, C_TIP, S(8));
+        for (int i = 0; i < 3; i++) text(dc, fSmall, box.left + S(10), box.top + S(7) + i * S(16), i ? C_TEXT : C_DIM, 0, L"%s", stripTip[i]);
+    }
+
     // ---- hover line and tooltip ----
     if (hover >= 0) {
         int x = xOf(plot, (uint32_t)hover);
@@ -530,6 +639,10 @@ static void paint(HWND w, HDC dc)
         for (int i = 0; i < 4; i++) text(dc, fSmall, box.left + S(10), box.top + S(7) + i * S(16), C_TEXT, 0, L"%s", tip[i]);
     }
 
+    if (!rechts) {   // narrow window: no right column, and nothing of it stays clickable
+        memset(sw, 0, sizeof sw); memset(stMinus, 0, sizeof stMinus); memset(stPlus, 0, sizeof stPlus); SetRectEmpty(&btnZoom);
+        return;
+    }
     // ---- switches: single functions on/off (a click writes einstellungen.ini) ----
     RECT sc = { rc.right - pad - evW, pad + tileH + gap, rc.right - pad, pad + tileH + gap + S(164) + EVO_NFUNK * S(28) + S(28) };
     fill(dc, sc, C_CARD, S(10));
@@ -691,6 +804,7 @@ static void stop_all(HWND w)
         MessageBoxW(w, T(L"m_alles_err", L"Keine Rechte, den Regler zu beenden. In einer Admin-Shell: evo-x2-cool --stopp"), L"EVO-X2-COOL", MB_ICONWARNING);
         return;
     }
+    endeGrund = "tray menu: exit all";
     DestroyWindow(w);
 }
 
@@ -711,6 +825,7 @@ static void tray_menu(HWND w)
     wchar_t zt[48]; swprintf(zt, 48, T(L"z_menu", L"Zieltemperatur (%.0f °C)"), cur_ziel());
     AppendMenuW(m, MF_POPUP | off, (UINT_PTR)zm, zt);
     AppendMenuW(m, MF_SEPARATOR, 0, 0);
+    AppendMenuW(m, MF_STRING, 104, T(L"m_logs", L"Logs speichern (ZIP auf dem Desktop)"));
     AppendMenuW(m, MF_STRING, 101, T(L"m_ende", L"Beenden (Regler läuft weiter)"));
     AppendMenuW(m, MF_STRING | (sh ? 0 : MF_GRAYED), 102, T(L"m_alles", L"Alles beenden (auch den Regler)"));
     POINT p; GetCursorPos(&p);
@@ -719,9 +834,10 @@ static void tray_menu(HWND w)
     PostMessageW(w, WM_NULL, 0, 0);
     DestroyMenu(m);
     if (id == 100) show_window(w, !visible);
-    else if (id == 101) DestroyWindow(w);
+    else if (id == 101) { endeGrund = "tray menu: exit"; DestroyWindow(w); }
     else if (id == 102) stop_all(w);
     else if (id == 103) open_releases();
+    else if (id == 104 && !logsLaeuft) CloseHandle(CreateThread(0, 0, logs_thread, w, 0, 0));
     else if (id >= 300) set_ziel(w, (float)(id - 300));
     else if (id >= 200) toggle_funk(w, id - 200);
 }
@@ -773,6 +889,69 @@ static DWORD WINAPI update_thread(void *w)
 
 static void open_releases(void) { ShellExecuteW(0, L"open", RELEASES, 0, 0, SW_SHOWNORMAL); }
 
+// own small log of the window (%LOCALAPPDATA%\evo-x2-cool\anzeige.txt): when it starts and why it ends. On 30.10. a
+// taskbar button stayed without a program behind it, and nothing told when or how the window had ended (0.6.7)
+static const char *endeGrund = "unknown (process ended without WM_DESTROY?)";
+static void anz_log(const char *fmt, ...)
+{
+    wchar_t pfad[MAX_PATH]; char text[200], line[240]; va_list a;
+    ExpandEnvironmentStringsW(L"%LOCALAPPDATA%\\evo-x2-cool", pfad, MAX_PATH);
+    CreateDirectoryW(pfad, 0);
+    wcscat(pfad, L"\\anzeige.txt");
+    va_start(a, fmt); vsnprintf(text, sizeof text, fmt, a); va_end(a);
+    SYSTEMTIME st; GetLocalTime(&st);
+    int n = snprintf(line, sizeof line, "%04d-%02d-%02d %02d:%02d:%02d  pid %lu  %s\r\n", st.wYear, st.wMonth, st.wDay, st.wHour,
+                     st.wMinute, st.wSecond, GetCurrentProcessId(), text);
+    HANDLE f = CreateFileW(pfad, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, 0, OPEN_ALWAYS, 0, 0);
+    if (f != INVALID_HANDLE_VALUE) { DWORD w; WriteFile(f, line, (DWORD)n, &w, 0); CloseHandle(f); }
+}
+
+// "save logs": the same as the PowerShell command in the README, run hidden, the ZIP lands on the desktop and is shown
+// in Explorer. The controller keeps writing today's file, so the files are copied with shared read first (0.6.7)
+static const char LOGS_PS[] =
+    "$d = \"$env:ProgramData\\evo-x2-cool\"; $t = \"$env:TEMP\\evo-x2-cool-logs\"\r\n"
+    "$z = Join-Path ([Environment]::GetFolderPath('Desktop')) 'evo-x2-cool-logs.zip'\r\n"
+    "New-Item -ItemType Directory -Force $t | Out-Null; Remove-Item \"$t\\*\" -ErrorAction SilentlyContinue\r\n"
+    "Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName='ACPI'; Id=13} -MaxEvents 500 -ErrorAction SilentlyContinue |\r\n"
+    "  Select-Object TimeCreated | Export-Csv \"$t\\acpi13.csv\" -NoTypeInformation\r\n"
+    "@(\"$d\\ereignisse.txt\", \"$d\\modell.txt\", \"$d\\einstellungen.ini\", \"$env:LOCALAPPDATA\\evo-x2-cool\\anzeige.txt\") +\r\n"
+    "  (Get-ChildItem \"$d\\regler-*.csv\" | Sort-Object Name | Select-Object -Last 3).FullName |\r\n"
+    "  Where-Object { $_ -and (Test-Path $_) } | ForEach-Object {\r\n"
+    "    $in = [IO.File]::Open($_, 'Open', 'Read', 'ReadWrite'); $out = [IO.File]::Create(\"$t\\\" + (Split-Path $_ -Leaf))\r\n"
+    "    $in.CopyTo($out); $out.Close(); $in.Close() }\r\n"
+    "Compress-Archive -Path \"$t\\*\" -DestinationPath $z -Force\r\n"
+    "if (-not (Test-Path $z)) { exit 1 }\r\n";
+static DWORD WINAPI logs_thread(void *p)
+{
+    HWND w = (HWND)p;
+    wchar_t ps[MAX_PATH], cmd[MAX_PATH + 128], zip[MAX_PATH], arg[MAX_PATH + 32];
+    InterlockedExchange(&logsLaeuft, 1); if (w) InvalidateRect(w, 0, FALSE);
+    GetTempPathW(MAX_PATH, ps); wcscat(ps, L"evo-x2-cool-logs.ps1");
+    HANDLE f = CreateFileW(ps, GENERIC_WRITE, 0, 0, CREATE_ALWAYS, 0, 0);
+    if (f == INVALID_HANDLE_VALUE) { InterlockedExchange(&logsLaeuft, 0); return 1; }
+    DWORD n; WriteFile(f, LOGS_PS, sizeof LOGS_PS - 1, &n, 0); CloseHandle(f);
+    swprintf(cmd, MAX_PATH + 128, L"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"%s\"", ps);
+    STARTUPINFOW si = { sizeof si }; PROCESS_INFORMATION pi; DWORD rc = 1;
+    if (CreateProcessW(0, cmd, 0, 0, FALSE, CREATE_NO_WINDOW, 0, 0, &si, &pi)) {
+        WaitForSingleObject(pi.hProcess, 120000); GetExitCodeProcess(pi.hProcess, &rc);
+        CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+    }
+    DeleteFileW(ps);
+    PWSTR desk = 0;
+    if (rc == 0 && SHGetKnownFolderPath(&FOLDERID_Desktop, 0, 0, &desk) == S_OK) {
+        swprintf(zip, MAX_PATH, L"%s\\evo-x2-cool-logs.zip", desk);
+        swprintf(arg, MAX_PATH + 32, L"/select,\"%s\"", zip);
+        ShellExecuteW(0, L"open", L"explorer.exe", arg, 0, SW_SHOWNORMAL);
+        anz_log("logs saved to the desktop");
+    } else {
+        MessageBoxW(w, T(L"logs_err", L"Die Logs konnten nicht gespeichert werden."), L"EVO-X2-COOL", MB_ICONWARNING);
+        anz_log("saving the logs failed (exit code %lu)", rc);
+    }
+    CoTaskMemFree(desk);
+    InterlockedExchange(&logsLaeuft, 0); if (w) InvalidateRect(w, 0, FALSE);
+    return rc;
+}
+
 static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp)
 {
     switch (m) {
@@ -799,13 +978,14 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         InvalidateRect(w, 0, FALSE); return 0;
     }
     case WM_MOUSELEAVE: mouseX = mouseY = -1; InvalidateRect(w, 0, FALSE); return 0;
-    case WM_GETMINMAXINFO: {   // below this the charts get too narrow next to the fixed right column
-        MINMAXINFO *mm = (MINMAXINFO *)lp; mm->ptMinTrackSize.x = S(900); mm->ptMinTrackSize.y = S(700); return 0;
+    case WM_GETMINMAXINFO: {   // below this even the narrow layout (no right column, fewer tiles and charts) gets cramped
+        MINMAXINFO *mm = (MINMAXINFO *)lp; mm->ptMinTrackSize.x = S(640); mm->ptMinTrackSize.y = S(480); return 0;
     }
     case WM_LBUTTONDOWN: {
         POINT p = { (short)LOWORD(lp), (short)HIWORD(lp) };
         for (int i = 0; i < 4; i++) if (PtInRect(&btn[i], p)) { spanIdx = i; InvalidateRect(w, 0, FALSE); }
         if (PtInRect(&btnUpdate, p)) open_releases();
+        if (PtInRect(&btnLogs, p) && !logsLaeuft) CloseHandle(CreateThread(0, 0, logs_thread, w, 0, 0));
         if (PtInRect(&btnZoom, p)) { zoom = !zoom; WritePrivateProfileStringW(L"Anzeige", L"Zoom", zoom ? L"1" : L"0", iniFile); InvalidateRect(w, 0, FALSE); }
         if (PtInRect(&btnThema, p) || PtInRect(&btnSprache, p)) {
             int ok;
@@ -860,8 +1040,10 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         InvalidateRect(w, 0, FALSE); return 0;
     }
     // closing ends the viewer: a hidden window could not be brought back from a taskbar pin (30.10., clicks did nothing)
-    case WM_CLOSE: case WM_ENDE: DestroyWindow(w); return 0;
-    case WM_DESTROY: Shell_NotifyIconW(NIM_DELETE, &tray); PostQuitMessage(0); return 0;
+    case WM_CLOSE: endeGrund = "window closed (X)"; DestroyWindow(w); return 0;
+    case WM_ENDE: endeGrund = "asked by the installer"; DestroyWindow(w); return 0;
+    case WM_ENDSESSION: if (wp) anz_log("ends: Windows logs off or shuts down"); return 0;
+    case WM_DESTROY: anz_log("ends: %s", endeGrund); Shell_NotifyIconW(NIM_DELETE, &tray); PostQuitMessage(0); return 0;
     }
     if (m == msgTaskbar && m) { tray_add(w); return 0; }
     return DefWindowProcW(w, m, wp, lp);
@@ -870,8 +1052,15 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp)
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 {
     (void)prev;
+    if (cmd && wcsstr(cmd, L"--logs")) { ExpandEnvironmentStringsW(EVO_INI, iniFile, MAX_PATH); load_lang(); return (int)logs_thread(0); }   // only save the logs
     HWND old = FindWindowW(L"evo-x2-cool-front", 0);   // already running: bring it to the front instead of a second copy
-    if (old) { DWORD pid; GetWindowThreadProcessId(old, &pid); AllowSetForegroundWindow(pid); PostMessageW(old, WM_ZEIGEN, 0, 0); return 0; }
+    if (old) {
+        DWORD pid; GetWindowThreadProcessId(old, &pid); AllowSetForegroundWindow(pid);
+        BOOL ok = PostMessageW(old, WM_ZEIGEN, 0, 0);
+        anz_log("second start: asked window of pid %lu to show itself (%s)", pid, ok ? "sent" : "sending failed");
+        return 0;
+    }
+    anz_log("start " EVO_VERSION "%s", cmd && wcsstr(cmd, L"--leiste") ? " (--leiste, icon only)" : "");
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     ULONG_PTR gdipToken; GpStartupInput gin = { 1, 0, FALSE, TRUE };   // only for anti-aliased round corners (fill)
     GdiplusStartup(&gdipToken, &gin, 0);

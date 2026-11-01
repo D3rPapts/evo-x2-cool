@@ -36,9 +36,11 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <winevt.h>
 #include "evo.h"
 #pragma comment(lib, "powrprof.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "wevtapi.lib")
 
 #define PIO_LOAD 0xA1B22084u   // (41394 << 16) | (0x821 << 2)
 #define PIO_EXEC 0xA1B22104u   // (41394 << 16) | (0x841 << 2)
@@ -322,6 +324,36 @@ static void event2(int wichtig, const char *fmt, ...)
     append(L"ereignisse.txt", line);
     if (sh) { EvoEvent *e = &sh->e[sh->nEvent % EVO_EV]; e->t = time(0); e->wichtig = (uint8_t)wichtig; memcpy(e->text, text, sizeof text); sh->nEvent++; }
     if (GetConsoleWindow()) printf("\n%s", line);
+}
+
+// Windows' "EC did not respond within the timeout" (ACPI event 13) goes into the event list with its own time, so
+// shared logs show it next to the controller's EC accesses (0.6.7). Looked up every 30 s in the system log (last 2 min),
+// each event once (record numbers only grow)
+static void acpi13_pruefen(void)
+{
+    static ULONGLONG letzte;
+    static __declspec(align(8)) BYTE puffer[8192];
+    EVT_HANDLE q = EvtQuery(0, L"System", L"*[System[Provider[@Name='ACPI'] and EventID=13 and TimeCreated[timediff(@SystemTime) <= 120000]]]",
+                            EvtQueryChannelPath | EvtQueryForwardDirection);
+    if (!q) return;
+    EVT_HANDLE ctx = EvtCreateRenderContext(0, 0, EvtRenderContextSystem), ev[8];
+    DWORD n = 0;
+    while (ctx && EvtNext(q, 8, ev, 0, 0, &n)) {
+        for (DWORD i = 0; i < n; i++) {
+            DWORD used = 0, cnt = 0;
+            PEVT_VARIANT v = (PEVT_VARIANT)puffer;
+            if (EvtRender(ctx, ev[i], EvtRenderEventValues, sizeof puffer, puffer, &used, &cnt) && v[EvtSystemEventRecordId].UInt64Val > letzte) {
+                letzte = v[EvtSystemEventRecordId].UInt64Val;
+                ULONGLONG t = v[EvtSystemTimeCreated].FileTimeVal;
+                FILETIME ft = { (DWORD)t, (DWORD)(t >> 32) }, lt; SYSTEMTIME st;
+                FileTimeToLocalFileTime(&ft, &lt); FileTimeToSystemTime(&lt, &st);
+                event(L_("acpi13", "Windows: EC hat nicht geantwortet (ACPI-Ereignis 13) um %02d:%02d:%02d"), st.wHour, st.wMinute, st.wSecond);
+            }
+            EvtClose(ev[i]);
+        }
+    }
+    if (ctx) EvtClose(ctx);
+    EvtClose(q);
 }
 
 static void csv_line(const char *line)
@@ -636,8 +668,8 @@ static int run(void)
     }
     if (nurLesen) event(L_("start_nurlesen", "Start: nur lesen, es wird nichts gesteuert"));
     else {
-        event(L_("start", "Start: Ziel %.0f °C, Achtung %d °C, Alarm %d °C, Lüfter %d–%d %%, Taktbremse ab %d °C, gelernt: %d Bereiche, %+.1f °C"),
-              ziel, achtung, alarm, minP, maxP, spitze, felder(), versatz);
+        event(L_("start", "Start %s: Ziel %.0f °C, Achtung %d °C, Alarm %d °C, Lüfter %d–%d %%, Taktbremse ab %d °C, gelernt: %d Bereiche, %+.1f °C"),
+              EVO_VERSION, ziel, achtung, alarm, minP, maxP, spitze, felder(), versatz);
         for (int i = 0; i < EVO_NFUNK; i++) if (!(fn >> i & 1)) event(L_("f_aus", "%s ist ausgeschaltet"), funk_text(i));
         event(L_("bios", "BIOS-Lüfterkurve gesichert (%d/%d/%d °C), kommt beim Beenden zurück"),
               orig[1], orig[2], orig[3]);
@@ -760,6 +792,7 @@ static int run(void)
         mFast += ((float)maxW - mFast) / 3; mSlow += ((float)maxW - mSlow) / 20;
         if (Te >= 0) emaTe += (Te - emaTe) / 10;   // the EC temperature jumps by 15 °C within seconds; the anchor follows slowly
 
+        if (k % 30 == 25) acpi13_pruefen();
         // --- settings file changed? (checked every 5 s, a cheap time stamp compare) ---
         if (k % 5 == 0) {
             FILETIME t = ini_time();
@@ -780,12 +813,17 @@ static int run(void)
         // a GPU pause under a minute stays "GPU": an image job on machine 2 switched GPU <-> few cores every ~10 s for
         // minutes, and each switch moved the clock cap 3300 <-> 3600 MHz
         // in a GPU pause many busy cores with real power count as "GPU + many cores" too: on 30.10. 11:46 the GPU rested
-        // while the cores drew 57 W, the situation stayed "GPU" (cap 3300 MHz) and Tctl reached 97.8 °C (0.6.6)
-        int lg = G > 20 || nachlauf || k < grafikBis ? (busy > 4 && (G > 20 || sumW > 15) ? LAGE_BEIDE : LAGE_GRAFIK) : busy > 4 ? LAGE_VIELE : LAGE_WENIGE;
+        // while the cores drew 57 W, the situation stayed "GPU" (cap 3300 MHz) and Tctl reached 97.8 °C (0.6.6).
+        // In above 15 W, out only below 10 W: with one limit the situation flipped 28 times an hour (0.6.7)
+        float kernW = lageNow == LAGE_BEIDE ? 10.0f : 15.0f;
+        int lg = G > 20 || nachlauf || k < grafikBis ? (busy > 4 && (G > 20 || sumW > kernW) ? LAGE_BEIDE : LAGE_GRAFIK) : busy > 4 ? LAGE_VIELE : LAGE_WENIGE;
         // a situation with a lower cap counts at once, one with a higher or the same cap only after 10 s: a few busy
         // threads that come and go must not flip the cap (and the EC mode) every second; with the same cap machine 2
         // switched "GPU + many cores" <-> "GPU" every second and filled the log
-        if (lageNow >= 0 && lg != lageNow && lage[lg].stufe >= lage[lageNow].stufe && ++locker < 10) lg = lageNow;
+        // A higher cap waits 60 s (0.6.7): with 10 s the GPU work of image/video jobs flipped "GPU" <-> "GPU + many cores"
+        // every ~10 s (busy cores come and go), 32 situation and 22 cap changes an hour on .198, 381 a day on .56
+        if (lageNow >= 0 && lg != lageNow && lage[lg].stufe >= lage[lageNow].stufe
+            && ++locker < (lage[lg].stufe > lage[lageNow].stufe ? 60 : 10)) lg = lageNow;
         else locker = 0;
         if (lg != lageNow) { lage[lg].spitze = (int)T; if (lageNow >= 0 && !nurLesen) event(L_("lastart", "Lastart jetzt: %s"), lage_text(lg)); lageNow = lg; }
         else if (T > lage[lg].spitze) lage[lg].spitze = (int)T;
