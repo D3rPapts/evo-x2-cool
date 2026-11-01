@@ -790,7 +790,8 @@ static void tray_update(void)   // once per second; talks to explorer only when 
 static void show_window(HWND w, int show)
 {
     if (show) { ShowWindow(w, IsIconic(w) ? SW_RESTORE : SW_SHOW); SetForegroundWindow(w); InvalidateRect(w, 0, FALSE); }
-    else { ShowWindow(w, SW_MINIMIZE); SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1); }   // give the drawing memory back
+    // hidden, not minimized: no taskbar button, only the icon next to the clock stays (0.6.8)
+    else { ShowWindow(w, SW_HIDE); SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1); }   // give the drawing memory back
 }
 
 // ends the controller as well (service or not): it puts the BIOS fan curve back, keeps the safe clock cap, then exits
@@ -1040,7 +1041,9 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         InvalidateRect(w, 0, FALSE); return 0;
     }
     // closing ends the viewer: a hidden window could not be brought back from a taskbar pin (30.10., clicks did nothing)
-    case WM_CLOSE: endeGrund = "window closed (X)"; DestroyWindow(w); return 0;
+    // X hides the window and keeps the icon next to the clock (Fabian 01.11.: since 0.6.6 X ended everything and the icon
+    // was gone); really ending is in the icon's menu. Windows logging off still ends it through WM_ENDSESSION/WM_DESTROY
+    case WM_CLOSE: anz_log("window hidden (X), icon stays"); show_window(w, 0); return 0;
     case WM_ENDE: endeGrund = "asked by the installer"; DestroyWindow(w); return 0;
     case WM_ENDSESSION: if (wp) anz_log("ends: Windows logs off or shuts down"); return 0;
     case WM_DESTROY: anz_log("ends: %s", endeGrund); Shell_NotifyIconW(NIM_DELETE, &tray); PostQuitMessage(0); return 0;
