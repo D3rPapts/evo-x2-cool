@@ -75,6 +75,8 @@ Name: "{commonstartup}\EVO-X2-COOL"; Filename: "{app}\evo-x2-cool-front.exe"; Pa
 Filename: "{tmp}\PawnIO_setup.exe"; Parameters: "-install"; StatusMsg: "{cm:StatusPawnIO}"; Check: not PawnIOInstalled
 Filename: "{app}\evo-x2-cool.exe"; Parameters: "--installieren"; StatusMsg: "{cm:StatusDienst}"; Flags: runhidden waituntilterminated; Tasks: dienst
 Filename: "{app}\evo-x2-cool-front.exe"; Description: "{cm:Oeffnen}"; Flags: postinstall nowait skipifsilent runasoriginaluser
+; an update (also /VERYSILENT) ended the running window: back to the tray, as before (0.6.8; on 01.11. the icon stayed away)
+Filename: "{app}\evo-x2-cool-front.exe"; Parameters: "--leiste"; Flags: nowait runasoriginaluser; Check: AnzeigeNeuStarten
 
 [UninstallRun]
 Filename: "{sys}\taskkill.exe"; Parameters: "/im evo-x2-cool-front.exe /f"; Flags: runhidden; RunOnceId: "front"
@@ -82,6 +84,14 @@ Filename: "{app}\evo-x2-cool.exe"; Parameters: "--entfernen"; Flags: runhidden w
 Filename: "{app}\evo-x2-cool.exe"; Parameters: "--stopp"; Flags: runhidden waituntilterminated; RunOnceId: "stopp"
 
 [Code]
+var
+  AnzeigeLief: Boolean;   // the window was running before the update: start it again in the tray afterwards, also when silent
+
+function AnzeigeNeuStarten: Boolean;
+begin
+  Result := AnzeigeLief;
+end;
+
 function PawnIOInstalled: Boolean;
 begin
   Result := RegKeyExists(HKLM64, 'SYSTEM\CurrentControlSet\Services\PawnIO');
@@ -99,6 +109,7 @@ begin
   exe := ExpandConstant('{tmp}\evo-x2-cool.exe');
   // ask the window to end itself first (WM_APP + 4): a killed one leaves a dead icon next to the clock
   wnd := FindWindowByClassName('evo-x2-cool-front');
+  AnzeigeLief := wnd <> 0;
   if wnd <> 0 then begin PostMessage(wnd, $8004, 0, 0); Sleep(1500); end;
   Exec(ExpandConstant('{sys}\taskkill.exe'), '/im evo-x2-cool-front.exe /f', '', SW_HIDE, ewWaitUntilTerminated, rc);
   Exec(exe, '--entfernen', '', SW_HIDE, ewWaitUntilTerminated, rc);
