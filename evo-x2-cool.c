@@ -917,7 +917,10 @@ static int run(void)
         // renews the hold, so bursts every 20-30 s keep the fan steady instead of pumping 30 <-> 70 % (machine 2, 01.11.
         // 14:20). Afterwards it goes down slowly, and the model or the emergency still raise it further when needed.
         static float h1, h2; static int sprungHalt;
-        int sprung = sprungW > 0 && k > 3 && heat >= dauerW && heat - h2 >= sprungW;
+        // measured against the higher of 2 s ago and the 20-s average: under steady GPU load (27B at ~85 W) the power dips for
+        // a second or two between requests and comes back, which is no new heat (.198, 01.11. 15:38-15:55: fan to 75 % every
+        // few minutes at 74 °C)
+        int sprung = sprungW > 0 && k > 3 && heat >= dauerW && heat - fmaxf(h2, pSlow) >= sprungW;
         h2 = h1; h1 = heat;
         if (sprung && sprungHalt == 0 && !nurLesen && (fn & F_LUEFTER)) event(L_("sprung", "Leistungssprung auf %.0f W: Lüfter sofort %d %%"), heat, sprungP);
         if (sprung) sprungHalt = 20; else if (sprungHalt > 0) sprungHalt--;
