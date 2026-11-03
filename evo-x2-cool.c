@@ -48,7 +48,7 @@
 #define SVC L"evo-x2-cool"
 
 // ---------- settings (einstellungen.ini) ----------
-static float ziel = 80; static int minP = 30, minLeer = 10, maxP = 70, spitze = 88, achtung = 90, alarm = 95, sicherMhz = 3600, taktPlus, nurLesen;
+static float ziel = 80; static int minP = 30, minLeer = 10, maxP = 70, spitze = 88, achtung = 90, alarm = 95, sicherMhz = 3600, taktPlus, nurLesen, ohneEc;
 static int minDauer = 45, dauerW = 70;   // fan floor under lasting high load (0 = off), and from how many watts
 static int sprungW = 50, sprungP = 75;   // power jump within 2 s that sends the fan straight to sprungP % (0 = off)
 static unsigned fn = F_ALLE;   // functions switched on
@@ -206,6 +206,7 @@ static int ec_lock(void) { return WaitForSingleObject(mEc, 500) <= WAIT_ABANDONE
 
 static int ec_read(uint8_t reg)
 {
+    if (ohneEc) return -1;   // --ohne-ec: never touch the EC (Tctl, power and GPU only)
     for (int t = 0; t < 3; t++) {
         if (ec_lock()) { int v = ec_read_raw(reg); ReleaseMutex(mEc); if (v >= 0) return v; }
         Sleep(20);
@@ -1112,6 +1113,7 @@ int wmain(int argc, wchar_t **argv)
     for (int i = 1; i < argc; i++) {
         const wchar_t *a = argv[i];
         if (!wcscmp(a, L"--nur-lesen")) nurLesen = 1;
+        else if (!wcscmp(a, L"--ohne-ec")) nurLesen = ohneEc = 1;   // measure without any EC access, e.g. to test whether ACPI 13 comes without us
         else if (!wcscmp(a, L"--dienst")) dienst = 1;
         else if (!wcscmp(a, L"--installieren")) inst = 1;
         else if (!wcscmp(a, L"--entfernen")) return uninstall();
