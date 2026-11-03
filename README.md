@@ -28,7 +28,7 @@ There was no way to control the fans of this machine under Windows, so we built 
 
 EVO-X2-COOL watches the chip every second, predicts where the temperature is heading, and:
 
-- **controls the fans** through the fan curve inside the EC: as quiet as possible while the predicted end temperature stays below the target (default 80 °C). Rising power is counted ahead, but only while it still rises and never beyond the measured power; far below the target the fan ramps up slowly, so a short burst stays quiet. Under **lasting high load** (default: 2 minutes above 70 W) the fan keeps at least 45 %, so a burst on the cores on top of a heat-soaked cooler does not reach the emergency;
+- **controls the fans** through the fan curve inside the EC: as quiet as possible while the predicted end temperature stays below the target (default 80 °C). Rising power is counted ahead, but only while it still rises and never beyond the measured power; far below the target the fan ramps up slowly, so a short burst stays quiet. Under **lasting high load** (default: 2 minutes above 70 W) the fan keeps at least 45 %, so a burst on the cores on top of a heat-soaked cooler does not reach the emergency; on a **power jump** (default 50 W within 2 s) the fan goes to 50 % at once and holds for 20 s, then comes down slowly (1.5 %/s);
 - **cools the SSDs** with the 120 mm system fan on the back (SSDs, WLAN): it watches the SSD temperature including the hotter controller sensor (a Samsung 990 PRO reported 96 °C on the controller while its main value said 70 °C) and the amount of data moved. It switches on ahead of the heat after 5 s of more than 100 MB/s, runs at least 30 % and 10 % above the CPU fans, and is off while idle with cool SSDs (on at 68 °C controller / 55 °C main value; at least 5 min on, 2 min off, so it does not flap);
 - **brakes the clock** depending on the load type (few cores / many cores / GPU busy). After a hot spot it drops to a safe clock for 30 s and remembers a lower limit for that load type. It tries the next higher step again only after a calm run with a core really at the limit: 10 minutes, then 1 hour, then 1 day after every further hot spot on that step;
 - **learns** how warm the machine really gets at a given chip power and fan duty, and corrects its own model. The starting model (end temperature = 34 + P × (0.58 − 0.30 × fan) + 6 × hottest core W, P = whole chip power) was fitted on the logs of two EVO-X2;
@@ -97,6 +97,8 @@ Alarm=95         ; red: fan 100 % at once (at most 97)
 SicherMHz=3600   ; clock cap left behind on stop
 MinDauerlast=45  ; fan at least this % after 2 min above DauerlastW (0 = off)
 DauerlastW=70    ; lasting load from this many watts (smoothed); off again 10 W below
+SprungW=50       ; power jump: this many watts more within 2 s sets the fan to SprungProzent at once (0 = off)
+SprungProzent=50 ; fan % on a power jump, held for 20 s
 TaktPlus=0       ; test switch: MHz added to every clock cap (-600..+600), also +/- in the window
 Sprache=de       ; de / en, any sprache-<code>.ini next to the exe works
 
@@ -173,7 +175,7 @@ Lernende Lüfter- und Taktsteuerung für die GMKtec EVO-X2 unter Windows. Inoffi
 
 **Ergebnis** bei einem Kern auf 100 %: Vorher 88 °C nach 4 Sekunden. Mit der gelernten Taktgrenze (etwa 7 % weniger Ein-Kern-Takt) bleibt die CPU stabil bei 78–80 °C, und die Lüfter laufen leise mit 30 %.
 
-- Regelt die Lüfter so leise wie möglich unter einer Zieltemperatur (Standard 80 °C) und sagt den Temperaturverlauf voraus. Unter Dauerlast (2 Minuten über 70 W) läuft der Lüfter mit mindestens 45 %.
+- Regelt die Lüfter so leise wie möglich unter einer Zieltemperatur (Standard 80 °C) und sagt den Temperaturverlauf voraus. Unter Dauerlast (2 Minuten über 70 W) läuft der Lüfter mit mindestens 45 %. Bei einem Leistungssprung (50 W in 2 s) geht er sofort auf 50 % und danach langsam wieder runter.
 - Kühlt die SSDs mit dem Systemlüfter: achtet auch auf den heißeren Controller-Sensor und schaltet bei viel Datenverkehr schon vorher ein.
 - Greift nur selten auf den EC zu (etwa 1.500 Mal pro Stunde) und stört den Windows-Treiber dabei nicht.
 - Bremst den Takt je nach Lastart, nach einer Hitzespitze 30 s stark, und merkt sich eine sichere Grenze.

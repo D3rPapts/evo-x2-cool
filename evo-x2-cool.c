@@ -91,7 +91,7 @@ static unsigned load_settings(void)
     if (GetFileAttributesW(iniFile) == INVALID_FILE_ATTRIBUTES) {
         static const char def[] =
             "; evo-x2-cool settings, re-read within 5 s after a change\r\n"
-            "[Regler]\r\nZiel=80\r\nMinProzent=30\r\nMinLeerlauf=10\r\nMaxProzent=70\r\nSpitze=88\r\nAchtung=90\r\nAlarm=95\r\nSicherMHz=3600\r\nMinDauerlast=45\r\nDauerlastW=70\r\nSprungW=50\r\nSprungProzent=75\r\nSprache=de\r\n\r\n"
+            "[Regler]\r\nZiel=80\r\nMinProzent=30\r\nMinLeerlauf=10\r\nMaxProzent=70\r\nSpitze=88\r\nAchtung=90\r\nAlarm=95\r\nSicherMHz=3600\r\nMinDauerlast=45\r\nDauerlastW=70\r\nSprungW=50\r\nSprungProzent=50\r\nSprache=de\r\n\r\n"
             "; 1 = on, 0 = off. The emergency (fan 100 % when overheating) always stays on.\r\n"
             "[Funktionen]\r\nLuefter=1\r\nTaktbremse=1\r\nEcLeise=1\r\nLernen=1\r\nVorhersage=1\r\n\r\n"
             "; window: Thema = system / hell / dunkel; UpdatePruefen = 1: ask GitHub once a day for a newer version (only shown, nothing installed)\r\n"
@@ -122,7 +122,7 @@ static unsigned load_settings(void)
     // power jump: fan at SprungProzent % at once when the chip draws SprungW more within 2 s (0 = off); 0.6.8
     sprungW = GetPrivateProfileIntW(L"Regler", L"SprungW", 50, iniFile);
     sprungW = sprungW <= 0 ? 0 : sprungW < 20 ? 20 : sprungW > 150 ? 150 : sprungW;
-    sprungP = GetPrivateProfileIntW(L"Regler", L"SprungProzent", 75, iniFile);
+    sprungP = GetPrivateProfileIntW(L"Regler", L"SprungProzent", 50, iniFile);
     sprungP = sprungP < 30 ? 30 : sprungP > 100 ? 100 : sprungP;
     // sane limits, whatever is in the file
     ziel = ziel < 50 ? 50 : ziel > 92 ? 92 : ziel; minP = minP < 0 ? 0 : minP > 100 ? 100 : minP;
