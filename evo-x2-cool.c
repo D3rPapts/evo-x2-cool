@@ -48,8 +48,9 @@
 #define SVC L"evo-x2-cool"
 
 // ---------- settings (einstellungen.ini) ----------
-static float ziel = 80; static int minP = 30, minLeer = 10, maxP = 70, spitze = 88, achtung = 90, alarm = 95, sicherMhz = 3600, taktPlus, nurLesen;
+static float ziel = 80; static int minP = 30, minLeer = 10, maxP = 70, spitze = 88, achtung = 90, alarm = 95, sicherMhz = 3600, taktPlus, nurLesen, ohneEc;
 static int minDauer = 45, dauerW = 70;   // fan floor under lasting high load (0 = off), and from how many watts
+static int sprungW = 50, sprungP = 75;   // power jump within 2 s that sends the fan straight to sprungP % (0 = off)
 static unsigned fn = F_ALLE;   // functions switched on
 static const int stufen[] = { 3000, 3300, 3600, 3900, 4200, 4500 };   // clock cap steps, MHz
 #define NSTUFEN 6
@@ -90,7 +91,7 @@ static unsigned load_settings(void)
     if (GetFileAttributesW(iniFile) == INVALID_FILE_ATTRIBUTES) {
         static const char def[] =
             "; evo-x2-cool settings, re-read within 5 s after a change\r\n"
-            "[Regler]\r\nZiel=80\r\nMinProzent=30\r\nMinLeerlauf=10\r\nMaxProzent=70\r\nSpitze=88\r\nAchtung=90\r\nAlarm=95\r\nSicherMHz=3600\r\nMinDauerlast=45\r\nDauerlastW=70\r\nSprache=de\r\n\r\n"
+            "[Regler]\r\nZiel=80\r\nMinProzent=30\r\nMinLeerlauf=10\r\nMaxProzent=70\r\nSpitze=88\r\nAchtung=90\r\nAlarm=95\r\nSicherMHz=3600\r\nMinDauerlast=45\r\nDauerlastW=70\r\nSprungW=50\r\nSprungProzent=50\r\nSprache=de\r\n\r\n"
             "; 1 = on, 0 = off. The emergency (fan 100 % when overheating) always stays on.\r\n"
             "[Funktionen]\r\nLuefter=1\r\nTaktbremse=1\r\nEcLeise=1\r\nLernen=1\r\nVorhersage=1\r\n\r\n"
             "; window: Thema = system / hell / dunkel; UpdatePruefen = 1: ask GitHub once a day for a newer version (only shown, nothing installed)\r\n"
@@ -118,6 +119,11 @@ static unsigned load_settings(void)
     minDauer = minDauer < 0 ? 0 : minDauer > 100 ? 100 : minDauer;
     dauerW = GetPrivateProfileIntW(L"Regler", L"DauerlastW", 70, iniFile);
     dauerW = dauerW < 30 ? 30 : dauerW > 150 ? 150 : dauerW;
+    // power jump: fan at SprungProzent % at once when the chip draws SprungW more within 2 s (0 = off); 0.6.8
+    sprungW = GetPrivateProfileIntW(L"Regler", L"SprungW", 50, iniFile);
+    sprungW = sprungW <= 0 ? 0 : sprungW < 20 ? 20 : sprungW > 150 ? 150 : sprungW;
+    sprungP = GetPrivateProfileIntW(L"Regler", L"SprungProzent", 50, iniFile);
+    sprungP = sprungP < 30 ? 30 : sprungP > 100 ? 100 : sprungP;
     // sane limits, whatever is in the file
     ziel = ziel < 50 ? 50 : ziel > 92 ? 92 : ziel; minP = minP < 0 ? 0 : minP > 100 ? 100 : minP;
     minLeer = minLeer < 0 ? 0 : minLeer > minP ? minP : minLeer;
@@ -200,6 +206,7 @@ static int ec_lock(void) { return WaitForSingleObject(mEc, 500) <= WAIT_ABANDONE
 
 static int ec_read(uint8_t reg)
 {
+    if (ohneEc) return -1;   // --ohne-ec: never touch the EC (Tctl, power and GPU only)
     for (int t = 0; t < 3; t++) {
         if (ec_lock()) { int v = ec_read_raw(reg); ReleaseMutex(mEc); if (v >= 0) return v; }
         Sleep(20);
@@ -897,12 +904,28 @@ static int run(void)
         // and a burst on the cores on top took the chip to 97-98 °C within seconds (5 emergencies on 29.10.). A floor
         // keeps a reserve. On after two minutes of the smoothed power above DauerlastW, off after a minute 10 W below
         static int dauerSek, dauer;
-        if (pSlow >= dauerW) dauerSek = dauerSek < 120 ? dauerSek + 1 : 120; else if (pSlow < dauerW - 10) dauerSek = dauerSek > 60 ? 60 : dauerSek - 1;
+        // not let go while the power is rising again (0.6.8: machine 2, 31.10. 00:15, the floor ended and the fan fell
+        // from 45 to 15 % while a new load took the chip from 55 to 72 °C)
+        if (pSlow >= dauerW) dauerSek = dauerSek < 120 ? dauerSek + 1 : 120; else if (pSlow < dauerW - 10 && pFast <= pSlow + 5) dauerSek = dauerSek > 60 ? 60 : dauerSek - 1;
         int dauerNeu = minDauer > 0 && (dauer ? dauerSek > 0 : dauerSek >= 120);
         if (dauerNeu != dauer && !nurLesen && (fn & F_LUEFTER))
             event(dauerNeu ? L_("dauer_an", "Dauerlast über %d W: Lüfter mindestens %d %%") : L_("dauer_aus", "Dauerlast vorbei (unter %d W), Untergrenze %d %% aufgehoben"), dauerNeu ? dauerW : dauerW - 10, minDauer);
         dauer = dauerNeu;
         if (dauer && wantD < minDauer) wantD = (float)minDauer;
+        // power jump (0.6.8): on machine 2 the chip went from 17 to 117 W within 2 s and from 61 to 92 °C within 4 s while
+        // the fan still stood at 35 %; the prediction only reacted at 90 °C (01.11. 02:49). So a jump of SprungW within
+        // 2 s up to at least DauerlastW sends the fan straight to SprungProzent and holds it 20 s. Every further jump
+        // renews the hold, so bursts every 20-30 s keep the fan steady instead of pumping 30 <-> 70 % (machine 2, 01.11.
+        // 14:20). Afterwards it goes down slowly, and the model or the emergency still raise it further when needed.
+        static float h1, h2; static int sprungHalt;
+        // measured against the higher of 2 s ago and the 20-s average: under steady GPU load (27B at ~85 W) the power dips for
+        // a second or two between requests and comes back, which is no new heat (.198, 01.11. 15:38-15:55: fan to 75 % every
+        // few minutes at 74 °C)
+        int sprung = sprungW > 0 && k > 3 && heat >= dauerW && heat - fmaxf(h2, pSlow) >= sprungW;
+        h2 = h1; h1 = heat;
+        if (sprung && sprungHalt == 0 && !nurLesen && (fn & F_LUEFTER)) event(L_("sprung", "Leistungssprung auf %.0f W: Lüfter sofort %d %%"), heat, sprungP);
+        if (sprung) sprungHalt = 20; else if (sprungHalt > 0) sprungHalt--;
+        if (sprungHalt > 0 && wantD < sprungP) wantD = (float)sprungP;
         int grund = boost >= 1 ? GRUND_NACHREGELN : (fn & F_VORHERSAGE) && pv > pSlow + 5 ? GRUND_VORHERSAGE : GRUND_MODELL;
         // two stages above the noise limit. Yellow (smoothed CPU or case sensor >= Achtung, default 90 °C, off 2 °C below; a 1-s boost spike is
         // the clock brake's job): the fan climbs by 2 %/s,
@@ -919,15 +942,16 @@ static int run(void)
         if (grund == GRUND_NOTFALL && !warNotfall && !nurLesen) event2(1, L_("notfall", "NOTFALL: CPU %.0f °C, Gehäuse %d °C → Lüfter 100 %%"), T, Te);
         // up: a prediction raises by at most 4 %/s (jumping 30 -> 70 % is loud, the fan needs ~10 s per step anyway),
         // only 1 %/s while the chip is still far below the target (a short burst then hardly reaches the fan),
-        // at once only when really hot or in an emergency; down after 10 s by 3 %/s.
+        // at once only when really hot, after a power jump or in an emergency; down after 10 s by 1.5 %/s (0.6.8, before
+        // 3 %/s: under bursts the fan fell back too fast and pumped).
         // After an emergency down at once but only by 1 %/s: dropping straight back let the chip heat up again within
         // a minute, and the emergency pumped (machine 2: 22 times in 70 min). Also with the fan switched off, the
         // controller keeps the fan until it is down at its wanted value, then the BIOS curve takes over again.
         static int nachNotfall;
         float auf = T < ziel - 8 && emaT < ziel - 8 ? 1.0f : 4.0f;
-        if (wantD >= d) { d = grund == GRUND_NOTFALL || grund == GRUND_ACHTUNG || vorbeugen || emaT >= ziel + 5 ? wantD : fminf(wantD, d + auf); lowSince = -1; nachNotfall = 0; }
+        if (wantD >= d) { d = grund == GRUND_NOTFALL || grund == GRUND_ACHTUNG || vorbeugen || sprungHalt > 0 || emaT >= ziel + 5 ? wantD : fminf(wantD, d + auf); lowSince = -1; nachNotfall = 0; }
         else if (warNotfall || nachNotfall) { d = fmaxf(wantD, d - 1); nachNotfall = d > wantD; lowSince = -1; }
-        else { if (lowSince < 0) lowSince = k; if (k - lowSince >= 10) d = fmaxf(wantD, d - 3); }
+        else { if (lowSince < 0) lowSince = k; if (k - lowSince >= 10) d = fmaxf(wantD, d - 1.5f); }
         warNotfall = grund == GRUND_NOTFALL;
         int di = (int)lroundf(d);
         // system fan: the 120 mm fan on the back of the board cools the SSDs, the WLAN card and the board under the
@@ -1089,6 +1113,7 @@ int wmain(int argc, wchar_t **argv)
     for (int i = 1; i < argc; i++) {
         const wchar_t *a = argv[i];
         if (!wcscmp(a, L"--nur-lesen")) nurLesen = 1;
+        else if (!wcscmp(a, L"--ohne-ec")) nurLesen = ohneEc = 1;   // measure without any EC access, e.g. to test whether ACPI 13 comes without us
         else if (!wcscmp(a, L"--dienst")) dienst = 1;
         else if (!wcscmp(a, L"--installieren")) inst = 1;
         else if (!wcscmp(a, L"--entfernen")) return uninstall();
