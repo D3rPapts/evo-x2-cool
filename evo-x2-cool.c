@@ -917,12 +917,20 @@ static int run(void)
         // 2 s up to at least DauerlastW sends the fan straight to SprungProzent and holds it 20 s. Every further jump
         // renews the hold, so bursts every 20-30 s keep the fan steady instead of pumping 30 <-> 70 % (machine 2, 01.11.
         // 14:20). Afterwards it goes down slowly, and the model or the emergency still raise it further when needed.
-        static float h1, h2; static int sprungHalt;
+        static float h1, h2, h3, h4; static int sprungHalt;
         // measured against the higher of 2 s ago and the 20-s average: under steady GPU load (27B at ~85 W) the power dips for
         // a second or two between requests and comes back, which is no new heat (.198, 01.11. 15:38-15:55: fan to 75 % every
         // few minutes at 74 °C)
         int sprung = sprungW > 0 && k > 3 && heat >= dauerW && heat - fmaxf(h2, pSlow) >= sprungW;
-        h2 = h1; h1 = heat;
+        // 0.6.9: a jump in steps counts too, but only out of idle (20-s average below 40 W) and while still rising: machine 2,
+        // 05.11. 18:11, 28 -> 60 -> 52 -> 78 -> 83 W within 4 s never made 50 W within 2 s, the chip went from 63 to 98 °C
+        // in 6 s and hit the emergency. Replay on 5 days of machine 1: 9 extra jumps
+        float hMin = fminf(fminf(h1, h2), fminf(h3, h4));
+        if (sprungW > 0 && k > 5 && heat >= dauerW && pSlow < 40 && heat >= h1 && heat - hMin >= sprungW && heat - pSlow >= sprungW - 10) sprung = 1;
+        // 0.6.9: the prediction at the current fan already far above the hot spot (Spitze + 5) counts as a jump as well: on
+        // machine 2 it showed 103 °C three seconds before the emergency while the fan still climbed by 4 %/s
+        if (sprungW > 0 && k > 30 && (fn & F_VORHERSAGE) && predict(pv, d, mFast) >= spitze + 5) sprung = 1;
+        h4 = h3; h3 = h2; h2 = h1; h1 = heat;
         if (sprung && sprungHalt == 0 && !nurLesen && (fn & F_LUEFTER)) event(L_("sprung", "Leistungssprung auf %.0f W: Lüfter sofort %d %%"), heat, sprungP);
         if (sprung) sprungHalt = 20; else if (sprungHalt > 0) sprungHalt--;
         if (sprungHalt > 0 && wantD < sprungP) wantD = (float)sprungP;
