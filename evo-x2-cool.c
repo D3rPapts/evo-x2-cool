@@ -48,7 +48,7 @@
 #define SVC L"evo-x2-cool"
 
 // ---------- settings (einstellungen.ini) ----------
-static float ziel = 80; static int minP = 30, minLeer = 10, maxP = 70, spitze = 88, achtung = 90, alarm = 95, sicherMhz = 3600, taktPlus, nurLesen, ohneEc;
+static float ziel = 80; static int minP = 30, minLeer = 15, maxP = 70, spitze = 88, achtung = 90, alarm = 95, sicherMhz = 3600, taktPlus, nurLesen, ohneEc;
 static int minDauer = 45, dauerW = 70;   // fan floor under lasting high load (0 = off), and from how many watts
 static int sprungW = 50, sprungP = 75;   // power jump within 2 s that sends the fan straight to sprungP % (0 = off)
 static unsigned fn = F_ALLE;   // functions switched on
@@ -91,7 +91,7 @@ static unsigned load_settings(void)
     if (GetFileAttributesW(iniFile) == INVALID_FILE_ATTRIBUTES) {
         static const char def[] =
             "; evo-x2-cool settings, re-read within 5 s after a change\r\n"
-            "[Regler]\r\nZiel=80\r\nMinProzent=30\r\nMinLeerlauf=10\r\nMaxProzent=70\r\nSpitze=88\r\nAchtung=90\r\nAlarm=95\r\nSicherMHz=3600\r\nMinDauerlast=45\r\nDauerlastW=70\r\nSprungW=50\r\nSprungProzent=50\r\nSprache=de\r\n\r\n"
+            "[Regler]\r\nZiel=80\r\nMinProzent=30\r\nMinLeerlauf=15\r\nMaxProzent=70\r\nSpitze=88\r\nAchtung=90\r\nAlarm=95\r\nSicherMHz=3600\r\nMinDauerlast=45\r\nDauerlastW=70\r\nSprungW=50\r\nSprungProzent=50\r\nSprache=de\r\n\r\n"
             "; 1 = on, 0 = off. The emergency (fan 100 % when overheating) always stays on.\r\n"
             "[Funktionen]\r\nLuefter=1\r\nTaktbremse=1\r\nEcLeise=1\r\nLernen=1\r\nVorhersage=1\r\n\r\n"
             "; window: Thema = system / hell / dunkel; UpdatePruefen = 1: ask GitHub once a day for a newer version (only shown, nothing installed)\r\n"
@@ -105,7 +105,7 @@ static unsigned load_settings(void)
     wchar_t buf[16], code[16];
     GetPrivateProfileStringW(L"Regler", L"Ziel", L"80", buf, 16, iniFile); ziel = (float)_wtof(buf);
     minP = GetPrivateProfileIntW(L"Regler", L"MinProzent", 30, iniFile);
-    minLeer = GetPrivateProfileIntW(L"Regler", L"MinLeerlauf", 10, iniFile);
+    minLeer = GetPrivateProfileIntW(L"Regler", L"MinLeerlauf", 15, iniFile);
     maxP = GetPrivateProfileIntW(L"Regler", L"MaxProzent", 70, iniFile);
     spitze = GetPrivateProfileIntW(L"Regler", L"Spitze", 88, iniFile);
     achtung = GetPrivateProfileIntW(L"Regler", L"Achtung", 90, iniFile);

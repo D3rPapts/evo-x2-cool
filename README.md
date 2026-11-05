@@ -89,7 +89,7 @@ Start `evo-x2-cool-front.exe` as a normal user. The three temperatures target (g
 [Regler]
 Ziel=80          ; target temperature °C
 MinProzent=30    ; fan duty range
-MinLeerlauf=10   ; lower floor while idle and far below the target
+MinLeerlauf=15   ; lower floor while idle and far below the target (15 since 0.6.9: steadier than 10, same temperature)
 MaxProzent=70
 Spitze=88        ; hot spot: brake the clock from here
 Achtung=90       ; yellow: fan climbs by 2 %/s, also beyond MaxProzent
