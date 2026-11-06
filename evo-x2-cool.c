@@ -7,8 +7,10 @@
 //    fan speeds (PawnIO), GPU power/load/temperature (ADL), CPU load per core, and keeps a smoothed temperature;
 //  - learns in a table (heat power x fan duty) how warm it really gets, compared to a physical prior, and predicts
 //    rising power ahead, then picks the quietest duty whose predicted end temperature stays below the target;
-//  - steers the fan through the curve INSIDE the EC (0x60-0x6B, rising above today's temperature), so if this program
-//    dies the EC keeps regulating with a rising curve;
+//  - 0.7.0: sets the two CPU fans through the BIOS' own ACPI-WMI interface (PowerSwitchInterface), from a curve rising
+//    above today's EC temperature applied every second; the EC is no longer touched directly for that, so our accesses
+//    can no longer collide with Windows' EC driver (a candidate cause of ACPI event 13). The system fan keeps a flat curve in the EC (0x66-0x6B), rewritten only when its
+//    step changes. Without the WMI interface (other BIOS): the curve inside the EC as before (0x60-0x6B);
 //  - caps the CPU clock (power plan PROCFREQMAX) per situation (few cores / many cores / GPU load and its after-run),
 //    drops to the lowest step for 30 s after a hot spot and learns per situation which step is safe;
 //  - many cores busy and the GPU idle: EC power mode "leise" (54 W).
@@ -239,6 +241,95 @@ static int ec_write(uint8_t reg, uint8_t val)
         Sleep(20);
     }
     return 0;
+}
+
+// ---------- the BIOS' own fan interface (ACPI-WMI, 0.7.0) ----------
+// ACPI event 13 ("EC did not respond") first came on 25.10.2026 (the system log of machine 1 goes back to July without a
+// single one), then 8-41 a day. That day both the raw EC access started and BIOS 1.12 / EC 1.10 were flashed, so the cause
+// is open; our port handshake can collide with Windows' ACPI EC driver, which knows nothing of our mutex. The BIOS has an ACPI-WMI interface, root\wmi PowerSwitchInterface
+// (DSDT \AMW0.WMAA), that reaches the same EC fields through Windows' driver, so nothing can collide:
+//   SetFanControl(FanNumber 1|2, FanDuty 0-100)  EC 0x33/0x34 = 0x80|duty (fixed duty, the EC stops regulating);
+//                                                FanDuty 101 hands the fan back to the EC (tested 06.11.)
+//   GetFanControl(1)  speeds of both CPU fans (0x35-0x38) in one 32-bit value
+//   GetHwTemp(1)      EC temperature (0x70)        Get/SetPowerMode  power mode (read 0x31, set through 0x32)
+// The 120 mm system fan (curve 0x66, speed 0x28/0x29) is not reachable this way and keeps its rare direct writes.
+#define COBJMACROS
+#include <wbemidl.h>
+#pragma comment(lib, "wbemuuid.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "oleaut32.lib")
+static IWbemServices *wSvc;
+static IWbemClassObject *wCls;
+static BSTR wPath;   // the instance, e.g. PowerSwitchInterface.InstanceName="ACPI\\PNP0C14\\IP3POWERSWITCH_0"
+static int wmiOk;
+
+static int wmi_init(void)
+{
+    IWbemLocator *loc = 0; IEnumWbemClassObject *en = 0; IWbemClassObject *o = 0; ULONG n = 0; VARIANT v;
+    HRESULT hr = CoInitializeEx(0, COINIT_MULTITHREADED);
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) return 0;
+    CoInitializeSecurity(0, -1, 0, 0, RPC_C_AUTHN_LEVEL_DEFAULT, RPC_C_IMP_LEVEL_IMPERSONATE, 0, EOAC_NONE, 0);
+    if (FAILED(CoCreateInstance(&CLSID_WbemLocator, 0, CLSCTX_INPROC_SERVER, &IID_IWbemLocator, (void **)&loc))) return 0;
+    BSTR ns = SysAllocString(L"ROOT\\WMI"), cls = SysAllocString(L"PowerSwitchInterface");
+    hr = IWbemLocator_ConnectServer(loc, ns, 0, 0, 0, 0, 0, 0, &wSvc);
+    IWbemLocator_Release(loc);
+    if (SUCCEEDED(hr)) CoSetProxyBlanket((IUnknown *)wSvc, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, 0, RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE, 0, EOAC_NONE);
+    if (SUCCEEDED(hr)) hr = IWbemServices_GetObject(wSvc, cls, 0, 0, &wCls, 0);
+    if (SUCCEEDED(hr)) hr = IWbemServices_CreateInstanceEnum(wSvc, cls, WBEM_FLAG_FORWARD_ONLY, 0, &en);
+    if (SUCCEEDED(hr) && IEnumWbemClassObject_Next(en, 3000, 1, &o, &n) == WBEM_S_NO_ERROR && n == 1) {
+        if (SUCCEEDED(IWbemClassObject_Get(o, L"__RELPATH", 0, &v, 0, 0)) && v.vt == VT_BSTR) wPath = v.bstrVal;
+        IWbemClassObject_Release(o);
+    }
+    if (en) IEnumWbemClassObject_Release(en);
+    SysFreeString(ns); SysFreeString(cls);
+    return wPath != 0;
+}
+
+// one method call with up to two UInt8 inputs; returns the named output (or -1)
+static long long wmi_call(const wchar_t *method, const wchar_t *in1, int v1, const wchar_t *in2, int v2, const wchar_t *out)
+{
+    IWbemClassObject *def = 0, *in = 0, *res = 0; long long r = -1; VARIANT v;
+    BSTR m = SysAllocString(method);
+    if (SUCCEEDED(IWbemClassObject_GetMethod(wCls, method, 0, &def, 0)) && def) {
+        IWbemClassObject_SpawnInstance(def, 0, &in);
+        VariantInit(&v); v.vt = VT_UI1;
+        if (in && in1) { v.bVal = (BYTE)v1; IWbemClassObject_Put(in, in1, 0, &v, 0); }
+        if (in && in2) { v.bVal = (BYTE)v2; IWbemClassObject_Put(in, in2, 0, &v, 0); }
+    }
+    if (SUCCEEDED(IWbemServices_ExecMethod(wSvc, wPath, m, 0, 0, in, &res, 0)) && res) {
+        VariantInit(&v);
+        if (SUCCEEDED(IWbemClassObject_Get(res, out, 0, &v, 0, 0)))
+            r = v.vt == VT_I4 ? (long long)(uint32_t)v.lVal : v.vt == VT_UI1 ? v.bVal : v.vt == VT_I2 ? v.iVal : -1;
+        VariantClear(&v);
+        IWbemClassObject_Release(res);
+    }
+    if (in) IWbemClassObject_Release(in);
+    if (def) IWbemClassObject_Release(def);
+    SysFreeString(m);
+    return r;
+}
+
+// EC temperature; 0x7FFFFFFF (the BIOS' answer for an unknown sensor), 0 or above 110 °C count as no reading
+static int wmi_ec_temp(void) { long long t = wmi_call(L"GetHwTemp", L"HwTempType", 1, 0, 0, L"Temp"); return t >= 10 && t <= 110 ? (int)t : -1; }
+// speeds of both CPU fans: r[0] = L1, r[1] = L2 (bytes: L1 low, L1 high, L2 low, L2 high)
+static int wmi_rpm(int r[2])
+{
+    long long v = wmi_call(L"GetFanControl", L"FanNumber", 1, 0, 0, L"FanDuty");
+    if (v < 0 || v == 0x7FFFFFFF) return 0;   // 0x7FFFFFFF: the BIOS' answer for an unknown fan number
+    r[0] = (int)(v & 0xFFFF); r[1] = (int)(v >> 16 & 0xFFFF);
+    return 1;
+}
+// duty 0-100 fixed, 101 = back to the EC's own curve
+static int wmi_fan(int nr, int duty) { return !nurLesen && wmi_call(L"SetFanControl", L"FanNumber", nr, L"FanDuty", duty, L"ResultStatus") == 0; }
+static int wmi_modus(void) { return (int)wmi_call(L"GetPowerMode", 0, 0, 0, 0, L"CurrentPowerMode"); }
+static int wmi_set_modus(int m) { return !nurLesen && wmi_call(L"SetPowerMode", L"PowerMode", m, 0, 0, L"ResultStatus") == 0; }
+// both CPU fans back to the EC: through WMI (101), and if that fails directly with the byte the BIOS method writes for 101
+// (0x80|101 = 0xE5 into 0x33/0x34), so no fan keeps a fixed duty without a controller behind it
+static int wmiBenutzt;
+static int fans_an_ec(void)
+{
+    if (wmi_fan(1, 101) & wmi_fan(2, 101)) return 1;
+    return ec_write(0x33, 0xE5) & ec_write(0x34, 0xE5);
 }
 
 // ---------- GPU via ADL ----------
@@ -558,8 +649,8 @@ static double ssd_io(void)
 // 120 mm system fan on the back of the board; mode 1 = curve active. The system fan gets sysWant (-1 = same as the CPU
 // fans); 0 = off, written as a curve that starts only at 85 °C, so the EC still turns it on if the controller dies.
 // Each EC write costs a write plus a read-back (~2 ms of spinning), so only registers that change are written (usually
-// start/full/pwm). check = 1 reads every register first instead of trusting the cache (done once a minute, in case the
-// EC was reset, e.g. after sleep).
+// start/full/pwm). In case the EC was reset (e.g. after sleep) curve_pruefen reads the registers back, one a second, every
+// 5 min (with WMI only the system fan's 6, every 30 min).
 // quiet time after writing to the EC: ACPI event 13 (Windows: "EC did not respond within the timeout") came exactly 5 s
 // after an EC power mode switch in 11 of 14 cases (27.-29.10.), and piled up 5 s after fan curve writes too. So after a
 // write the controller leaves the EC alone for 6 s (no reads, no further writes) and Windows' own requests get through.
@@ -581,7 +672,7 @@ static void curve_schritt(int max)
     static const int order[6] = { 1, 2, 3, 4, 5, 0 };   // the mode byte (curve on) last
     int geschrieben = 0;
     curveOffen = 0;
-    for (int b = 0; b <= 6; b += 6)
+    for (int b = wmiOk ? 6 : 0; b <= 6; b += 6)   // with WMI the CPU fans are set directly, only the system fan uses the EC curve
         for (int j = 0; j < 6; j++) {
             int i = b + order[j];
             if (curveReg[i] == curveZiel[i]) continue;
@@ -597,6 +688,10 @@ static void curve_pruefen(void)
     if (v >= 0 && v != curveReg[pruefNr]) { curveReg[pruefNr] = v; curveOffen++; }
     if (++pruefNr >= 12) pruefNr = -1;
 }
+// 0.7.0: the system fan's curve is flat at a few fixed steps (duty up to 80 °C, then to full at 100 °C as a safety net when
+// the controller is gone), independent of the anchor, so it is written only when the step changes, a few times an hour
+static const int sysStufen[] = { 0, 30, 45, 60, 80, 100 };
+static int sys_stufe(int s) { int i = 0; while (s > sysStufen[i] && sysStufen[i] < 100) i++; return sysStufen[i]; }
 static void write_curve(int d, float teSmooth, int max)
 {
     int start = (int)floorf(teSmooth) - 3; start = start < 25 ? 25 : start > 92 ? 92 : start;
@@ -605,6 +700,7 @@ static void write_curve(int d, float teSmooth, int max)
     int s = sysWant < 0 ? d : sysWant, spwm = s - 6 < 0 ? 0 : s - 6;
     int sfull = start + (100 - spwm + 1) / 2 + 1; if (sfull > 105) sfull = 105;
     int val[12] = { 1, 20, start, full, pwm, 2, 1, 20, s ? start : 85, s ? sfull : 105, s ? spwm : 0, 2 };
+    if (wmiOk) { val[8] = s ? 80 : 85; val[9] = s ? 100 : 105; val[10] = s; }   // flat step (s is one of sysStufen); 0x60 stays the BIOS'
     memcpy(curveZiel, val, sizeof val);
     curveD = d; curveSys = s; curveAnchor = teSmooth;
     curve_schritt(max);
@@ -619,10 +715,21 @@ static int curve_duty(int t, int b)
     return t <= s ? p : t >= f ? 100 : p + (100 - p) * (t - s) / (f - s);
 }
 
-static int restore_bios(const uint8_t orig[12])
+// CPU duty with WMI: the same curve the EC got before (d at the anchor = smoothed EC temperature, start 3 °C below it at
+// d - 6, +2 % per °C above), applied by the controller every second at the current EC temperature; emergency: 100 %
+static int cpu_duty(int d, float teSmooth, int te, int notfall)
+{
+    int start = (int)floorf(teSmooth) - 3; start = start < 25 ? 25 : start > 92 ? 92 : start;
+    int v = notfall ? 100 : te < 0 ? d : d - 6 + (te > start ? 2 * (te - start) : 0);
+    return v < 0 ? 0 : v > 100 ? 100 : v;
+}
+
+// writes the BIOS values back from register ab on (0: both blocks, 6: only the system fan's; with WMI block 0x60 is
+// written back once at start and never touched after)
+static int restore_bios(const uint8_t orig[12], int ab)
 {
     int ok = 1;
-    for (int i = 11; i >= 0; i--) { ok &= ec_write((uint8_t)(0x60 + i), orig[i]); curveReg[i] = -1; }
+    for (int i = 11; i >= ab; i--) { ok &= ec_write((uint8_t)(0x60 + i), orig[i]); curveReg[i] = -1; }
     curveD = curveSys = -1; curveAnchor = -1; curveOffen = 0; pruefNr = -1;
     return ok;
 }
@@ -660,13 +767,19 @@ static int run(void)
     if (!nurLesen && (v0 != 1 || v1 != 10)) { event(L_("ec_version", "EC-Version %d.%d unbekannt (erwartet 1.10): nur lesen"), v0, v1); nurLesen = 1; }
     uint8_t orig[12] = { 0 };
     if (!nurLesen && !read_bios_fan(orig)) { event(L_("bios_fehlt", "BIOS-Lüftereinstellungen (UEFI Setup) nicht lesbar: nur lesen")); nurLesen = 1; }
+    wmiOk = !ohneEc && wmi_init();
+    // a crashed run may have left a fixed duty: hand both fans back to the EC once, also when this run only reads (it is a
+    // restore, like the BIOS curve below)
+    if (wmiOk) { wmi_call(L"SetFanControl", L"FanNumber", 1, L"FanDuty", 101, L"ResultStatus"); wmi_call(L"SetFanControl", L"FanNumber", 2, L"FanDuty", 101, L"ResultStatus"); }
+    event(wmiOk ? L_("wmi_an", "CPU-Lüfter, EC-Temperatur und Leistungsmodus über die BIOS-Schnittstelle (WMI), kein direkter EC-Zugriff mehr dafür")
+                : L_("wmi_aus", "BIOS-Schnittstelle (WMI) nicht verfügbar: Lüfter wie bisher direkt über den EC"));
 
     topology();
     adl_init();
     if (adlIdx < 0) event(L_("adl", "GPU-Werte vom Treiber nicht verfügbar: GPU-Leistung wird geschätzt"));
     NTQSI ntqsi = (NTQSI)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQuerySystemInformation");
     load_model();
-    int modusOrig = ec_read_sicher(0x31, -1), modusJetzt = modusOrig;
+    int modusOrig = wmiOk ? wmi_modus() : ec_read_sicher(0x31, -1), modusJetzt = modusOrig;
     if (modusOrig == 2 || modusOrig < 0) modusOrig = 0;   // "leise" at start is most likely left over from a killed run
     if (sh) {
         sh->nurLesen = nurLesen; sh->funktionen = nurLesen ? 0 : fn; sh->ziel = ziel; sh->minP = minP; sh->maxP = maxP; sh->spitze = spitze; sh->achtung = achtung; sh->alarm = alarm; sh->taktPlus = taktPlus;
@@ -682,7 +795,10 @@ static int run(void)
               orig[1], orig[2], orig[3]);
     }
 
-    if (!nurLesen && !(fn & F_LUEFTER)) restore_bios(orig);   // a killed run may have left its curve in the EC
+    // a killed run may have left its curve in the EC; with WMI the CPU block must hold the BIOS curve anyway (the fans are
+    // handed back to it on stop), so it is written back once at start
+    if (!nurLesen && (wmiOk || !(fn & F_LUEFTER))) restore_bios(orig, 0);
+    int wmiDuty = -1, wmiFehl = 0, ohneTemp = 0;   // last duty sent through WMI (101 = EC regulates, -1 = none yet), failures in a row
     if (!nurLesen && !(fn & F_TAKT) && read_cap() != 0) write_cap(0);
     uint64_t unit = 0; msr(0xC0010299, &unit);
     double joule = 1.0 / (double)(1ull << ((unit >> 8) & 0x1F));   // energy status unit
@@ -764,8 +880,16 @@ static int run(void)
         // Before: ~7000 reads an hour, now ~1000. The speed registers one a second (seconds 11-17 of each 30), not 6 in a
         // row: such a burst came 5 s before ACPI 13 events (0.6.6)
         // a value that is not confirmed or impossible (case above 110 °C) keeps the last reading
+        // 0.7.0 with WMI: EC temperature every second and CPU fan speeds every 5 s through Windows' own EC driver (cannot
+        // collide); only the system fan's speed (0x28/0x29, display only) still directly, every 5 min
+        if (wmiOk) {
+            int t = wmi_ec_temp();
+            if (t >= 0) { ec[0] = t; ohneTemp = 0; } else ohneTemp++;   // no reading: the CPU duty is d alone (cpu_duty)
+            int r[2]; if (k % 5 == 2 && wmi_rpm(r)) { ec[1] = r[0] >> 8; ec[2] = r[0] & 0xFF; ec[4] = r[1] >> 8; ec[5] = r[1] & 0xFF; }
+        }
         for (int i = 0; i < 8; i++) {
-            if (i == 3 || (i == 0 ? k % 5 : k % 30 != 10 + i)) continue;
+            int faellig = wmiOk ? i >= 6 && k % 300 == 290 + i : i != 3 && (i == 0 ? k % 5 == 0 : k % 30 == 10 + i);
+            if (!faellig) continue;
             if (ec_ruhig()) break;   // quiet time after a write: keep the last values
             int v = ec_read_sicher(regs[i], ec[i]); if (v >= 0 && !(i == 0 && v > 110)) ec[i] = v;
         }
@@ -872,7 +996,7 @@ static int run(void)
             int modus = (fn & F_LEISE) && lg == LAGE_VIELE && G < 5 ? 2 : modusOrig;
             if (modus == modusJetzt || modus == 2) modusLocker = 0;
             else if (modusJetzt == 2 && ++modusLocker < 120) modus = 2;
-            if (modus != modusJetzt && !ec_ruhig() && ec_write(0x31, (uint8_t)modus)) { ec_ruhe(); event(L_("modus", "EC-Leistungsmodus → %s"), modus == 2 ? L_("modus2", "leise (54 W)") : modus == 1 ? L_("modus1", "Leistung") : L_("modus0", "ausgewogen")); modusJetzt = modus; }
+            if (modus != modusJetzt && (wmiOk ? wmi_set_modus(modus) : !ec_ruhig() && ec_write(0x31, (uint8_t)modus))) { if (!wmiOk) ec_ruhe(); event(L_("modus", "EC-Leistungsmodus → %s"), modus == 2 ? L_("modus2", "leise (54 W)") : modus == 1 ? L_("modus1", "Leistung") : L_("modus0", "ausgewogen")); modusJetzt = modus; }
         }
 
         // --- learn: only when calm (power steady, temperature hardly moving) and not during boost hot spots (>= 90 °C:
@@ -990,19 +1114,46 @@ static int run(void)
         if (ssdS >= 70) { int m = 30 + 4 * (ssdS - 70); sw = sw > m ? sw : m; }
         if (ioHalt > sw) sw = (int)ceilf(ioHalt);
         sysWant = sw > 100 ? 100 : sw;
+        if (wmiOk) {
+            // steps: up at once, down only after 60 s below (each change is a direct EC write)
+            static int sysStufe = -1, sysTief;
+            int st = sys_stufe(sysWant);
+            if (st > sysStufe) { sysStufe = st; sysTief = 0; }
+            else if (st < sysStufe) { if (++sysTief >= 60) { sysStufe = st; sysTief = 0; } }
+            else sysTief = 0;
+            sysWant = sysStufe;
+        }
         int fanOn = !nurLesen && ((fn & F_LUEFTER) || grund == GRUND_NOTFALL || nachNotfall);   // the emergency takes over even when switched off
         // (yellow does not: switched off, the BIOS curve is already at full from 85 °C)
         // written only on a change of 5 % or an anchor 5 °C away (an emergency at once): the fans need ~10 s per step
         // anyway, and every write is EC traffic (2 % / 3 °C wrote the curve ~100 times an hour, now ~40). The check
-        // against an EC reset (after sleep) reads the 12 registers every 5 min, one a second
-        int kurveNeu = curveD < 0 || abs(di - curveD) >= 5 || abs(sysWant - curveSys) >= 5 || fabsf(emaTe - curveAnchor) > 5
-                       || (grund == GRUND_NOTFALL && di != curveD);
+        // against an EC reset (after sleep) reads the registers back, one a second.
+        // With WMI only the system fan's step goes into the EC (curveD/curveAnchor just follow the controller)
+        int kurveNeu = wmiOk ? sysWant != curveSys
+                             : curveD < 0 || abs(di - curveD) >= 5 || abs(sysWant - curveSys) >= 5 || fabsf(emaTe - curveAnchor) > 5
+                               || (grund == GRUND_NOTFALL && di != curveD);
         int dringend = grund == GRUND_NOTFALL || grund == GRUND_ACHTUNG;
         if (fanOn && kurveNeu) { if (!ec_ruhig() || dringend) write_curve(di, emaTe, dringend ? 12 : 2); }
         else if (fanOn && curveOffen) { if (!ec_ruhig()) curve_schritt(2); }
         else if (fanOn && pruefNr >= 0) { if (!ec_ruhig()) curve_pruefen(); }
-        else if (fanOn && k % 300 == 30 && curveD >= 0) pruefNr = 0;
-        else if (!fanOn && curveD >= 0) restore_bios(orig);
+        else if (fanOn && k % (wmiOk ? 1800 : 300) == 30 && curveD >= 0) pruefNr = wmiOk ? 6 : 0;
+        else if (!fanOn && curveD >= 0) restore_bios(orig, wmiOk ? 6 : 0);
+        if (wmiOk && fanOn) { curveD = di; curveAnchor = emaTe; }
+        // WMI: the CPU fans get the curve's duty at the current EC temperature every second (sent on a change, and every
+        // 30 s again in case the EC dropped it, e.g. after sleep); switched off: back to the EC's own curve (101).
+        // Setting the fans failing 5 times in a row: fans back to the EC and on with the direct way of before, so no fan
+        // stays at a fixed duty without a controller behind it (a missing temperature alone keeps WMI: cpu_duty uses d)
+        if (wmiOk && !nurLesen) {
+            int want = fanOn ? cpu_duty(di, emaTe, ohneTemp ? -1 : Te, grund == GRUND_NOTFALL) : 101;
+            if (want != wmiDuty || k % 30 == 0) {
+                if (wmi_fan(1, want) & wmi_fan(2, want)) { wmiDuty = want; wmiFehl = 0; wmiBenutzt = 1; } else wmiFehl++;
+            }
+            if (wmiFehl >= 5) {
+                fans_an_ec();
+                wmiOk = 0; wmiDuty = -1; curveD = -1;   // the next second writes the whole curve into the EC directly
+                event2(1, L_("wmi_weg", "BIOS-Schnittstelle (WMI) antwortet nicht mehr: Lüfter wieder direkt über den EC"));
+            }
+        }
         if (nurLesen) grund = GRUND_NUR_LESEN;
 
         // --- record (Prozent = duty really written, -1 = BIOS curve; Regler_Prozent = what the controller wants, also when switched off) ---
@@ -1016,7 +1167,7 @@ static int run(void)
             s->ecT = (int16_t)Te; s->busy = (int16_t)busy; s->gpuLoad = (int16_t)gL; s->gpuT = (int16_t)gT; s->fan = (int16_t)(nurLesen ? -1 : curveD);
             s->cap = (int16_t)capNow; s->rpm[0] = (int16_t)r1; s->rpm[1] = (int16_t)r2; s->rpm[2] = (int16_t)r3;
             s->lage = (uint8_t)lg; s->modus = (uint8_t)modusJetzt; s->grund = (uint8_t)grund; s->leise = modusJetzt == 2;
-            s->ecFan = (int16_t)(nurLesen || Te < 0 ? -1 : curve_duty(Te, 0));
+            s->ecFan = (int16_t)(nurLesen ? -1 : wmiOk ? (wmiDuty >= 0 && wmiDuty <= 100 ? wmiDuty : -1) : Te < 0 ? -1 : curve_duty(Te, 0));
             s->sysEc = (int16_t)(nurLesen || Te < 0 ? -1 : curve_duty(Te, 6)); s->sysFan = (int16_t)(nurLesen ? -1 : curveSys);
             s->ssdT = (int16_t)ssdT; s->ssdS = (int16_t)ssdS;
             sh->nSample++;
@@ -1041,9 +1192,10 @@ static int run(void)
     // --- stop: save, restore BIOS fan values, safe clock, original power mode ---
     if (!nurLesen) {
         save_model();
-        int ok = restore_bios(orig);
+        int ok = restore_bios(orig, wmiOk ? 6 : 0);
+        if (wmiOk || wmiBenutzt) ok &= fans_an_ec();   // CPU fans back to the EC's own (BIOS) curve
         if (fn & F_TAKT) write_cap(sicherMhz);
-        if (modusJetzt != modusOrig) ec_write(0x31, (uint8_t)modusOrig);
+        if (modusJetzt != modusOrig) { if (wmiOk) wmi_set_modus(modusOrig); else ec_write(0x31, (uint8_t)modusOrig); }
         event(L_("stopp", "Stopp: BIOS-Lüfterkurve %s, Taktbremse bleibt %d MHz, Modell gespeichert"),
               ok ? L_("stopp_ok", "zurück") : L_("stopp_fehler", "NICHT vollständig zurück"), fn & F_TAKT ? sicherMhz : capNow);
     } else event(L_("stopp_nurlesen", "Stopp (nur lesen)"));
@@ -1088,7 +1240,8 @@ static int install(const wchar_t *opts)
     if (!s) { printf("Dienst nicht angelegt, Fehler %lu (gibt es ihn schon? erst --entfernen)\n", GetLastError()); return 1; }
     SERVICE_DESCRIPTIONW desc = { L"Lernende Luefter- und Taktsteuerung fuer die GMKtec EVO-X2 (evo-x2-cool). Anzeige: evo-x2-cool-front.exe" };
     ChangeServiceConfig2W(s, SERVICE_CONFIG_DESCRIPTION, &desc);
-    SC_ACTION act[3] = { { SC_ACTION_RESTART, 60000 }, { SC_ACTION_RESTART, 60000 }, { SC_ACTION_RESTART, 60000 } };
+    // 0.7.0: restart after 5 s (was 60): with WMI the CPU fans keep a fixed duty while no controller runs
+    SC_ACTION act[3] = { { SC_ACTION_RESTART, 5000 }, { SC_ACTION_RESTART, 5000 }, { SC_ACTION_RESTART, 5000 } };
     SERVICE_FAILURE_ACTIONSW fa = { 86400, 0, 0, 3, act };
     ChangeServiceConfig2W(s, SERVICE_CONFIG_FAILURE_ACTIONS, &fa);
     SERVICE_PRESHUTDOWN_INFO pre = { 15000 };
