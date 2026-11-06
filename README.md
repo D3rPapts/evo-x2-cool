@@ -37,7 +37,7 @@ EVO-X2-COOL watches the chip every second, predicts where the temperature is hea
 
 On a normal stop the fans go back to the BIOS curve. Since 0.7.0 the CPU fans hold a fixed duty set by the program, so if it crashes Windows restarts the service after 5 s; if the BIOS interface stops answering, the program hands the fans back to the EC and continues the old direct way.
 
-**Since 0.7.0 it no longer talks to the EC directly for the CPU fans.** The BIOS of the EVO-X2 has an ACPI-WMI interface (`root\wmi`, class `PowerSwitchInterface`) that sets the duty of both CPU fans, reads their speeds, the EC temperature and the power mode, and reaches the EC through Windows' own ACPI driver, which serializes all EC traffic (the EC fields are declared with the ACPI global lock). EVO-X2-COOL now applies its fan curve itself every second through that interface. Only the 120 mm system fan is not reachable this way: its curve is still written into the EC directly, as a flat step (0/30/45/60/80/100 %, safety ramp to full above 80 °C) that is rewritten only when the step changes, a few times an hour, with 6 s of quiet afterwards. Without the WMI interface (other BIOS) everything works the direct way of 0.6.x (about 1,500 accesses per hour, no bursts, 6 s quiet after every write).
+**Since 0.7.0 it no longer talks to the EC directly for the CPU fans.** The BIOS of the EVO-X2 has an ACPI-WMI interface (`root\wmi`, class `PowerSwitchInterface`) that sets the duty of both CPU fans, reads their speeds, the EC temperature and the power mode, and reaches the EC through Windows' own ACPI driver, so nothing can collide with it. EVO-X2-COOL now applies its fan curve itself every second through that interface. Only the 120 mm system fan is not reachable this way: its curve is still written into the EC directly, as a flat step (0/30/45/60/80/100 %, safety ramp to full above 80 °C) that is rewritten only when the step changes, a few times an hour, with 6 s of quiet afterwards. Without the WMI interface (other BIOS) everything works the direct way of 0.6.x (about 1,500 accesses per hour, no bursts, 6 s quiet after every write).
 
 **Measured on the 64 GB machine**, one core at 100 % for 3 minutes:
 
@@ -118,7 +118,7 @@ Data in the same folder: `modell.txt` (learned model), `regler-<date>.csv` (one 
 
 ## Known issues
 
-- **ACPI event 13 ("EC did not respond within the timeout")** in the Windows system log, up to 40 a day with 0.6.x. **This was caused by EVO-X2-COOL's direct EC access**: on our second machine (BIOS 1.12 / EC 1.10 since February, system log back one year) the first one ever came 10 minutes after EVO-X2-COOL was first started, never before. Our direct accesses did not take the ACPI global lock that Windows uses for the EC. 0.7.0 uses the BIOS' WMI interface for the CPU fans instead and only rarely writes the system fan's curve directly; please tell us if you still see ACPI 13 with 0.7.0.
+- **ACPI event 13 ("EC did not respond within the timeout")** in the Windows system log, up to 40 a day with 0.6.x. **This was caused by EVO-X2-COOL's direct EC access**: on our second machine (BIOS 1.12 / EC 1.10 since February, system log back one year) the first one ever came 10 minutes after EVO-X2-COOL was first started, never before. The EC signals an event about every 10 s, and Windows then queries it on the same ports 0x62/0x66; Windows' EC driver shares no lock with other programs, so a direct access of ours could land in the middle of that query (the same was measured on the Bosgame M5 with the same board family, see [crmaris/FanControl.AXB35 #1](https://github.com/crmaris/FanControl.AXB35/issues/1)). 0.7.0 uses the BIOS' WMI interface for the CPU fans instead and only rarely writes the system fan's curve directly; please tell us if you still see ACPI 13 with 0.7.0.
 - **Samsung 990 PRO without heatsink:** under heavy data load its controller reached 96 °C even with the system fan at full speed, and one drive dropped out under such load. A thin heatsink or a thermal pad to the case helps more than any fan curve. Check the space above the M.2 slot first, and do not remove the label.
 
 ## Share your logs
@@ -156,6 +156,7 @@ Visual Studio Build Tools (C, x64). `build.cmd` builds both programs with the hy
 
 - [cmetz/ec-su_axb35-linux](https://github.com/cmetz/ec-su_axb35-linux): EC register layout of the AXB35 board
 - [pajtony/FanControl.AXB35](https://github.com/pajtony/FanControl.AXB35): the same EC through PawnIO in FanControl
+- [crmaris/FanControl.AXB35](https://github.com/crmaris/FanControl.AXB35): measured the ACPI 13 collisions on the Bosgame M5 and also moved to the BIOS WMI interface
 - [PawnIO](https://github.com/namazso/PawnIO) and [PawnIO.Modules](https://github.com/namazso/PawnIO.Modules) by namazso
 - [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor)
 
