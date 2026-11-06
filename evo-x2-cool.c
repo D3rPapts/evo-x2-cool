@@ -190,11 +190,21 @@ static int ec_wait(uint8_t mask, uint8_t want) { for (int i = 0; i < 20000; i++)
 // most likely its answer: taking it made Windows time out ("EC did not respond", ACPI event 13, 5 s later) and gave us
 // a foreign byte (0x49: L1 ~18800 rpm, once a case temperature of 116 °C and a false emergency). So wait until the EC
 // is idle; only a byte nobody fetches for a while is really stale and is dropped.
+// 0.7.1: SCI_EVT (0x20) must be clear as well. The EC raises it every 10.05 s for ~0.9 ms (measured on machine 1 with
+// status reads only; 0x49 above is the answer to that query, event _Q49), and Windows then queries the event (QR_EC) on
+// the same two ports: a transaction of ours in that moment is what made Windows time out. So a transaction starts only
+// after the status read 0 (no IBF, OBF, SCI_EVT) 16 times in a row (~0.1 ms); with an event pending it gives up at once
+// (the callers retry 20 ms later, when Windows is done), and a waiting byte is never taken while an event is pending.
 static int ec_idle(void)
 {
-    for (int i = 0; i < 2000; i++) if ((pin(0x66) & 3) == 0) return 1;
-    if (pin(0x66) & 1) pin(0x62);
-    return ec_wait(2, 0);
+    int frei = 0;
+    for (int i = 0; i < 2000; i++) {
+        uint8_t s = pin(0x66);
+        if (s & 0x20) return 0;
+        if ((s & 3) == 0) { if (++frei >= 16) return 1; } else frei = 0;
+    }
+    if ((pin(0x66) & 0x21) == 1) pin(0x62);
+    return 0;
 }
 
 static int ec_read_raw(uint8_t reg)
@@ -688,9 +698,13 @@ static void curve_pruefen(void)
     if (v >= 0 && v != curveReg[pruefNr]) { curveReg[pruefNr] = v; curveOffen++; }
     if (++pruefNr >= 12) pruefNr = -1;
 }
-// 0.7.0: the system fan's curve is flat at a few fixed steps (duty up to 80 °C, then to full at 100 °C as a safety net when
-// the controller is gone), independent of the anchor, so it is written only when the step changes, a few times an hour
+// With WMI the system fan gets a few fixed steps, so its curve is written only when the step changes or the temperature
+// moved far. 0.7.0 wrote them as flat curves starting at 80 °C: but below the start the EC stops the fan (measured
+// 06.11.: step 45/60 % at EC 60 °C gave 0 rpm), so the system fan stood still. 0.7.1: the curve starts 10 °C below the
+// smoothed EC temperature with duty = step there (2 % per °C, as before); it is rewritten on a step change, when the
+// temperature fell to 3 °C above the start, or rose 10 °C above the anchor
 static const int sysStufen[] = { 0, 30, 45, 60, 80, 100 };
+static int sysStart = -1; static float sysAnker;
 static int sys_stufe(int s) { int i = 0; while (s > sysStufen[i] && sysStufen[i] < 100) i++; return sysStufen[i]; }
 static void write_curve(int d, float teSmooth, int max)
 {
@@ -700,19 +714,25 @@ static void write_curve(int d, float teSmooth, int max)
     int s = sysWant < 0 ? d : sysWant, spwm = s - 6 < 0 ? 0 : s - 6;
     int sfull = start + (100 - spwm + 1) / 2 + 1; if (sfull > 105) sfull = 105;
     int val[12] = { 1, 20, start, full, pwm, 2, 1, 20, s ? start : 85, s ? sfull : 105, s ? spwm : 0, 2 };
-    if (wmiOk) { val[8] = s ? 80 : 85; val[9] = s ? 100 : 105; val[10] = s; }   // flat step (s is one of sysStufen); 0x60 stays the BIOS'
+    if (wmiOk && s) {   // s is one of sysStufen; block 0x60 stays the BIOS'
+        int st = (int)floorf(teSmooth) - 10; st = st < 25 ? 25 : st > 92 ? 92 : st;
+        int pw = s - 20 < 0 ? 0 : s - 20, fu = st + (100 - pw + 1) / 2 + 1;
+        val[8] = st; val[9] = fu > 105 ? 105 : fu; val[10] = pw;
+    }
+    sysStart = val[8]; sysAnker = teSmooth;
     memcpy(curveZiel, val, sizeof val);
     curveD = d; curveSys = s; curveAnchor = teSmooth;
     curve_schritt(max);
 }
 
-// duty % the written curve gives at EC temperature t: pwm up to start, then linear to 100 % at full; -1 = BIOS curve.
+// duty % the written curve gives at EC temperature t: 0 below start (the EC stops the fan there), pwm at start, then
+// linear to 100 % at full; -1 = BIOS curve.
 // b = 0: CPU fans (block 0x60), b = 6: system fan (block 0x66)
 static int curve_duty(int t, int b)
 {
     int s = curveReg[b + 2], f = curveReg[b + 3], p = curveReg[b + 4];
     if (curveD < 0 || s < 0 || f <= s || p < 0) return -1;
-    return t <= s ? p : t >= f ? 100 : p + (100 - p) * (t - s) / (f - s);
+    return t < s ? 0 : t >= f ? 100 : p + (100 - p) * (t - s) / (f - s);
 }
 
 // CPU duty with WMI: the same curve the EC got before (d at the anchor = smoothed EC temperature, start 3 °C below it at
@@ -1129,7 +1149,7 @@ static int run(void)
         // anyway, and every write is EC traffic (2 % / 3 °C wrote the curve ~100 times an hour, now ~40). The check
         // against an EC reset (after sleep) reads the registers back, one a second.
         // With WMI only the system fan's step goes into the EC (curveD/curveAnchor just follow the controller)
-        int kurveNeu = wmiOk ? sysWant != curveSys
+        int kurveNeu = wmiOk ? sysWant != curveSys || (curveSys > 0 && (emaTe < sysStart + 3 || emaTe > sysAnker + 10))
                              : curveD < 0 || abs(di - curveD) >= 5 || abs(sysWant - curveSys) >= 5 || fabsf(emaTe - curveAnchor) > 5
                                || (grund == GRUND_NOTFALL && di != curveD);
         int dringend = grund == GRUND_NOTFALL || grund == GRUND_ACHTUNG;
