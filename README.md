@@ -9,6 +9,8 @@ Learning fan and clock controller for the **GMKtec EVO-X2** mini PC (AMD Ryzen A
 >
 > Written with AI assistance (Claude Code), tested on real hardware.
 
+> **Note (06.11.2026):** the code on `main` is the withdrawn 0.7.1. Its fan control through the BIOS interface reacts too fast (the CPU fans pump under bursty load). Please use the [0.6.8 release](https://github.com/D3rPapts/evo-x2-cool/releases/tag/v0.6.8) until 0.7 is back after a full night of testing. / **Hinweis:** `main` enthält das zurückgezogene 0.7.1, bitte 0.6.8 verwenden.
+
 *Deutsch: siehe [unten](#deutsch).*
 
 ## The problem
