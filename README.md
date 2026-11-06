@@ -28,16 +28,16 @@ There was no way to control the fans of this machine under Windows, so we built 
 
 EVO-X2-COOL watches the chip every second, predicts where the temperature is heading, and:
 
-- **controls the fans** through the fan curve inside the EC: as quiet as possible while the predicted end temperature stays below the target (default 80 °C). Rising power is counted ahead, but only while it still rises and never beyond the measured power; far below the target the fan ramps up slowly, so a short burst stays quiet. Under **lasting high load** (default: 2 minutes above 70 W) the fan keeps at least 45 %, so a burst on the cores on top of a heat-soaked cooler does not reach the emergency; on a **power jump** (default 50 W within 2 s) the fan goes to 50 % at once and holds for 20 s, then comes down slowly (1.5 %/s);
+- **controls the fans** (since 0.7.0 the two CPU fans through the BIOS' own interface, see below): as quiet as possible while the predicted end temperature stays below the target (default 80 °C). Rising power is counted ahead, but only while it still rises and never beyond the measured power; far below the target the fan ramps up slowly, so a short burst stays quiet. Under **lasting high load** (default: 2 minutes above 70 W) the fan keeps at least 45 %, so a burst on the cores on top of a heat-soaked cooler does not reach the emergency; on a **power jump** (default 50 W within 2 s) the fan goes to 50 % at once and holds for 20 s, then comes down slowly (1.5 %/s);
 - **cools the SSDs** with the 120 mm system fan on the back (SSDs, WLAN): it watches the SSD temperature including the hotter controller sensor (a Samsung 990 PRO reported 96 °C on the controller while its main value said 70 °C) and the amount of data moved. It switches on ahead of the heat after 5 s of more than 100 MB/s, runs at least 30 % and 10 % above the CPU fans, and is off while idle with cool SSDs (on at 68 °C controller / 55 °C main value; at least 5 min on, 2 min off, so it does not flap);
 - **brakes the clock** depending on the load type (few cores / many cores / GPU busy). After a hot spot it drops to a safe clock for 30 s and remembers a lower limit for that load type. It tries the next higher step again only after a calm run with a core really at the limit: 10 minutes, then 1 hour, then 1 day after every further hot spot on that step;
 - **learns** how warm the machine really gets at a given chip power and fan duty, and corrects its own model. The starting model (end temperature = 34 + P × (0.58 − 0.30 × fan) + 6 × hottest core W, P = whole chip power) was fitted on the logs of two EVO-X2;
 - **switches the EC to the quiet power mode** (54 W) while many cores are busy and the GPU is idle;
 - has two warning stages: **yellow** (default 90 °C: the fan climbs steadily, also beyond MaxProzent) and **red** (default 95 °C: fan to full at once). Red cannot be switched off.
 
-If the program crashes, the EC keeps regulating with the last (rising) curve. On a normal stop the BIOS fan curve is written back.
+On a normal stop the fans go back to the BIOS curve. Since 0.7.0 the CPU fans hold a fixed duty set by the program, so if it crashes Windows restarts the service after 5 s; if the BIOS interface stops answering, the program hands the fans back to the EC and continues the old direct way.
 
-It talks to the EC as little as possible (about 1,500 accesses per hour since 0.6.3, before ~8,000): EC temperature every 5 s, fan speeds every 30 s, the fan curve only when it changes by at least 5 % / 5 °C, a full check every 5 minutes. Every access waits until Windows' own ACPI driver is done with the EC, and values that change are read twice. Since 0.6.5 it leaves the EC alone for 6 s after every write (no reads, no further writes; the emergency writes anyway): Windows' "EC did not respond" (ACPI event 13) came exactly 5 s after an EC power mode switch in 11 of 14 cases. Since 0.6.6 it never sends a burst: the fan curve goes out 2 registers a second, the fan speeds and the full check 1 register a second (after 0.6.5 the remaining events came 5 s after such bursts), and it goes back from the quiet power mode only after 2 minutes of calm (before 30 s).
+**Since 0.7.0 it no longer talks to the EC directly for the CPU fans.** The BIOS of the EVO-X2 has an ACPI-WMI interface (`root\wmi`, class `PowerSwitchInterface`) that sets the duty of both CPU fans, reads their speeds, the EC temperature and the power mode, and reaches the EC through Windows' own ACPI driver, which serializes all EC traffic (the EC fields are declared with the ACPI global lock). EVO-X2-COOL now applies its fan curve itself every second through that interface. Only the 120 mm system fan is not reachable this way: its curve is still written into the EC directly, as a flat step (0/30/45/60/80/100 %, safety ramp to full above 80 °C) that is rewritten only when the step changes, a few times an hour, with 6 s of quiet afterwards. Without the WMI interface (other BIOS) everything works the direct way of 0.6.x (about 1,500 accesses per hour, no bursts, 6 s quiet after every write).
 
 **Measured on the 64 GB machine**, one core at 100 % for 3 minutes:
 
@@ -89,7 +89,7 @@ Start `evo-x2-cool-front.exe` as a normal user. The three temperatures target (g
 [Regler]
 Ziel=80          ; target temperature °C
 MinProzent=30    ; fan duty range
-MinLeerlauf=10   ; lower floor while idle and far below the target
+MinLeerlauf=15   ; lower floor while idle and far below the target (15 since 0.6.9: steadier than 10, same temperature)
 MaxProzent=70
 Spitze=88        ; hot spot: brake the clock from here
 Achtung=90       ; yellow: fan climbs by 2 %/s, also beyond MaxProzent
@@ -118,7 +118,7 @@ Data in the same folder: `modell.txt` (learned model), `regler-<date>.csv` (one 
 
 ## Known issues
 
-- **ACPI event 13 ("EC did not respond within the timeout")** in the Windows system log. On our machines it started on the day the EC firmware 1.10 / BIOS 1.12 was installed. Before 0.6.5 most of these events came exactly 5 s after an access of ours; since 0.6.6 they no longer line up with our accesses (1 of 15), but still come about every one to two hours, mostly under GPU load. We have not seen any effect beyond the log entry. Logs from other machines would help to find out whether this happens without EVO-X2-COOL as well (see below).
+- **ACPI event 13 ("EC did not respond within the timeout")** in the Windows system log, up to 40 a day with 0.6.x. **This was caused by EVO-X2-COOL's direct EC access**: on our second machine (BIOS 1.12 / EC 1.10 since February, system log back one year) the first one ever came 10 minutes after EVO-X2-COOL was first started, never before. Our direct accesses did not take the ACPI global lock that Windows uses for the EC. 0.7.0 uses the BIOS' WMI interface for the CPU fans instead and only rarely writes the system fan's curve directly; please tell us if you still see ACPI 13 with 0.7.0.
 - **Samsung 990 PRO without heatsink:** under heavy data load its controller reached 96 °C even with the system fan at full speed, and one drive dropped out under such load. A thin heatsink or a thermal pad to the case helps more than any fan curve. Check the space above the M.2 slot first, and do not remove the label.
 
 ## Share your logs
@@ -177,10 +177,10 @@ Lernende Lüfter- und Taktsteuerung für die GMKtec EVO-X2 unter Windows. Inoffi
 
 - Regelt die Lüfter so leise wie möglich unter einer Zieltemperatur (Standard 80 °C) und sagt den Temperaturverlauf voraus. Unter Dauerlast (2 Minuten über 70 W) läuft der Lüfter mit mindestens 45 %. Bei einem Leistungssprung (50 W in 2 s) geht er sofort auf 50 % und danach langsam wieder runter.
 - Kühlt die SSDs mit dem Systemlüfter: achtet auch auf den heißeren Controller-Sensor und schaltet bei viel Datenverkehr schon vorher ein.
-- Greift nur selten auf den EC zu (etwa 1.500 Mal pro Stunde) und stört den Windows-Treiber dabei nicht.
+- Seit 0.7.0 steuert es die CPU-Lüfter über die BIOS-eigene Schnittstelle (WMI) statt direkt über den EC. Nur die Kurve des Systemlüfters wird noch direkt geschrieben, und nur wenn sich seine Stufe ändert. Stürzt das Programm ab, startet Windows den Dienst nach 5 s neu.
 - Bremst den Takt je nach Lastart, nach einer Hitzespitze 30 s stark, und merkt sich eine sichere Grenze.
 - Lernt aus Erfahrung. Den Notfall (Lüfter auf voll) kann man nicht abschalten.
 - Fenster und Meldungen auf Deutsch oder Englisch, hell oder dunkel, Funktionen einzeln schaltbar.
 - Braucht EC-Firmware 1.10 und den Treiber PawnIO. Bedienung und Einstellungen wie oben.
-- Bekannt: ACPI-Ereignis 13 im Windows-Protokoll (seit EC 1.10, etwa alle ein bis zwei Stunden, meist unter Grafiklast, seit 0.6.6 nicht mehr an unsere Zugriffe gekoppelt, bisher ohne Folgen). Eine Samsung 990 PRO ohne Kühlkörper wird unter Datenlast trotz vollem Systemlüfter sehr heiß – Kühlkörper oder Wärmeleitpad zum Gehäuse helfen.
+- ACPI-Ereignis 13 im Windows-Protokoll (bis 0.6.x bis zu 40 am Tag) kam von unserem direkten EC-Zugriff: Auf unserem zweiten Rechner (BIOS 1.12/EC 1.10 seit Februar) kam das erste nach einem Jahr ohne zehn Minuten nach dem ersten Start von EVO-X2-COOL. 0.7.0 nutzt dafür die BIOS-Schnittstelle. Bitte melden, falls es mit 0.7.0 noch auftritt. Eine Samsung 990 PRO ohne Kühlkörper wird unter Datenlast trotz vollem Systemlüfter sehr heiß – Kühlkörper oder Wärmeleitpad zum Gehäuse helfen.
 - **Logs teilen:** Mit den Logs anderer EVO-X2 können wir weiter verbessern. Ab 0.6.7: Rechtsklick auf das Symbol neben der Uhr → „Logs speichern (ZIP auf dem Desktop)“; bei älteren Versionen packt der PowerShell-Befehl oben unter „Share your logs“ die letzten drei Tage als ZIP auf den Desktop. Die ZIP-Datei bitte über das Formular „Logs teilen“ als Issue hochladen. Enthalten sind nur Messwerte (Temperaturen, Leistung, Lüfter, Takt, SSD), keine Namen, Dateien oder Programme. Issues sind öffentlich.
