@@ -530,18 +530,29 @@ static int pk(float p) { int k = (int)lroundf(p / 10); return k < 0 ? 0 : k >= N
 static int dk(float d) { int k = (int)lroundf(d / 10); return k < 0 ? 0 : k >= ND ? ND - 1 : k; }
 static float prior(float p, float d, float m) { return 34 + p * (0.58f - 0.30f * d / 100) + 6 * m; }
 
+// 0.6.11: limits, so one broken reading can never poison the model (.56: field 8 7 = -33257 from 06.11., fan 70 % for nothing)
+#define REST_MAX 25.0f          // a learned field is at most this far from the prior
+#define T_MIN 20.0f             // plausible end temperatures / predictions
+#define T_MAX 110.0f
+static float grenze(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
+
 static float predict(float p, float d, float m)
 {
     int a = pk(p), b = dk(d);
-    if (cell[a][b].n >= 20) return prior(p, d, m) + cell[a][b].r;
-    int best = -1; float bd = 1e9f;
-    for (int j = 0; j < ND; j++) if (cell[a][j].n >= 20 && fabsf(j * 10 - d) < bd) { bd = fabsf(j * 10 - d); best = j; }
-    return prior(p, d, m) + (best >= 0 ? cell[a][best].r : versatz);
+    float v;
+    if (cell[a][b].n >= 20) v = prior(p, d, m) + cell[a][b].r;
+    else {
+        int best = -1; float bd = 1e9f;
+        for (int j = 0; j < ND; j++) if (cell[a][j].n >= 20 && fabsf(j * 10 - d) < bd) { bd = fabsf(j * 10 - d); best = j; }
+        v = prior(p, d, m) + (best >= 0 ? cell[a][best].r : versatz);
+    }
+    return isfinite(v) ? grenze(v, T_MIN, T_MAX) : prior(p, d, m);
 }
 
 static void learn(float p, float d, float m, float y)
 {
-    float res = y - prior(p, d, m);
+    if (!isfinite(y) || y < T_MIN || y > T_MAX || !isfinite(p) || !isfinite(d)) return;   // implausible reading: not learned
+    float res = grenze(y - prior(p, d, m), -REST_MAX, REST_MAX);
     versatz += (res - versatz) / 60;
     int a = pk(p), b = dk(d);
     if (cell[a][b].n == 0) cell[a][b].r = versatz;
@@ -569,16 +580,21 @@ static void load_model(void)
     swprintf(p, MAX_PATH, L"%s\\modell.txt", dataDir);
     FILE *f = _wfopen(p, L"r");
     if (!f) return;
-    int skala = 1;   // files without the line come from 0.1/0.2
+    int skala = 1, verworfen = 0;   // files without the line come from 0.1/0.2
     while (fgets(line, sizeof line, f)) {
         if (sscanf(line, "skala %d", &m) == 1) skala = m;
-        else if (sscanf(line, "versatz %f", &r) == 1) { if (skala == SKALA) versatz = r; }
-        else if (sscanf(line, "feld %d %d %f %d", &a, &b, &r, &n) == 4 && a >= 0 && a < NP && b >= 0 && b < ND) { if (skala == SKALA) { cell[a][b].r = r; cell[a][b].n = n; } }
+        else if (sscanf(line, "versatz %f", &r) == 1) { if (skala == SKALA && isfinite(r)) versatz = grenze(r, -REST_MAX, REST_MAX); }
+        else if (sscanf(line, "feld %d %d %f %d", &a, &b, &r, &n) == 4 && a >= 0 && a < NP && b >= 0 && b < ND) {
+            // a field outside the limits (broken reading in an older version) is dropped and learned anew
+            if (skala == SKALA && isfinite(r) && fabsf(r) <= REST_MAX && n > 0) { cell[a][b].r = r; cell[a][b].n = n; }
+            else if (skala == SKALA) verworfen++;
+        }
         else if (sscanf(line, "deckel %15s %d", name, &m) == 2) { for (int i = 0; i < EVO_NLAGE; i++) if (!strcmp(name, lageName[i])) lage[i].stufe = stufe_von(m); }
         else if (sscanf(line, "fehl %15s %d %d", name, &m, &n) == 3) { for (int i = 0; i < EVO_NLAGE; i++) if (!strcmp(name, lageName[i])) lage[i].fehl[stufe_von(m)] = n; }
     }
     fclose(f);
     if (skala != SKALA) event(L_("skala", "Neues Wärmemodell (ganze Chipleistung): Lüfter-Erfahrung wird neu gelernt, Taktgrenzen bleiben"));
+    if (verworfen) event(L_("feld_verworfen", "Wärmemodell: %d unplausible Bereiche verworfen, sie werden neu gelernt"), verworfen);
 }
 
 static void save_model(void)
