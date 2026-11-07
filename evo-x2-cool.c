@@ -583,7 +583,7 @@ static void load_model(void)
     int skala = 1, verworfen = 0;   // files without the line come from 0.1/0.2
     while (fgets(line, sizeof line, f)) {
         if (sscanf(line, "skala %d", &m) == 1) skala = m;
-        else if (sscanf(line, "versatz %f", &r) == 1) { if (skala == SKALA && isfinite(r)) versatz = grenze(r, -REST_MAX, REST_MAX); }
+        else if (sscanf(line, "versatz %f", &r) == 1) { if (skala == SKALA) { if (isfinite(r) && fabsf(r) <= REST_MAX) versatz = r; else { versatz = 0; verworfen++; } } }
         else if (sscanf(line, "feld %d %d %f %d", &a, &b, &r, &n) == 4 && a >= 0 && a < NP && b >= 0 && b < ND) {
             // a field outside the limits (broken reading in an older version) is dropped and learned anew
             if (skala == SKALA && isfinite(r) && fabsf(r) <= REST_MAX && n > 0) { cell[a][b].r = r; cell[a][b].n = n; }
