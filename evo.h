@@ -14,7 +14,7 @@
 #define EVO_EV     256           // events kept
 
 enum { LAGE_WENIGE, LAGE_VIELE, LAGE_GRAFIK, LAGE_BEIDE, EVO_NLAGE };   // BEIDE = GPU busy and many cores
-enum { GRUND_MODELL, GRUND_VORHERSAGE, GRUND_NACHREGELN, GRUND_NOTFALL, GRUND_NUR_LESEN, GRUND_ACHTUNG };
+enum { GRUND_MODELL, GRUND_VORHERSAGE, GRUND_NACHREGELN, GRUND_NOTFALL, GRUND_NUR_LESEN, GRUND_ACHTUNG, GRUND_VORBEUGEN };
 
 // functions that can be switched off in einstellungen.ini, section [Funktionen] (1 = on). The emergency (fan 100 %
 // when overheating) cannot be switched off: it takes over even while the fan control is off.

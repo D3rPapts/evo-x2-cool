@@ -1053,6 +1053,7 @@ static int cpu_luefter(Regler *r, Messung *m, int lg)
     if (sprung) r->sprungHalt = 20; else if (r->sprungHalt > 0) r->sprungHalt--;
     if (r->sprungHalt > 0 && wantD < sprungP) wantD = (float)sprungP;
     int grund = r->boost >= 1 ? GRUND_NACHREGELN : (fn & F_VORHERSAGE) && m->pv > r->pSlow + 5 ? GRUND_VORHERSAGE : GRUND_MODELL;
+    if (vorbeugen && grund == GRUND_MODELL) grund = GRUND_VORBEUGEN;   // 0.6.11: the 50 % for GPU + many cores is named as such
     // yellow (smoothed CPU or case sensor >= Achtung, off 2 °C below): +2 %/s, also beyond MaxProzent;
     // red (CPU >= Alarm for 3 s or case sensor >= Alarm): 100 % at once
     if (r->emaT >= achtung || m->Te >= achtung) r->gelb = 1; else if (r->emaT < achtung - 2 && m->Te < achtung - 2) r->gelb = 0;
@@ -1139,7 +1140,7 @@ static void modus_pruefen(Regler *r)
 
 static void aufzeichnen(Regler *r, const Messung *m, int lg, int grund, int di)
 {
-    static const char *grundName[] = { "modell", "vorhersage", "nachregeln", "NOTFALL", "nur-lesen", "achtung" };
+    static const char *grundName[] = { "modell", "vorhersage", "nachregeln", "NOTFALL", "nur-lesen", "achtung", "vorbeugen" };
     // Prozent = duty the controller asked for (written into the EC curve as soon as the EC is free), -1 = BIOS curve;
     // Regler_Prozent = what the controller wants, also when switched off
     int *ec = r->ec;

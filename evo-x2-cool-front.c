@@ -181,6 +181,7 @@ static const wchar_t *grundText(int i)
     case GRUND_NOTFALL: return T(L"grund3", L"NOTFALL");
     case GRUND_NUR_LESEN: return T(L"grund4", L"nur lesen");
     case GRUND_ACHTUNG: return T(L"grund5", L"Achtung, steigt");
+    case GRUND_VORBEUGEN: return T(L"grund6", L"vorbeugend (Grafik + Kerne)");
     default: return T(L"grund0", L"nach Modell");
     }
 }
