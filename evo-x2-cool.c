@@ -344,7 +344,14 @@ static DWORD WINAPI etw_faden(void *x)
     p->Wnode.Flags = WNODE_FLAG_TRACED_GUID; p->Wnode.ClientContext = 1;   // time stamps in QPC ticks
     p->LogFileMode = EVENT_TRACE_REAL_TIME_MODE; p->FlushTimer = 1; p->BufferSize = 4; p->MinimumBuffers = 2; p->MaximumBuffers = 4;
     if (StartTraceW(&etwSitzung, etwName, p) != ERROR_SUCCESS) { etwSitzung = 0; return 0; }
-    if (EnableTraceEx2(etwSitzung, &ACPI_PROV, EVENT_CONTROL_CODE_ENABLE_PROVIDER, TRACE_LEVEL_VERBOSE, ~0ULL, 0, 0, 0) != ERROR_SUCCESS) return 0;
+    // only event 7 into the small buffers (a burst of other ACPI events could fill them and push out the ones we need);
+    // the keyword mask stays open, a narrower one delivered nothing in the test
+    EVENT_FILTER_EVENT_ID ids = { TRUE, 0, 1, { 7 } };
+    EVENT_FILTER_DESCRIPTOR fd = { (ULONGLONG)(ULONG_PTR)&ids, sizeof ids, EVENT_FILTER_TYPE_EVENT_ID };
+    ENABLE_TRACE_PARAMETERS ep = { 0 };
+    ep.Version = ENABLE_TRACE_PARAMETERS_VERSION_2; ep.EnableFilterDesc = &fd; ep.FilterDescCount = 1;
+    if (EnableTraceEx2(etwSitzung, &ACPI_PROV, EVENT_CONTROL_CODE_ENABLE_PROVIDER, TRACE_LEVEL_VERBOSE, ~0ULL, 0, 0, &ep) != ERROR_SUCCESS
+        && EnableTraceEx2(etwSitzung, &ACPI_PROV, EVENT_CONTROL_CODE_ENABLE_PROVIDER, TRACE_LEVEL_VERBOSE, ~0ULL, 0, 0, 0) != ERROR_SUCCESS) return 0;
     EVENT_TRACE_LOGFILEW lf = { 0 };
     lf.LoggerName = etwName;
     lf.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD | PROCESS_TRACE_MODE_RAW_TIMESTAMP;   // QPC, not FILETIME
@@ -368,20 +375,31 @@ static void etw_stopp(void)
     if (etwSpur != INVALID_PROCESSTRACE_HANDLE) CloseTrace(etwSpur);
 }
 
-// waits (at most ACPI_VOR_MS + ACPI_NACH_MS) while Windows' next query is due
+// waits while Windows' next query is due (at most ACPI_VOR_MS + ACPI_NACH_MS plus a timer tick); checks again after
+// each sleep, which can end a tick early or late
 static void acpi_fenster(void)
 {
-    LONG64 t0 = acpiQpc, halb = acpiTakt / 2, f = qpcHz.QuadPart;
-    if (!t0 || halb <= 0) return;
-    LARGE_INTEGER jetzt; QueryPerformanceCounter(&jetzt);
-    LONG64 seit = jetzt.QuadPart - t0;
-    if (seit < 0 || seit > f * ACPI_ALT_MS / 1000) return;
-    LONG64 phase = seit % halb, vor = f * ACPI_VOR_MS / 1000, nach = f * ACPI_NACH_MS / 1000, warten = 0;
-    if (phase > halb - vor) warten = halb - phase + nach; else if (phase < nach) warten = nach - phase;
-    if (warten > 0) Sleep((DWORD)(warten * 1000 / f) + 1);
+    for (int runde = 0; runde < 3; runde++) {
+        LONG64 t0 = acpiQpc, halb = acpiTakt / 2, f = qpcHz.QuadPart;
+        if (!t0 || halb <= 0) return;
+        LARGE_INTEGER jetzt; QueryPerformanceCounter(&jetzt);
+        LONG64 seit = jetzt.QuadPart - t0;
+        if (seit < 0 || seit > f * ACPI_ALT_MS / 1000) return;
+        LONG64 phase = seit % halb, vor = f * ACPI_VOR_MS / 1000, nach = f * ACPI_NACH_MS / 1000, warten = 0;
+        if (phase > halb - vor) warten = halb - phase + nach; else if (phase < nach) warten = nach - phase;
+        if (warten <= 0) return;
+        Sleep((DWORD)(warten * 1000 / f) + 1);
+    }
 }
 
-static int ec_lock(void) { acpi_fenster(); return WaitForSingleObject(mEc, 500) <= WAIT_ABANDONED; }
+// the window is checked while the mutex is held: another EC program (LibreHardwareMonitor ...) holding it up to 500 ms
+// would otherwise move our transaction into the query; it waits at most the window length, as during its own accesses
+static int ec_lock(void)
+{
+    if (WaitForSingleObject(mEc, 500) > WAIT_ABANDONED) return 0;
+    acpi_fenster();
+    return 1;
+}
 
 static int ec_read(uint8_t reg)
 {
@@ -888,7 +906,7 @@ static int cmp_float(const void *a, const void *b) { float x = *(const float *)a
 #define PRUEF_SEK 16
 #define MODUS_SEK 47
 // Everything the loop keeps from one second to the next.
-// Schedule within the loop (k = seconds): EC temperature k % 5 == 0; fan speeds k % 30 == 11-16; SSD temperature
+// Schedule within the loop (k = seconds): EC temperature k % 5 == 0; fan speeds k % 30 == 1-4, 6-9, 11; SSD temperature
 // k % 5 == 1; ACPI 13 lookup k % 30 == 25; settings check k % 5 == 0 (file time only); curve check
 // k % 300 == PRUEF_SEK, then one register a second (17-28); power mode k % 300 == MODUS_SEK (or the first second after a
 // quiet time); model saved and shown k % 60 == 0.
@@ -990,10 +1008,14 @@ static void messen(Regler *r, Messung *m)
     static int hoch[3] = { -1, -1, -1 }, tief[3] = { -1, -1, -1 };
     for (int i = 0; i < 9; i++) {
         if (k % 30 != sek[i] || ec_ruhig()) continue;
-        int l = i / 3, schritt = i % 3, v = ec_read((uint8_t)(regs[l] + (schritt == 1)));
-        if (schritt == 0) hoch[l] = v;
-        else if (schritt == 1) tief[l] = v;
-        else if (v >= 0 && v == hoch[l] && tief[l] >= 0) { r->ec[1 + 2 * l] = v; r->ec[2 + 2 * l] = tief[l]; }
+        int l = i / 3, schritt = i % 3;
+        if (schritt == 0) { hoch[l] = ec_read(regs[l]); tief[l] = -1; }   // a step skipped in the quiet time leaves -1:
+        else if (schritt == 1) tief[l] = hoch[l] < 0 ? -1 : ec_read_sicher((uint8_t)(regs[l] + 1), r->ec[2 + 2 * l]);  // no mixing with bytes
+        else {                                                                 // from 30 s before; low byte confirmed
+            int v = hoch[l] < 0 || tief[l] < 0 ? -1 : ec_read(regs[l]);
+            if (v >= 0 && v == hoch[l]) { r->ec[1 + 2 * l] = v; r->ec[2 + 2 * l] = tief[l]; }
+            hoch[l] = tief[l] = -1;
+        }
     }
     m->Te = r->ec[0];
     // GPU every second while it works, every 2 s while it rests
@@ -1310,7 +1332,7 @@ static int run(void)
     int v0 = ec_read_geduldig(REG_VERSION), v1 = ec_read_geduldig(REG_VERSION + 1), modus0 = ec_read_geduldig(REG_MODUS);
     if (WaitForSingleObject(stopEv, 0) == WAIT_OBJECT_0) {
         event(L_("stopp_start", "Stopp während des Starts: nichts verändert"));
-        CloseHandle(hCpu); CloseHandle(hEc); return 0;
+        etw_stopp(); CloseHandle(hCpu); CloseHandle(hEc); return 0;
     }
     if (!nurLesen && (v0 != 1 || v1 != 10)) { event(L_("ec_version", "EC-Version %d.%d unbekannt (erwartet 1.10): nur lesen"), v0, v1); nurLesen = 1; }
     uint8_t orig[12] = { 0 };
