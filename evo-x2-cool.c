@@ -297,7 +297,7 @@ static int ec_read_raw(uint8_t reg)
 }
 
 // ---------- Windows' own EC query (ETW Microsoft-Windows-Kernel-Acpi, event 7) ----------
-// The EC raises SCI_EVT about every 10.05 s (now and then one extra half way) and Windows queries it at once, for ~1 ms
+// The EC raises SCI_EVT about every 10.07 s (now and then one extra half way) and Windows queries it at once, for ~1 ms
 // (measured 08.11.2026). A transaction of ours overlapping that query makes Windows time out (ACPI event 13). Windows
 // reports every query as ETW event 7 with an exact time stamp, so the next one is predictable: a thread listens the
 // whole time (it sleeps until the kernel hands over an event, a few small events every 10 s), and before each transaction
@@ -306,26 +306,51 @@ static int ec_read_raw(uint8_t reg)
 // (session could not start, other Windows) nothing waits, as in 0.6.11.
 static const GUID ACPI_PROV = { 0xC514638F, 0x7723, 0x485B, { 0xBC, 0xFC, 0x96, 0x56, 0x5D, 0x73, 0x5D, 0x4A } };
 static wchar_t etwName[] = L"EVO-X2-COOL-ACPI";
-#define ACPI_TAKT_MS 10053
+#define ACPI_TAKT_MS 10066
 #define ACPI_VOR_MS 40
-#define ACPI_NACH_MS 15
+#define ACPI_NACH_MS 25
 #define ACPI_ALT_MS 60000
 static volatile LONG64 acpiQpc, acpiTakt;   // QPC time stamp of the last query; learned period in QPC ticks
 static volatile LONG acpiZahl;
 static LARGE_INTEGER qpcHz;
 static TRACEHANDLE etwSitzung, etwSpur = INVALID_PROCESSTRACE_HANDLE;
 
+// Diagnosis (does a remaining ACPI 13 come from a query off the beat, or from an access of ours too close to one on the
+// beat?): ec_lock() notes the start of each of our transactions, the ETW thread notes for each query its kind and the
+// nearest access of ours, the main loop writes the remarkable ones and a summary every 10 minutes into the event list.
+#define ACPI_RASTER_MS 30      // a query within this of the beat (full or half period) counts as on the beat
+#define ACPI_NAH_MS 10         // an access of ours this close to a query is noted
+#define ACPI_NEU_MS 25000      // no query on the beat for this long: the next one becomes the new reference
+enum { ABFRAGE_TAKT, ABFRAGE_HALB, ABFRAGE_AUSSER, ABFRAGE_NEU };
+static volatile LONG64 zugriffe[64]; static volatile LONG zugriffNr;
+typedef struct { LONG64 t; int art; float abwMs, zugriffMs; } Abfrage;
+static Abfrage abfragen[32]; static volatile LONG abfrageNr; static LONG abfrageGelesen;
+
 static void WINAPI etw_ereignis(PEVENT_RECORD e)
 {
     if (e->EventHeader.EventDescriptor.Id != 7) return;   // 4 events per query (keyword 0x200000000001)
-    LONG64 t = e->EventHeader.TimeStamp.QuadPart, alt = acpiQpc;
-    if (alt && t - alt < qpcHz.QuadPart / 10) return;   // one query brings several events within a millisecond
-    if (alt) {
-        LONG64 d = t - alt, takt = acpiTakt;
-        if (d > takt * 97 / 100 && d < takt * 103 / 100) InterlockedExchange64(&acpiTakt, takt + (d - takt) / 8);
-    }
-    InterlockedExchange64(&acpiQpc, t);
+    static LONG64 letzte;
+    LONG64 t = e->EventHeader.TimeStamp.QuadPart, f = qpcHz.QuadPart, alt = acpiQpc;
+    if (letzte && t - letzte < f / 10) return;   // one query brings several events within a millisecond
+    letzte = t;
+    // the reference moves only with queries on the beat: one off the beat (the EC's own events) would otherwise shift the
+    // predicted windows away from the next regular query for up to 10 s
+    int art = ABFRAGE_NEU; float abw = 0;
+    if (alt && t - alt <= f * ACPI_NEU_MS / 1000) {
+        LONG64 halb = acpiTakt / 2, d = t - alt, n = (d + halb / 2) / halb, rest = d - n * halb;
+        abw = (float)rest * 1000 / f;
+        if (n > 0 && rest * 1000 < f * ACPI_RASTER_MS && -rest * 1000 < f * ACPI_RASTER_MS) {
+            art = n % 2 ? ABFRAGE_HALB : ABFRAGE_TAKT;
+            if (n % 2 == 0) { LONG64 takt = acpiTakt; InterlockedExchange64(&acpiTakt, takt + (d * 2 / n - takt) / 4); }
+            InterlockedExchange64(&acpiQpc, t);
+        } else art = ABFRAGE_AUSSER;
+    } else InterlockedExchange64(&acpiQpc, t);
     InterlockedIncrement(&acpiZahl);
+    LONG64 best = 0; int gefunden = 0;
+    for (int i = 0; i < 64; i++) { LONG64 z = zugriffe[i]; if (z && (!gefunden || _abs64(z - t) < _abs64(best - t))) { best = z; gefunden = 1; } }
+    Abfrage *a = &abfragen[abfrageNr % 32];
+    a->t = t; a->art = art; a->abwMs = abw; a->zugriffMs = gefunden ? (float)(best - t) * 1000 / f : 1e9f;
+    InterlockedIncrement(&abfrageNr);
 }
 
 static EVENT_TRACE_PROPERTIES *etw_eigenschaften(void)
@@ -398,6 +423,8 @@ static int ec_lock(void)
 {
     if (WaitForSingleObject(mEc, 500) > WAIT_ABANDONED) return 0;
     acpi_fenster();
+    LARGE_INTEGER t; QueryPerformanceCounter(&t);
+    zugriffe[InterlockedIncrement(&zugriffNr) % 64] = t.QuadPart;
     return 1;
 }
 
@@ -576,6 +603,41 @@ static void acpi13_pruefen(void)
     }
     if (ctx) EvtClose(ctx);
     EvtClose(q);
+}
+
+// the queries noted by the ETW thread: off the beat, or an access of ours closer than ACPI_NAH_MS, one line each (at most
+// 20 in 10 minutes, with the time to the millisecond to put them next to an ACPI 13); every 10 minutes a summary
+static void abfragen_melden(int zusammenfassen)
+{
+    static int zahl[4], nah, zeilen; static float minZugriff = 1e9f, maxAbw;
+    LARGE_INTEGER jetzt; QueryPerformanceCounter(&jetzt);
+    FILETIME ftJetzt; GetSystemTimeAsFileTime(&ftJetzt);
+    ULONGLONG uJetzt = ((ULONGLONG)ftJetzt.dwHighDateTime << 32) | ftJetzt.dwLowDateTime;
+    LONG bis = abfrageNr;
+    if (bis - abfrageGelesen > 32) abfrageGelesen = bis - 32;
+    for (; abfrageGelesen < bis; abfrageGelesen++) {
+        Abfrage a = abfragen[abfrageGelesen % 32];
+        zahl[a.art]++;
+        if (a.art <= ABFRAGE_HALB && fabsf(a.abwMs) > maxAbw) maxAbw = fabsf(a.abwMs);
+        if (fabsf(a.zugriffMs) < fabsf(minZugriff)) minZugriff = a.zugriffMs;
+        int istNah = fabsf(a.zugriffMs) < ACPI_NAH_MS;
+        nah += istNah;
+        if ((a.art != ABFRAGE_AUSSER && !istNah) || zeilen >= 20) continue;
+        zeilen++;
+        ULONGLONG u = uJetzt - (ULONGLONG)((jetzt.QuadPart - a.t) * 10000000 / qpcHz.QuadPart);
+        FILETIME ft = { (DWORD)u, (DWORD)(u >> 32) }, lt; SYSTEMTIME st;
+        FileTimeToLocalFileTime(&ft, &lt); FileTimeToSystemTime(&lt, &st);
+        if (a.art == ABFRAGE_AUSSER)
+            event(L_("etw_ausser", "EC-Abfrage %02d:%02d:%02d.%03d außer Takt (%+.0f ms), unser nächster Zugriff %+.1f ms"),
+                  st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, a.abwMs, a.zugriffMs);
+        else
+            event(L_("etw_nah", "EC-Abfrage %02d:%02d:%02d.%03d im Takt (%+.1f ms), unser Zugriff nur %+.1f ms daneben"),
+                  st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, a.abwMs, a.zugriffMs);
+    }
+    if (!zusammenfassen) return;
+    event(L_("etw_10min", "EC-Abfragen 10 min: %d im Takt, %d halb, %d außer Takt, %d neu; Zugriff nah %d, min %+.1f ms; Takt ±%.1f ms"),
+          zahl[ABFRAGE_TAKT], zahl[ABFRAGE_HALB], zahl[ABFRAGE_AUSSER], zahl[ABFRAGE_NEU], nah, minZugriff > 1e8f ? 0.0f : minZugriff, maxAbw);
+    memset(zahl, 0, sizeof zahl); nah = zeilen = 0; minZugriff = 1e9f; maxAbw = 0;
 }
 
 static void csv_line(const char *line)
@@ -1378,6 +1440,7 @@ static int run(void)
         if (k == 0) { next += 1000; Sleep(1000); continue; }   // first round only primes the counters
         glaetten(r, &m);
         if (k % 30 == 25) acpi13_pruefen();
+        if (k % 30 == 26) abfragen_melden(k % 600 == 26);
         if (k == 120) {
             if (acpiZahl > 1) event(L_("etw_an", "Windows-EC-Abfragen sichtbar (Takt %.2f s): EC-Zugriffe weichen ihnen aus"), (double)acpiTakt / qpcHz.QuadPart);
             else event(L_("etw_aus", "Windows-EC-Abfragen nicht sichtbar: EC-Zugriffe wie bisher"));
