@@ -49,7 +49,7 @@ int WINAPI GdipDeletePath(void *path);
 #define WM_ZEIGEN (WM_APP + 2)   // sent by a second start: show the window
 #define WM_UPDATE (WM_APP + 3)   // the update check found a newer version
 #define WM_ENDE   (WM_APP + 4)   // sent by the installer before an update: end cleanly, so no dead icon stays next to the clock
-#define RELEASES L"https://github.com/D3rPapts/evo-x2-cool/releases"
+#define RELEASES L"https://github.com/D3rPapst/evo-x2-cool/releases"
 
 static const EvoShared *sh;
 static HANDLE map;
@@ -852,7 +852,7 @@ static int fetch_latest(char tag[16])
     int ok = 0;
     HINTERNET s = WinHttpOpen(L"evo-x2-cool/" EVO_VERSION_W, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0), c = 0, r = 0;
     if (s) { WinHttpSetTimeouts(s, 10000, 10000, 10000, 10000); c = WinHttpConnect(s, L"api.github.com", INTERNET_DEFAULT_HTTPS_PORT, 0); }
-    if (c) r = WinHttpOpenRequest(c, L"GET", L"/repos/D3rPapts/evo-x2-cool/releases/latest", 0, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    if (c) r = WinHttpOpenRequest(c, L"GET", L"/repos/D3rPapst/evo-x2-cool/releases/latest", 0, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
     if (r && WinHttpSendRequest(r, L"Accept: application/vnd.github+json\r\n", (DWORD)-1, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) && WinHttpReceiveResponse(r, 0)) {
         static char buf[8192]; DWORD got = 0, total = 0;   // tag_name comes early in the answer
         while (total < sizeof buf - 1 && WinHttpReadData(r, buf + total, sizeof buf - 1 - total, &got) && got) total += got;

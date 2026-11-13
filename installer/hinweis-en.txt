@@ -9,4 +9,4 @@ Please read before installing:
 - On exit and uninstall the BIOS fan curve comes back. The emergency mode (fan to full when overheating) cannot be switched off.
 - Written with AI assistance (Claude Code), tested on real hardware.
 
-License: GPL-3.0-or-later. Source code: https://github.com/D3rPapts/evo-x2-cool
+License: GPL-3.0-or-later. Source code: https://github.com/D3rPapst/evo-x2-cool
