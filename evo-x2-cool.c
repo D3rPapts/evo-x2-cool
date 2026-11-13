@@ -38,6 +38,8 @@
 #include <math.h>
 #include <time.h>
 #include <winevt.h>
+#include <evntrace.h>
+#include <evntcons.h>
 #include "evo.h"
 #pragma comment(lib, "powrprof.lib")
 #pragma comment(lib, "advapi32.lib")
@@ -294,7 +296,92 @@ static int ec_read_raw(uint8_t reg)
     if (!ec_wait(EC_OBF, EC_OBF)) return -1; return pin(EC_DATA);
 }
 
-static int ec_lock(void) { return WaitForSingleObject(mEc, 500) <= WAIT_ABANDONED; }
+// ---------- Windows' own EC query (ETW Microsoft-Windows-Kernel-Acpi, event 105) ----------
+// The EC raises SCI_EVT about every 10.05 s (now and then one extra half way) and Windows queries it at once, for ~1 ms
+// (measured 08.11.2026). A transaction of ours overlapping that query makes Windows time out (ACPI event 13). Windows
+// reports every query as ETW event 105 with an exact time stamp, so the next one is predictable: a thread listens the
+// whole time (it sleeps until the kernel hands over an event, a few small events every 10 s), and before each transaction
+// acpi_fenster() waits while a query is due, from ACPI_VOR_MS before to ACPI_NACH_MS after (also at half the period).
+// ETW delivers late (buffers, flushed every second), but the time stamps are exact. Without a query seen for ACPI_ALT_MS
+// (session could not start, other Windows) nothing waits, as in 0.6.11.
+static const GUID ACPI_PROV = { 0xC514638F, 0x7723, 0x485B, { 0xBC, 0xFC, 0x96, 0x56, 0x5D, 0x73, 0x5D, 0x4A } };
+static wchar_t etwName[] = L"EVO-X2-COOL-ACPI";
+#define ACPI_TAKT_MS 10053
+#define ACPI_VOR_MS 40
+#define ACPI_NACH_MS 15
+#define ACPI_ALT_MS 60000
+static volatile LONG64 acpiQpc, acpiTakt;   // QPC time stamp of the last query; learned period in QPC ticks
+static volatile LONG acpiZahl;
+static LARGE_INTEGER qpcHz;
+static TRACEHANDLE etwSitzung, etwSpur = INVALID_PROCESSTRACE_HANDLE;
+
+static void WINAPI etw_ereignis(PEVENT_RECORD e)
+{
+    if (e->EventHeader.EventDescriptor.Id != 105) return;
+    LONG64 t = e->EventHeader.TimeStamp.QuadPart, alt = acpiQpc;
+    if (alt && t - alt < qpcHz.QuadPart / 10) return;   // one query brings several events within a millisecond
+    if (alt) {
+        LONG64 d = t - alt, takt = acpiTakt;
+        if (d > takt * 97 / 100 && d < takt * 103 / 100) InterlockedExchange64(&acpiTakt, takt + (d - takt) / 8);
+    }
+    InterlockedExchange64(&acpiQpc, t);
+    InterlockedIncrement(&acpiZahl);
+}
+
+static EVENT_TRACE_PROPERTIES *etw_eigenschaften(void)
+{
+    static union { EVENT_TRACE_PROPERTIES p; char raum[sizeof(EVENT_TRACE_PROPERTIES) + 256]; } u;
+    memset(&u, 0, sizeof u);
+    u.p.Wnode.BufferSize = sizeof u; u.p.LoggerNameOffset = sizeof u.p;
+    return &u.p;
+}
+
+static DWORD WINAPI etw_faden(void *x)
+{
+    (void)x;
+    ControlTraceW(0, etwName, etw_eigenschaften(), EVENT_TRACE_CONTROL_STOP);   // left over from a killed run
+    EVENT_TRACE_PROPERTIES *p = etw_eigenschaften();
+    p->Wnode.Flags = WNODE_FLAG_TRACED_GUID; p->Wnode.ClientContext = 1;   // time stamps in QPC ticks
+    p->LogFileMode = EVENT_TRACE_REAL_TIME_MODE; p->FlushTimer = 1; p->BufferSize = 4; p->MinimumBuffers = 2; p->MaximumBuffers = 4;
+    if (StartTraceW(&etwSitzung, etwName, p) != ERROR_SUCCESS) { etwSitzung = 0; return 0; }
+    if (EnableTraceEx2(etwSitzung, &ACPI_PROV, EVENT_CONTROL_CODE_ENABLE_PROVIDER, TRACE_LEVEL_VERBOSE, 0, 0, 0, 0) != ERROR_SUCCESS) return 0;
+    EVENT_TRACE_LOGFILEW lf = { 0 };
+    lf.LoggerName = etwName;
+    lf.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
+    lf.EventRecordCallback = etw_ereignis;
+    etwSpur = OpenTraceW(&lf);
+    if (etwSpur != INVALID_PROCESSTRACE_HANDLE) ProcessTrace(&etwSpur, 1, 0, 0);   // returns when the session stops
+    return 0;
+}
+
+static void etw_start(void)
+{
+    QueryPerformanceFrequency(&qpcHz);
+    acpiTakt = qpcHz.QuadPart * ACPI_TAKT_MS / 1000;
+    HANDLE h = CreateThread(0, 0, etw_faden, 0, 0, 0);
+    if (h) CloseHandle(h);
+}
+
+static void etw_stopp(void)
+{
+    if (etwSitzung) ControlTraceW(etwSitzung, 0, etw_eigenschaften(), EVENT_TRACE_CONTROL_STOP);
+    if (etwSpur != INVALID_PROCESSTRACE_HANDLE) CloseTrace(etwSpur);
+}
+
+// waits (at most ACPI_VOR_MS + ACPI_NACH_MS) while Windows' next query is due
+static void acpi_fenster(void)
+{
+    LONG64 t0 = acpiQpc, halb = acpiTakt / 2, f = qpcHz.QuadPart;
+    if (!t0 || halb <= 0) return;
+    LARGE_INTEGER jetzt; QueryPerformanceCounter(&jetzt);
+    LONG64 seit = jetzt.QuadPart - t0;
+    if (seit < 0 || seit > f * ACPI_ALT_MS / 1000) return;
+    LONG64 phase = seit % halb, vor = f * ACPI_VOR_MS / 1000, nach = f * ACPI_NACH_MS / 1000, warten = 0;
+    if (phase > halb - vor) warten = halb - phase + nach; else if (phase < nach) warten = nach - phase;
+    if (warten > 0) Sleep((DWORD)(warten * 1000 / f) + 1);
+}
+
+static int ec_lock(void) { acpi_fenster(); return WaitForSingleObject(mEc, 500) <= WAIT_ABANDONED; }
 
 static int ec_read(uint8_t reg)
 {
@@ -894,13 +981,19 @@ static void messen(Regler *r, Messung *m)
         ReleaseMutex(mPci);
     }
     // as few EC reads as possible: EC temperature every 5 s (second emergency path and the slow curve anchor; Tctl comes
-    // every second), fan speeds every 30 s for the display, one register a second (seconds 11-16), never during the
-    // quiet time; a value that is not confirmed or impossible (case above 110 °C) keeps the last reading
-    static const uint8_t regs[7] = { REG_TEMP, REG_L1, REG_L1 + 1, REG_L2, REG_L2 + 1, REG_SYS, REG_SYS + 1 };
-    for (int i = 0; i < 7; i++) {
-        if (i == 0 ? k % 5 : k % 30 != 10 + i) continue;
-        if (ec_ruhig()) break;
-        int v = ec_read_sicher(regs[i], r->ec[i]); if (v >= 0 && !(i == 0 && v > 110)) r->ec[i] = v;
+    // every second), fan speeds every 30 s for the display, one register a second, never during the quiet time; a value
+    // that is not confirmed or impossible (case above 110 °C) keeps the last reading. A speed is two bytes read a second
+    // apart: high, low, high again (seconds 1-4, 6-9, 11); the pair counts only if both high bytes match, else a speed
+    // crossing a multiple of 256 in between gives a value off by up to 255 rpm.
+    if (k % 5 == 0 && !ec_ruhig()) { int v = ec_read_sicher(REG_TEMP, r->ec[0]); if (v >= 0 && v <= 110) r->ec[0] = v; }
+    static const uint8_t sek[9] = { 1, 2, 3, 4, 6, 7, 8, 9, 11 }, regs[3] = { REG_L1, REG_L2, REG_SYS };
+    static int hoch[3] = { -1, -1, -1 }, tief[3] = { -1, -1, -1 };
+    for (int i = 0; i < 9; i++) {
+        if (k % 30 != sek[i] || ec_ruhig()) continue;
+        int l = i / 3, schritt = i % 3, v = ec_read((uint8_t)(regs[l] + (schritt == 1)));
+        if (schritt == 0) hoch[l] = v;
+        else if (schritt == 1) tief[l] = v;
+        else if (v >= 0 && v == hoch[l] && tief[l] >= 0) { r->ec[1 + 2 * l] = v; r->ec[2 + 2 * l] = tief[l]; }
     }
     m->Te = r->ec[0];
     // GPU every second while it works, every 2 s while it rests
@@ -1208,6 +1301,7 @@ static int run(void)
     hEc = pio_load(exeDir, L"LpcACPIEC");
     if (!hCpu || !hEc) { event(L_("pawnio", "PawnIO nicht erreichbar (Adminrechte? pawnio\\*.bin neben der exe?)")); return 1; }
     sh = shared_open();
+    etw_start();
 
     // safety: only control the EC we know (firmware 1.10 = bytes 01 0A at 0x00); a busy EC gets 3 s (ec_read_geduldig),
     // still unreadable or another version: read only. A stop during these reads ends the run before anything is done.
@@ -1262,6 +1356,10 @@ static int run(void)
         if (k == 0) { next += 1000; Sleep(1000); continue; }   // first round only primes the counters
         glaetten(r, &m);
         if (k % 30 == 25) acpi13_pruefen();
+        if (k == 120) {
+            if (acpiZahl > 1) event(L_("etw_an", "Windows-EC-Abfragen sichtbar (Takt %.2f s): EC-Zugriffe weichen ihnen aus"), (double)acpiTakt / qpcHz.QuadPart);
+            else event(L_("etw_aus", "Windows-EC-Abfragen nicht sichtbar: EC-Zugriffe wie bisher"));
+        }
         if (k % 5 == 0) einstellungen_pruefen(r, &iniSeen);
         int lg = lastart(r, &m);
         if (WaitForSingleObject(stopEv, 0) == WAIT_OBJECT_0) break;   // stop requested: no more writes this second
@@ -1299,6 +1397,7 @@ static int run(void)
               ok ? L_("stopp_ok", "zurück") : L_("stopp_fehler", "NICHT vollständig zurück"), fn & F_TAKT ? sicherMhz : r->capNow);
     } else event(L_("stopp_nurlesen", "Stopp (nur lesen)"));
     if (csv) CloseHandle(csv);
+    etw_stopp();
     CloseHandle(hCpu); CloseHandle(hEc);
     return 0;
 }
