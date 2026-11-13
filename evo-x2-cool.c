@@ -321,10 +321,13 @@ static TRACEHANDLE etwSitzung, etwSpur = INVALID_PROCESSTRACE_HANDLE;
 #define ACPI_RASTER_MS 30      // a query within this of the beat (full or half period) counts as on the beat
 #define ACPI_NAH_MS 10         // an access of ours this close to a query is noted
 #define ACPI_NEU_MS 25000      // no query on the beat for this long: the next one becomes the new reference
-enum { ABFRAGE_TAKT, ABFRAGE_HALB, ABFRAGE_AUSSER, ABFRAGE_NEU };
+enum { ABFRAGE_TAKT, ABFRAGE_HALB, ABFRAGE_AUSSER, ABFRAGE_NEU, ABFRAGE_EIGEN };
 static volatile LONG64 zugriffe[64]; static volatile LONG zugriffNr;
 typedef struct { LONG64 t; int art; float abwMs, zugriffMs; } Abfrage;
 static Abfrage abfragen[32]; static volatile LONG abfrageNr; static LONG abfrageGelesen;
+// our own WMI reads (wmi_lesen) also show up as Windows EC accesses: their time spans (QPC) mark them as our own, they
+// neither move the reference nor count as off the beat
+static volatile LONG64 wmiVon[16], wmiBis[16]; static volatile LONG wmiNr;
 
 static void WINAPI etw_ereignis(PEVENT_RECORD e)
 {
@@ -334,18 +337,33 @@ static void WINAPI etw_ereignis(PEVENT_RECORD e)
     if (letzte && t - letzte < f / 10) return;   // one query brings several events within a millisecond
     letzte = t;
     // the reference moves only with queries on the beat: one off the beat (the EC's own events) would otherwise shift the
-    // predicted windows away from the next regular query for up to 10 s
+    // predicted windows away from the next regular query for up to 10 s. A reference not yet confirmed by a query on the
+    // beat after it (the first one seen may be off the beat) is replaced as soon as two queries lie one or two periods
+    // apart, so the beat is found within about 10 s of the start instead of after ACPI_NEU_MS.
+    static LONG64 frueher[8]; static int frueherNr, bestaetigt;
     int art = ABFRAGE_NEU; float abw = 0;
-    if (alt && t - alt <= f * ACPI_NEU_MS / 1000) {
-        LONG64 halb = acpiTakt / 2, d = t - alt, n = (d + halb / 2) / halb, rest = d - n * halb;
+    for (int i = 0; i < 16; i++) if (wmiVon[i] && t >= wmiVon[i] - f / 500 && t <= wmiBis[i] + f / 500) { art = ABFRAGE_EIGEN; break; }
+    LONG64 halb = acpiTakt / 2, raster = f * ACPI_RASTER_MS / 1000;
+    if (art == ABFRAGE_EIGEN) ;
+    else if (alt && t - alt <= f * ACPI_NEU_MS / 1000) {
+        LONG64 d = t - alt, n = (d + halb / 2) / halb, rest = d - n * halb;
         abw = (float)rest * 1000 / f;
-        if (n > 0 && rest * 1000 < f * ACPI_RASTER_MS && -rest * 1000 < f * ACPI_RASTER_MS) {
+        if (n > 0 && rest < raster && -rest < raster) {
             art = n % 2 ? ABFRAGE_HALB : ABFRAGE_TAKT;
             if (n % 2 == 0) { LONG64 takt = acpiTakt; InterlockedExchange64(&acpiTakt, takt + (d * 2 / n - takt) / 4); }
             InterlockedExchange64(&acpiQpc, t);
-        } else art = ABFRAGE_AUSSER;
-    } else InterlockedExchange64(&acpiQpc, t);
-    InterlockedIncrement(&acpiZahl);
+            if (n % 2 == 0) bestaetigt = 1;   // only a full period confirms (a half one can match by chance)
+        } else {
+            art = ABFRAGE_AUSSER;
+            for (int i = 0; i < 8 && !bestaetigt; i++) {
+                LONG64 dd = t - frueher[i], nn = (dd + halb / 2) / halb, rr = dd - nn * halb;
+                if (frueher[i] && frueher[i] != alt && (nn == 2 || nn == 4) && rr < raster && -rr < raster) {
+                    art = ABFRAGE_NEU; InterlockedExchange64(&acpiQpc, t); bestaetigt = 1; break;
+                }
+            }
+        }
+    } else { InterlockedExchange64(&acpiQpc, t); bestaetigt = 0; }
+    if (art != ABFRAGE_EIGEN) { frueher[frueherNr++ % 8] = t; InterlockedIncrement(&acpiZahl); }
     LONG64 best = 0; int gefunden = 0;
     for (int i = 0; i < 64; i++) { LONG64 z = zugriffe[i]; if (z && (!gefunden || _abs64(z - t) < _abs64(best - t))) { best = z; gefunden = 1; } }
     Abfrage *a = &abfragen[abfrageNr % 32];
@@ -467,7 +485,12 @@ static long long wmi_lesen(const wchar_t *method, const wchar_t *in1, int v1, co
         VariantInit(&v); v.vt = VT_UI1; v.bVal = (BYTE)v1;
         if (in) IWbemClassObject_Put(in, in1, 0, &v, 0);
     }
-    if (SUCCEEDED(IWbemServices_ExecMethod(wSvc, wPath, m, 0, 0, in, &res, 0)) && res) {
+    LARGE_INTEGER t0, t1; QueryPerformanceCounter(&t0);
+    LONG nr = InterlockedIncrement(&wmiNr) % 16;
+    wmiBis[nr] = LLONG_MAX; wmiVon[nr] = t0.QuadPart;   // open span while the call runs
+    HRESULT hr = IWbemServices_ExecMethod(wSvc, wPath, m, 0, 0, in, &res, 0);
+    QueryPerformanceCounter(&t1); wmiBis[nr] = t1.QuadPart;
+    if (SUCCEEDED(hr) && res) {
         VariantInit(&v);
         if (SUCCEEDED(IWbemClassObject_Get(res, out, 0, &v, 0, 0)))
             r = v.vt == VT_I4 ? (long long)(uint32_t)v.lVal : v.vt == VT_UI1 ? v.bVal : v.vt == VT_I2 ? v.iVal : -1;
@@ -702,7 +725,7 @@ static void acpi13_pruefen(void)
 // 20 in 10 minutes, with the time to the millisecond to put them next to an ACPI 13); every 10 minutes a summary
 static void abfragen_melden(int zusammenfassen)
 {
-    static int zahl[4], nah, zeilen; static float minZugriff = 1e9f, maxAbw;
+    static int zahl[5], nah, zeilen; static float minZugriff = 1e9f, maxAbw;
     LARGE_INTEGER jetzt; QueryPerformanceCounter(&jetzt);
     FILETIME ftJetzt; GetSystemTimeAsFileTime(&ftJetzt);
     ULONGLONG uJetzt = ((ULONGLONG)ftJetzt.dwHighDateTime << 32) | ftJetzt.dwLowDateTime;
@@ -711,6 +734,7 @@ static void abfragen_melden(int zusammenfassen)
     for (; abfrageGelesen < bis; abfrageGelesen++) {
         Abfrage a = abfragen[abfrageGelesen % 32];
         zahl[a.art]++;
+        if (a.art == ABFRAGE_EIGEN) continue;
         if (a.art <= ABFRAGE_HALB && fabsf(a.abwMs) > maxAbw) maxAbw = fabsf(a.abwMs);
         if (fabsf(a.zugriffMs) < fabsf(minZugriff)) minZugriff = a.zugriffMs;
         int istNah = fabsf(a.zugriffMs) < ACPI_NAH_MS;
@@ -728,8 +752,9 @@ static void abfragen_melden(int zusammenfassen)
                   st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, a.abwMs, a.zugriffMs);
     }
     if (!zusammenfassen) return;
-    event(L_("etw_10min", "EC-Abfragen 10 min: %d im Takt, %d halb, %d außer Takt, %d neu; Zugriff nah %d, min %+.1f ms; Takt ±%.1f ms"),
-          zahl[ABFRAGE_TAKT], zahl[ABFRAGE_HALB], zahl[ABFRAGE_AUSSER], zahl[ABFRAGE_NEU], nah, minZugriff > 1e8f ? 0.0f : minZugriff, maxAbw);
+    event(L_("etw_10min2", "EC-Abfragen 10 min: %d Takt, %d halb, %d außer, %d neu, %d WMI; Zugriff nah %d, min %+.1f ms; Takt ±%.1f ms"),
+          zahl[ABFRAGE_TAKT], zahl[ABFRAGE_HALB], zahl[ABFRAGE_AUSSER], zahl[ABFRAGE_NEU], zahl[ABFRAGE_EIGEN], nah,
+          minZugriff > 1e8f ? 0.0f : minZugriff, maxAbw);
     memset(zahl, 0, sizeof zahl); nah = zeilen = 0; minZugriff = 1e9f; maxAbw = 0;
 }
 
