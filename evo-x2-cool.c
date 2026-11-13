@@ -417,6 +417,91 @@ static void acpi_fenster(void)
     }
 }
 
+// ---------- reading through the BIOS WMI interface ----------
+// The BIOS offers root\WMI PowerSwitchInterface (DSDT \AMW0.WMAA); its methods reach the EC fields through Windows' own
+// EC driver, which serializes them with Windows' queries, so a read there can never collide (ACPI 13). Only READ
+// methods are used: GetHwTemp(1) = EC temperature (0x70), GetFanControl(1) = speeds of both CPU fans (0x35-0x38) in
+// one 32-bit value (L1 low word, L2 high word). Measured 13.11.2026: same values as the direct reads, 7-15 ms a call.
+// Control stays as it is (curve tables in the EC, written directly; the EC keeps regulating if this service stops);
+// the system fan speed (0x28/0x29) is not offered and stays a direct read, once a minute. WMI failing 3 times in a
+// row: direct reads as before.
+#define COBJMACROS
+#include <wbemidl.h>
+#pragma comment(lib, "wbemuuid.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "oleaut32.lib")
+static IWbemServices *wSvc;
+static IWbemClassObject *wCls;
+static BSTR wPath;   // the instance, e.g. PowerSwitchInterface.InstanceName="ACPI\PNP0C14\IP3POWERSWITCH_0"
+static int wmiOk, wmiFehl;
+
+static int wmi_init(void)
+{
+    IWbemLocator *loc = 0; IEnumWbemClassObject *en = 0; IWbemClassObject *o = 0; ULONG n = 0; VARIANT v;
+    HRESULT hr = CoInitializeEx(0, COINIT_MULTITHREADED);
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) return 0;
+    CoInitializeSecurity(0, -1, 0, 0, RPC_C_AUTHN_LEVEL_DEFAULT, RPC_C_IMP_LEVEL_IMPERSONATE, 0, EOAC_NONE, 0);
+    if (FAILED(CoCreateInstance(&CLSID_WbemLocator, 0, CLSCTX_INPROC_SERVER, &IID_IWbemLocator, (void **)&loc))) return 0;
+    BSTR ns = SysAllocString(L"ROOT\\WMI"), cls = SysAllocString(L"PowerSwitchInterface");
+    hr = IWbemLocator_ConnectServer(loc, ns, 0, 0, 0, 0, 0, 0, &wSvc);
+    IWbemLocator_Release(loc);
+    if (SUCCEEDED(hr)) CoSetProxyBlanket((IUnknown *)wSvc, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, 0, RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE, 0, EOAC_NONE);
+    if (SUCCEEDED(hr)) hr = IWbemServices_GetObject(wSvc, cls, 0, 0, &wCls, 0);
+    if (SUCCEEDED(hr)) hr = IWbemServices_CreateInstanceEnum(wSvc, cls, WBEM_FLAG_FORWARD_ONLY, 0, &en);
+    if (SUCCEEDED(hr) && IEnumWbemClassObject_Next(en, 3000, 1, &o, &n) == WBEM_S_NO_ERROR && n == 1) {
+        if (SUCCEEDED(IWbemClassObject_Get(o, L"__RELPATH", 0, &v, 0, 0)) && v.vt == VT_BSTR) wPath = v.bstrVal;
+        IWbemClassObject_Release(o);
+    }
+    if (en) IEnumWbemClassObject_Release(en);
+    SysFreeString(ns); SysFreeString(cls);
+    return wPath != 0;
+}
+
+// one read method with one UInt8 input; returns the named output (or -1)
+static long long wmi_lesen(const wchar_t *method, const wchar_t *in1, int v1, const wchar_t *out)
+{
+    IWbemClassObject *def = 0, *in = 0, *res = 0; long long r = -1; VARIANT v;
+    BSTR m = SysAllocString(method);
+    if (SUCCEEDED(IWbemClassObject_GetMethod(wCls, method, 0, &def, 0)) && def) {
+        IWbemClassObject_SpawnInstance(def, 0, &in);
+        VariantInit(&v); v.vt = VT_UI1; v.bVal = (BYTE)v1;
+        if (in) IWbemClassObject_Put(in, in1, 0, &v, 0);
+    }
+    if (SUCCEEDED(IWbemServices_ExecMethod(wSvc, wPath, m, 0, 0, in, &res, 0)) && res) {
+        VariantInit(&v);
+        if (SUCCEEDED(IWbemClassObject_Get(res, out, 0, &v, 0, 0)))
+            r = v.vt == VT_I4 ? (long long)(uint32_t)v.lVal : v.vt == VT_UI1 ? v.bVal : v.vt == VT_I2 ? v.iVal : -1;
+        VariantClear(&v);
+        IWbemClassObject_Release(res);
+    }
+    if (in) IWbemClassObject_Release(in);
+    if (def) IWbemClassObject_Release(def);
+    SysFreeString(m);
+    return r;
+}
+
+// a failed call counts; 3 in a row: back to direct reads for the rest of the run
+static void wmi_ergebnis(int ok)
+{
+    if (ok) { wmiFehl = 0; return; }
+    if (++wmiFehl >= 3 && wmiOk) {
+        wmiOk = 0;
+        event2(1, L_("wmi_weg", "BIOS-Schnittstelle (WMI) antwortet nicht mehr: EC-Temperatur und Drehzahlen wieder direkt"));
+    }
+}
+// EC temperature; 0x7FFFFFFF (the BIOS' answer for an unknown sensor), 0 or above 110 °C count as no reading
+static int wmi_ec_temp(void) { long long t = wmi_lesen(L"GetHwTemp", L"HwTempType", 1, L"Temp"); wmi_ergebnis(t >= 10 && t <= 110); return t >= 10 && t <= 110 ? (int)t : -1; }
+// speeds of both CPU fans: r[0] = L1, r[1] = L2
+static int wmi_rpm(int r[2])
+{
+    long long v = wmi_lesen(L"GetFanControl", L"FanNumber", 1, L"FanDuty");
+    int ok = v >= 0 && v != 0x7FFFFFFF && (v & 0xFFFF) < 10000 && (v >> 16 & 0xFFFF) < 10000;
+    wmi_ergebnis(ok);
+    if (!ok) return 0;
+    r[0] = (int)(v & 0xFFFF); r[1] = (int)(v >> 16 & 0xFFFF);
+    return 1;
+}
+
 // the window is checked while the mutex is held: another EC program (LibreHardwareMonitor ...) holding it up to 500 ms
 // would otherwise move our transaction into the query; it waits at most the window length, as during its own accesses
 static int ec_lock(void)
@@ -1065,11 +1150,22 @@ static void messen(Regler *r, Messung *m)
     // that is not confirmed or impossible (case above 110 °C) keeps the last reading. A speed is two bytes read a second
     // apart: high, low, high again (seconds 1-4, 6-9, 11); the pair counts only if both high bytes match, else a speed
     // crossing a multiple of 256 in between gives a value off by up to 255 rpm.
-    if (k % 5 == 0 && !ec_ruhig()) { int v = ec_read_sicher(REG_TEMP, r->ec[0]); if (v >= 0 && v <= 110) r->ec[0] = v; }
+    // With WMI (see wmi_init) the EC temperature and both CPU fans come from there (fans in second 1 of 30), only the
+    // system fan is read directly, once a minute.
+    if (k % 5 == 0 && !ec_ruhig()) {
+        int v = wmiOk ? wmi_ec_temp() : -1;
+        if (v < 0 && !wmiOk) v = ec_read_sicher(REG_TEMP, r->ec[0]);
+        if (v >= 0 && v <= 110) r->ec[0] = v;
+    }
+    if (wmiOk && k % 30 == 1 && !ec_ruhig()) {
+        int rpm[2];
+        if (wmi_rpm(rpm)) { r->ec[1] = rpm[0] >> 8; r->ec[2] = rpm[0] & 0xFF; r->ec[3] = rpm[1] >> 8; r->ec[4] = rpm[1] & 0xFF; }
+    }
     static const uint8_t sek[9] = { 1, 2, 3, 4, 6, 7, 8, 9, 11 }, regs[3] = { REG_L1, REG_L2, REG_SYS };
     static int hoch[3] = { -1, -1, -1 }, tief[3] = { -1, -1, -1 };
     for (int i = 0; i < 9; i++) {
         if (k % 30 != sek[i] || ec_ruhig()) continue;
+        if (wmiOk && (i < 6 || k % 60 >= 30)) continue;   // CPU fans through WMI; system fan every other cycle
         int l = i / 3, schritt = i % 3;
         if (schritt == 0) { hoch[l] = ec_read(regs[l]); tief[l] = -1; }   // a step skipped in the quiet time leaves -1:
         else if (schritt == 1) tief[l] = hoch[l] < 0 ? -1 : ec_read_sicher((uint8_t)(regs[l] + 1), r->ec[2 + 2 * l]);  // no mixing with bytes
@@ -1386,6 +1482,9 @@ static int run(void)
     if (!hCpu || !hEc) { event(L_("pawnio", "PawnIO nicht erreichbar (Adminrechte? pawnio\\*.bin neben der exe?)")); return 1; }
     sh = shared_open();
     etw_start();
+    wmiOk = !ohneEc && wmi_init();
+    event(wmiOk ? L_("wmi_lesen", "EC-Temperatur und CPU-Lüfterdrehzahl über die BIOS-Schnittstelle (WMI) gelesen, Steuerung weiter direkt")
+                : L_("wmi_lesen_aus", "BIOS-Schnittstelle (WMI) nicht verfügbar: alles direkt über den EC gelesen"));
 
     // safety: only control the EC we know (firmware 1.10 = bytes 01 0A at 0x00); a busy EC gets 3 s (ec_read_geduldig),
     // still unreadable or another version: read only. A stop during these reads ends the run before anything is done.
