@@ -5,8 +5,8 @@
 #include <stdint.h>
 #include <wchar.h>
 
-#define EVO_VERSION   "0.7.1"   // also AppVer in installer\evo-x2-cool.iss and the git tag v0.7.1
-#define EVO_VERSION_W L"0.7.1"
+#define EVO_VERSION   "0.6.11"   // also AppVer in installer\evo-x2-cool.iss and the git tag v0.6.11
+#define EVO_VERSION_W L"0.6.11"
 #define EVO_SHM    L"Global\\evo-x2-cool"
 #define EVO_STOPP  L"Global\\evo-x2-cool-stopp"   // set it and the controller restores everything and ends (service too)
 #define EVO_MAGIC  0x45564F37u   // "EVO7", changes with the layout below so an old window does not misread a new controller
@@ -14,7 +14,7 @@
 #define EVO_EV     256           // events kept
 
 enum { LAGE_WENIGE, LAGE_VIELE, LAGE_GRAFIK, LAGE_BEIDE, EVO_NLAGE };   // BEIDE = GPU busy and many cores
-enum { GRUND_MODELL, GRUND_VORHERSAGE, GRUND_NACHREGELN, GRUND_NOTFALL, GRUND_NUR_LESEN, GRUND_ACHTUNG };
+enum { GRUND_MODELL, GRUND_VORHERSAGE, GRUND_NACHREGELN, GRUND_NOTFALL, GRUND_NUR_LESEN, GRUND_ACHTUNG, GRUND_VORBEUGEN };
 
 // functions that can be switched off in einstellungen.ini, section [Funktionen] (1 = on). The emergency (fan 100 %
 // when overheating) cannot be switched off: it takes over even while the fan control is off.
