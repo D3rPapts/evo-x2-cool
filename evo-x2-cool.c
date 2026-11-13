@@ -490,7 +490,15 @@ static void wmi_ergebnis(int ok)
     }
 }
 // EC temperature; 0x7FFFFFFF (the BIOS' answer for an unknown sensor), 0 or above 110 °C count as no reading
-static int wmi_ec_temp(void) { long long t = wmi_lesen(L"GetHwTemp", L"HwTempType", 1, L"Temp"); wmi_ergebnis(t >= 10 && t <= 110); return t >= 10 && t <= 110 ? (int)t : -1; }
+// GetHwTemp(1) packs four EC bytes (DSDT): CPUT 0x70 (byte 0, the one used), GPUT 0x71, CPAD 0x72, GPAD 0x73 (all 0 on
+// the EVO-X2, 13.11.2026); only byte 0 counts, so a BIOS that fills the others changes nothing
+static int wmi_ec_temp(void)
+{
+    long long v = wmi_lesen(L"GetHwTemp", L"HwTempType", 1, L"Temp");
+    int t = v < 0 || v == 0x7FFFFFFF ? -1 : (int)(v & 0xFF), ok = t >= 10 && t <= 110;
+    wmi_ergebnis(ok);
+    return ok ? t : -1;
+}
 // speeds of both CPU fans: r[0] = L1, r[1] = L2
 static int wmi_rpm(int r[2])
 {
