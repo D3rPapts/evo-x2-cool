@@ -296,10 +296,10 @@ static int ec_read_raw(uint8_t reg)
     if (!ec_wait(EC_OBF, EC_OBF)) return -1; return pin(EC_DATA);
 }
 
-// ---------- Windows' own EC query (ETW Microsoft-Windows-Kernel-Acpi, event 105) ----------
+// ---------- Windows' own EC query (ETW Microsoft-Windows-Kernel-Acpi, event 7) ----------
 // The EC raises SCI_EVT about every 10.05 s (now and then one extra half way) and Windows queries it at once, for ~1 ms
 // (measured 08.11.2026). A transaction of ours overlapping that query makes Windows time out (ACPI event 13). Windows
-// reports every query as ETW event 105 with an exact time stamp, so the next one is predictable: a thread listens the
+// reports every query as ETW event 7 with an exact time stamp, so the next one is predictable: a thread listens the
 // whole time (it sleeps until the kernel hands over an event, a few small events every 10 s), and before each transaction
 // acpi_fenster() waits while a query is due, from ACPI_VOR_MS before to ACPI_NACH_MS after (also at half the period).
 // ETW delivers late (buffers, flushed every second), but the time stamps are exact. Without a query seen for ACPI_ALT_MS
@@ -317,7 +317,7 @@ static TRACEHANDLE etwSitzung, etwSpur = INVALID_PROCESSTRACE_HANDLE;
 
 static void WINAPI etw_ereignis(PEVENT_RECORD e)
 {
-    if (e->EventHeader.EventDescriptor.Id != 105) return;
+    if (e->EventHeader.EventDescriptor.Id != 7) return;   // 4 events per query (keyword 0x200000000001)
     LONG64 t = e->EventHeader.TimeStamp.QuadPart, alt = acpiQpc;
     if (alt && t - alt < qpcHz.QuadPart / 10) return;   // one query brings several events within a millisecond
     if (alt) {
@@ -344,10 +344,10 @@ static DWORD WINAPI etw_faden(void *x)
     p->Wnode.Flags = WNODE_FLAG_TRACED_GUID; p->Wnode.ClientContext = 1;   // time stamps in QPC ticks
     p->LogFileMode = EVENT_TRACE_REAL_TIME_MODE; p->FlushTimer = 1; p->BufferSize = 4; p->MinimumBuffers = 2; p->MaximumBuffers = 4;
     if (StartTraceW(&etwSitzung, etwName, p) != ERROR_SUCCESS) { etwSitzung = 0; return 0; }
-    if (EnableTraceEx2(etwSitzung, &ACPI_PROV, EVENT_CONTROL_CODE_ENABLE_PROVIDER, TRACE_LEVEL_VERBOSE, 0, 0, 0, 0) != ERROR_SUCCESS) return 0;
+    if (EnableTraceEx2(etwSitzung, &ACPI_PROV, EVENT_CONTROL_CODE_ENABLE_PROVIDER, TRACE_LEVEL_VERBOSE, ~0ULL, 0, 0, 0) != ERROR_SUCCESS) return 0;
     EVENT_TRACE_LOGFILEW lf = { 0 };
     lf.LoggerName = etwName;
-    lf.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
+    lf.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD | PROCESS_TRACE_MODE_RAW_TIMESTAMP;   // QPC, not FILETIME
     lf.EventRecordCallback = etw_ereignis;
     etwSpur = OpenTraceW(&lf);
     if (etwSpur != INVALID_PROCESSTRACE_HANDLE) ProcessTrace(&etwSpur, 1, 0, 0);   // returns when the session stops

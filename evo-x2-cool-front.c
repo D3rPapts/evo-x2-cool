@@ -841,7 +841,7 @@ static void set_title(HWND w)
     if (wcscmp(cur, t)) SetWindowTextW(w, t);
 }
 
-// ---------- update check: once a day the window asks GitHub for the newest release (prereleases too) and only SHOWS
+// ---------- update check: once a day the window asks GitHub for the release marked "Latest" and only SHOWS
 // a newer version (button, tray menu, one balloon per version). Nothing is downloaded or installed: the setup is
 // unsigned and brings a driver, so a person decides. [Anzeige] UpdatePruefen=0 switches it off. The controller service
 // itself never goes online. ----------
@@ -852,7 +852,7 @@ static int fetch_latest(char tag[16])
     int ok = 0;
     HINTERNET s = WinHttpOpen(L"evo-x2-cool/" EVO_VERSION_W, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0), c = 0, r = 0;
     if (s) { WinHttpSetTimeouts(s, 10000, 10000, 10000, 10000); c = WinHttpConnect(s, L"api.github.com", INTERNET_DEFAULT_HTTPS_PORT, 0); }
-    if (c) r = WinHttpOpenRequest(c, L"GET", L"/repos/D3rPapts/evo-x2-cool/releases?per_page=1", 0, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    if (c) r = WinHttpOpenRequest(c, L"GET", L"/repos/D3rPapts/evo-x2-cool/releases/latest", 0, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
     if (r && WinHttpSendRequest(r, L"Accept: application/vnd.github+json\r\n", (DWORD)-1, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) && WinHttpReceiveResponse(r, 0)) {
         static char buf[8192]; DWORD got = 0, total = 0;   // tag_name comes early in the answer
         while (total < sizeof buf - 1 && WinHttpReadData(r, buf + total, sizeof buf - 1 - total, &got) && got) total += got;
