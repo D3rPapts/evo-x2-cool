@@ -6,9 +6,9 @@
 // situation (GPU / many cores / emergency), the event list, and a tooltip with the values under the mouse.
 // Keys 1-4 or the buttons change the time span. The switches on the right turn single functions of the controller on and off
 // (written to einstellungen.ini, which the controller re-reads within 5 s). Texts come from sprache-<code>.ini next to the exe.
-// An icon next to the clock shows the current values as tooltip and turns red while it is too hot. Closing the window ends
-// the viewer (the controller keeps running); --leiste starts with the icon only. A second start brings the running window
-// to the front.
+// An icon next to the clock shows the current values as tooltip and turns red while it is too hot. Closing the window (X)
+// hides it and the icon stays; the viewer ends from the icon's menu (the controller keeps running either way). --leiste
+// starts with the icon only. A second start brings the running window to the front.
 #define WIN32_LEAN_AND_MEAN
 #define UNICODE
 #define _CRT_SECURE_NO_WARNINGS
@@ -117,34 +117,28 @@ static void load_lang(void)
     zoom = GetPrivateProfileIntW(L"Anzeige", L"Zoom", 0, iniFile) != 0;
 }
 
+// one button of the top row, right-aligned at *right; moves *right to the left of it
+static void top_button(HDC dc, RECT *r, int *right, int y, COLORREF bg, COLORREF fg, const wchar_t *label)
+{
+    SelectObject(dc, fText); SIZE sz; GetTextExtentPoint32W(dc, label, (int)wcslen(label), &sz);
+    *r = (RECT){ *right - sz.cx - S(20), y, *right, y + S(22) };
+    fill(dc, *r, bg, S(8));
+    text(dc, fText, (r->left + r->right) / 2, y + S(3), fg, 2, L"%s", label);
+    *right = r->left - S(6);
+}
+
 // theme and language buttons at the right end of a row; returns their left edge
 static int top_buttons(HDC dc, int right, int y)
 {
     const wchar_t *tl = thema == 1 ? T(L"thema1", L"☀ Hell") : thema == 2 ? T(L"thema2", L"☾ Dunkel") : T(L"thema0", L"◐ System");
     wchar_t sl[24]; swprintf(sl, 24, L"🌐 %s", langCode); CharUpperW(sl + 3);
     const wchar_t *lb[2] = { sl, tl }; RECT *rb[2] = { &btnSprache, &btnThema };
-    for (int i = 0; i < 2; i++) {
-        SelectObject(dc, fText); SIZE sz; GetTextExtentPoint32W(dc, lb[i], (int)wcslen(lb[i]), &sz);
-        *rb[i] = (RECT){ right - sz.cx - S(20), y, right, y + S(22) };
-        fill(dc, *rb[i], C_CARD, S(8));
-        text(dc, fText, (rb[i]->left + rb[i]->right) / 2, y + S(3), C_TEXT, 2, L"%s", lb[i]);
-        right = rb[i]->left - S(6);
-    }
-    {   // save the logs as ZIP on the desktop (also in the tray menu), so people can send them to us
-        const wchar_t *ll = logsLaeuft ? T(L"logs_laeuft", L"⏳ Logs werden gespeichert …") : T(L"logs_knopf", L"💾 Logs speichern");
-        SelectObject(dc, fText); SIZE sz; GetTextExtentPoint32W(dc, ll, (int)wcslen(ll), &sz);
-        btnLogs = (RECT){ right - sz.cx - S(20), y, right, y + S(22) };
-        fill(dc, btnLogs, C_CARD, S(8));
-        text(dc, fText, (btnLogs.left + btnLogs.right) / 2, y + S(3), C_TEXT, 2, L"%s", ll);
-        right = btnLogs.left - S(6);
-    }
+    for (int i = 0; i < 2; i++) top_button(dc, rb[i], &right, y, C_CARD, C_TEXT, lb[i]);
+    // save the logs as ZIP on the desktop (also in the tray menu), so people can send them to us
+    top_button(dc, &btnLogs, &right, y, C_CARD, C_TEXT, logsLaeuft ? T(L"logs_laeuft", L"⏳ Logs werden gespeichert …") : T(L"logs_knopf", L"💾 Logs speichern"));
     if (updVer[0]) {   // newer version on GitHub: one more button, opens the release page
         wchar_t ul[48]; swprintf(ul, 48, T(L"upd_knopf", L"⬆ Version %s"), updVer);
-        SelectObject(dc, fText); SIZE sz; GetTextExtentPoint32W(dc, ul, (int)wcslen(ul), &sz);
-        btnUpdate = (RECT){ right - sz.cx - S(20), y, right, y + S(22) };
-        fill(dc, btnUpdate, C_OK, S(8));
-        text(dc, fText, (btnUpdate.left + btnUpdate.right) / 2, y + S(3), RGB(255, 255, 255), 2, L"%s", ul);
-        right = btnUpdate.left - S(6);
+        top_button(dc, &btnUpdate, &right, y, C_OK, RGB(255, 255, 255), ul);
     } else SetRectEmpty(&btnUpdate);
     return right;
 }
@@ -187,6 +181,7 @@ static const wchar_t *grundText(int i)
     case GRUND_NOTFALL: return T(L"grund3", L"NOTFALL");
     case GRUND_NUR_LESEN: return T(L"grund4", L"nur lesen");
     case GRUND_ACHTUNG: return T(L"grund5", L"Achtung, steigt");
+    case GRUND_VORBEUGEN: return T(L"grund6", L"vorbeugend (Grafik + Kerne)");
     default: return T(L"grund0", L"nach Modell");
     }
 }
@@ -457,7 +452,7 @@ static void paint(HWND w, HDC dc)
         return;
     }
     uint32_t n = sh->nSample;
-    span = spans[spanIdx]; count = n < span ? n : span; if (count > EVO_N) count = EVO_N; first = n - count;
+    span = spans[spanIdx]; count = n < span ? n : span; if (count > EVO_N - 1) count = EVO_N - 1; first = n - count;   // slot n % EVO_N is the next one overwritten
     const EvoSample *cur = &sh->s[(n - 1) % EVO_N];
     int stale = (int)(time(0) - cur->t) > 5;
 
@@ -654,26 +649,21 @@ static void paint(HWND w, HDC dc)
     {
         static const wchar_t *stKey[3] = { L"z_ziel", L"z_achtung", L"z_alarm" }, *stDef[3] = { L"Ziel", L"Achtung (Lüfter steigt)", L"Alarm (Lüfter voll)" };
         const COLORREF stC[3] = { C_OK, C_CAP, C_HOT }; COLORREF bc = sh->nurLesen ? C_GRID : C_OFF;
-        for (int j = 0; j < 3; j++) {
-            int zy = sc.top + S(40) + (2 - j) * S(30);   // red on top, like the temperature scale
-            RECT dot = { sc.left + S(14), zy + S(7), sc.left + S(24), zy + S(17) }; fill(dc, dot, stC[j], S(10));
-            text(dc, fText, sc.left + S(32), zy + S(2), C_TEXT, 0, L"%s", T(stKey[j], stDef[j]));
+        // rows 0-2: red on top, like the temperature scale; row 3: clock plus (test switch TaktPlus), added to every cap of
+        // the clock brake, 100 MHz per click, -600..+600
+        for (int j = 0; j < 4; j++) {
+            int zy = j < 3 ? sc.top + S(40) + (2 - j) * S(30) : sc.top + S(130);
+            if (j < 3) { RECT dot = { sc.left + S(14), zy + S(7), sc.left + S(24), zy + S(17) }; fill(dc, dot, stC[j], S(10)); }
+            text(dc, fText, sc.left + S(32), zy + S(2), C_TEXT, 0, L"%s", j < 3 ? T(stKey[j], stDef[j]) : T(L"z_takt", L"Taktgrenze (MHz)"));
             stPlus[j] = (RECT){ sc.right - S(38), zy, sc.right - S(14), zy + S(24) };
             stMinus[j] = (RECT){ stPlus[j].left - S(94), zy, stPlus[j].left - S(70), zy + S(24) };
             fill(dc, stMinus[j], bc, S(8)); fill(dc, stPlus[j], bc, S(8));
             text(dc, fBold, (stMinus[j].left + stMinus[j].right) / 2, zy + S(2), C_TEXT, 2, L"−");
             text(dc, fBold, (stPlus[j].left + stPlus[j].right) / 2, zy + S(2), C_TEXT, 2, L"+");
-            text(dc, fBold, (stMinus[j].right + stPlus[j].left) / 2, zy + S(2), now < stUntil[j] ? C_WARM : C_TEXT, 2, L"%.0f °C", cur_stufe(j));
+            int mx = (stMinus[j].right + stPlus[j].left) / 2;
+            if (j < 3) text(dc, fBold, mx, zy + S(2), now < stUntil[j] ? C_WARM : C_TEXT, 2, L"%.0f °C", cur_stufe(j));
+            else text(dc, fBold, mx, zy + S(2), now < stUntil[3] ? C_WARM : cur_stufe(3) ? C_CAP : C_TEXT, 2, L"%+.0f", cur_stufe(3));
         }
-        // clock plus (test switch TaktPlus): added to every cap of the clock brake, 100 MHz per click, -600..+600
-        int zy = sc.top + S(130);
-        text(dc, fText, sc.left + S(32), zy + S(2), C_TEXT, 0, L"%s", T(L"z_takt", L"Taktgrenze (MHz)"));
-        stPlus[3] = (RECT){ sc.right - S(38), zy, sc.right - S(14), zy + S(24) };
-        stMinus[3] = (RECT){ stPlus[3].left - S(94), zy, stPlus[3].left - S(70), zy + S(24) };
-        fill(dc, stMinus[3], bc, S(8)); fill(dc, stPlus[3], bc, S(8));
-        text(dc, fBold, (stMinus[3].left + stMinus[3].right) / 2, zy + S(2), C_TEXT, 2, L"−");
-        text(dc, fBold, (stPlus[3].left + stPlus[3].right) / 2, zy + S(2), C_TEXT, 2, L"+");
-        text(dc, fBold, (stMinus[3].right + stPlus[3].left) / 2, zy + S(2), now < stUntil[3] ? C_WARM : cur_stufe(3) ? C_CAP : C_TEXT, 2, L"%+.0f", cur_stufe(3));
     }
     for (int i = 0; i < EVO_NFUNK; i++) {
         int y = sc.top + S(164) + i * S(28), isOn = on >> i & 1;
@@ -781,7 +771,8 @@ static void tray_update(void)   // once per second; talks to explorer only when 
         else swprintf(l1, 48, T(L"t_tip1b", L"CPU %.0f °C"), c->tctl);
         if (c->cap) swprintf(cap, 48, T(L"tr_cap", L"Taktbremse %d MHz"), c->cap); else wcscpy(cap, T(L"t_capaus", L"Taktbremse aus"));
         n += swprintf(tip + n, 128 - n, L"%s\n", l1);
-        swprintf(tip + n, 128 - n, T(L"t_tip2", L"Lüfter %d %% · %s"), c->fan, cap);
+        if (c->fan >= 0) swprintf(tip + n, 128 - n, T(L"t_tip2", L"Lüfter %d %% · %s"), c->fan, cap);
+        else swprintf(tip + n, 128 - n, T(L"t_tip2b", L"Lüfter BIOS · %s"), cap);
         if (c->grund == GRUND_NOTFALL || c->tctl >= sh->spitze) ico = icoHeiss;
     }
     if (ico != tray.hIcon || wcscmp(tip, tray.szTip)) { tray.hIcon = ico; wcscpy(tray.szTip, tip); Shell_NotifyIconW(NIM_MODIFY, &tray); }
@@ -1040,9 +1031,8 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         }
         InvalidateRect(w, 0, FALSE); return 0;
     }
-    // closing ends the viewer: a hidden window could not be brought back from a taskbar pin (30.10., clicks did nothing)
-    // X hides the window and keeps the icon next to the clock (Fabian 01.11.: since 0.6.6 X ended everything and the icon
-    // was gone); really ending is in the icon's menu. Windows logging off still ends it through WM_ENDSESSION/WM_DESTROY
+    // X hides the window and keeps the icon next to the clock; really ending is in the icon's menu. Windows logging off
+    // still ends it through WM_ENDSESSION/WM_DESTROY
     case WM_CLOSE: anz_log("window hidden (X), icon stays"); show_window(w, 0); return 0;
     case WM_ENDE: endeGrund = "asked by the installer"; DestroyWindow(w); return 0;
     case WM_ENDSESSION: if (wp) anz_log("ends: Windows logs off or shuts down"); return 0;
