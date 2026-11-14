@@ -38,6 +38,8 @@
 #include <math.h>
 #include <time.h>
 #include <winevt.h>
+#include <evntrace.h>
+#include <evntcons.h>
 #include "evo.h"
 #pragma comment(lib, "powrprof.lib")
 #pragma comment(lib, "advapi32.lib")
@@ -294,7 +296,253 @@ static int ec_read_raw(uint8_t reg)
     if (!ec_wait(EC_OBF, EC_OBF)) return -1; return pin(EC_DATA);
 }
 
-static int ec_lock(void) { return WaitForSingleObject(mEc, 500) <= WAIT_ABANDONED; }
+// ---------- Windows' own EC query (ETW Microsoft-Windows-Kernel-Acpi, event 7) ----------
+// The EC raises SCI_EVT about every 10.07 s (now and then one extra half way) and Windows queries it at once, for ~1 ms
+// (measured 08.11.2026). A transaction of ours overlapping that query makes Windows time out (ACPI event 13). Windows
+// reports every query as ETW event 7 with an exact time stamp, so the next one is predictable: a thread listens the
+// whole time (it sleeps until the kernel hands over an event, a few small events every 10 s), and before each transaction
+// acpi_fenster() waits while a query is due, from ACPI_VOR_MS before to ACPI_NACH_MS after (also at half the period).
+// ETW delivers late (buffers, flushed every second), but the time stamps are exact. Without a query seen for ACPI_ALT_MS
+// (session could not start, other Windows) nothing waits, as in 0.6.11.
+static const GUID ACPI_PROV = { 0xC514638F, 0x7723, 0x485B, { 0xBC, 0xFC, 0x96, 0x56, 0x5D, 0x73, 0x5D, 0x4A } };
+static wchar_t etwName[] = L"EVO-X2-COOL-ACPI";
+#define ACPI_TAKT_MS 10066
+#define ACPI_VOR_MS 40
+#define ACPI_NACH_MS 25
+#define ACPI_ALT_MS 60000
+static volatile LONG64 acpiQpc, acpiTakt;   // QPC time stamp of the last query; learned period in QPC ticks
+static volatile LONG acpiZahl;
+static LARGE_INTEGER qpcHz;
+static TRACEHANDLE etwSitzung, etwSpur = INVALID_PROCESSTRACE_HANDLE;
+
+// Diagnosis (does a remaining ACPI 13 come from a query off the beat, or from an access of ours too close to one on the
+// beat?): ec_lock() notes the start of each of our transactions, the ETW thread notes for each query its kind and the
+// nearest access of ours, the main loop writes the remarkable ones and a summary every 10 minutes into the event list.
+#define ACPI_RASTER_MS 30      // a query within this of the beat (full or half period) counts as on the beat
+#define ACPI_NAH_MS 10         // an access of ours this close to a query is noted
+#define ACPI_NEU_MS 25000      // no query on the beat for this long: the next one becomes the new reference
+enum { ABFRAGE_TAKT, ABFRAGE_HALB, ABFRAGE_AUSSER, ABFRAGE_NEU, ABFRAGE_EIGEN };
+static volatile LONG64 zugriffe[64]; static volatile LONG zugriffNr;
+typedef struct { LONG64 t; int art; float abwMs, zugriffMs; } Abfrage;
+static Abfrage abfragen[32]; static volatile LONG abfrageNr; static LONG abfrageGelesen;
+// our own WMI reads (wmi_lesen) also show up as Windows EC accesses: their time spans (QPC) mark them as our own, they
+// neither move the reference nor count as off the beat
+static volatile LONG64 wmiVon[16], wmiBis[16]; static volatile LONG wmiNr;
+
+static void WINAPI etw_ereignis(PEVENT_RECORD e)
+{
+    if (e->EventHeader.EventDescriptor.Id != 7) return;   // 4 events per query (keyword 0x200000000001)
+    static LONG64 letzte;
+    LONG64 t = e->EventHeader.TimeStamp.QuadPart, f = qpcHz.QuadPart, alt = acpiQpc;
+    if (letzte && t - letzte < f / 10) return;   // one query brings several events within a millisecond
+    letzte = t;
+    // the reference moves only with queries on the beat: one off the beat (the EC's own events) would otherwise shift the
+    // predicted windows away from the next regular query for up to 10 s. A reference not yet confirmed by a query on the
+    // beat after it (the first one seen may be off the beat) is replaced as soon as two queries lie one or two periods
+    // apart, so the beat is found within about 10 s of the start instead of after ACPI_NEU_MS.
+    static LONG64 frueher[8]; static int frueherNr, bestaetigt;
+    int art = ABFRAGE_NEU; float abw = 0;
+    for (int i = 0; i < 16; i++) if (wmiVon[i] && t >= wmiVon[i] - f / 500 && t <= wmiBis[i] + f / 500) { art = ABFRAGE_EIGEN; break; }
+    LONG64 halb = acpiTakt / 2, raster = f * ACPI_RASTER_MS / 1000;
+    if (art == ABFRAGE_EIGEN) ;
+    else if (alt && t - alt <= f * ACPI_NEU_MS / 1000) {
+        LONG64 d = t - alt, n = (d + halb / 2) / halb, rest = d - n * halb;
+        abw = (float)rest * 1000 / f;
+        if (n > 0 && rest < raster && -rest < raster) {
+            art = n % 2 ? ABFRAGE_HALB : ABFRAGE_TAKT;
+            if (n % 2 == 0) { LONG64 takt = acpiTakt; InterlockedExchange64(&acpiTakt, takt + (d * 2 / n - takt) / 4); }
+            InterlockedExchange64(&acpiQpc, t);
+            if (n % 2 == 0) bestaetigt = 1;   // only a full period confirms (a half one can match by chance)
+        } else {
+            art = ABFRAGE_AUSSER;
+            for (int i = 0; i < 8 && !bestaetigt; i++) {
+                LONG64 dd = t - frueher[i], nn = (dd + halb / 2) / halb, rr = dd - nn * halb;
+                if (frueher[i] && frueher[i] != alt && (nn == 2 || nn == 4) && rr < raster && -rr < raster) {
+                    art = ABFRAGE_NEU; InterlockedExchange64(&acpiQpc, t); bestaetigt = 1; break;
+                }
+            }
+        }
+    } else { InterlockedExchange64(&acpiQpc, t); bestaetigt = 0; }
+    if (art != ABFRAGE_EIGEN) { frueher[frueherNr++ % 8] = t; InterlockedIncrement(&acpiZahl); }
+    LONG64 best = 0; int gefunden = 0;
+    for (int i = 0; i < 64; i++) { LONG64 z = zugriffe[i]; if (z && (!gefunden || _abs64(z - t) < _abs64(best - t))) { best = z; gefunden = 1; } }
+    Abfrage *a = &abfragen[abfrageNr % 32];
+    a->t = t; a->art = art; a->abwMs = abw; a->zugriffMs = gefunden ? (float)(best - t) * 1000 / f : 1e9f;
+    InterlockedIncrement(&abfrageNr);
+}
+
+static EVENT_TRACE_PROPERTIES *etw_eigenschaften(void)
+{
+    static union { EVENT_TRACE_PROPERTIES p; char raum[sizeof(EVENT_TRACE_PROPERTIES) + 256]; } u;
+    memset(&u, 0, sizeof u);
+    u.p.Wnode.BufferSize = sizeof u; u.p.LoggerNameOffset = sizeof u.p;
+    return &u.p;
+}
+
+static DWORD WINAPI etw_faden(void *x)
+{
+    (void)x;
+    ControlTraceW(0, etwName, etw_eigenschaften(), EVENT_TRACE_CONTROL_STOP);   // left over from a killed run
+    EVENT_TRACE_PROPERTIES *p = etw_eigenschaften();
+    p->Wnode.Flags = WNODE_FLAG_TRACED_GUID; p->Wnode.ClientContext = 1;   // time stamps in QPC ticks
+    p->LogFileMode = EVENT_TRACE_REAL_TIME_MODE; p->FlushTimer = 1; p->BufferSize = 4; p->MinimumBuffers = 2; p->MaximumBuffers = 4;
+    if (StartTraceW(&etwSitzung, etwName, p) != ERROR_SUCCESS) { etwSitzung = 0; return 0; }
+    // only event 7 into the small buffers (a burst of other ACPI events could fill them and push out the ones we need);
+    // the keyword mask stays open, a narrower one delivered nothing in the test
+    EVENT_FILTER_EVENT_ID ids = { TRUE, 0, 1, { 7 } };
+    EVENT_FILTER_DESCRIPTOR fd = { (ULONGLONG)(ULONG_PTR)&ids, sizeof ids, EVENT_FILTER_TYPE_EVENT_ID };
+    ENABLE_TRACE_PARAMETERS ep = { 0 };
+    ep.Version = ENABLE_TRACE_PARAMETERS_VERSION_2; ep.EnableFilterDesc = &fd; ep.FilterDescCount = 1;
+    if (EnableTraceEx2(etwSitzung, &ACPI_PROV, EVENT_CONTROL_CODE_ENABLE_PROVIDER, TRACE_LEVEL_VERBOSE, ~0ULL, 0, 0, &ep) != ERROR_SUCCESS
+        && EnableTraceEx2(etwSitzung, &ACPI_PROV, EVENT_CONTROL_CODE_ENABLE_PROVIDER, TRACE_LEVEL_VERBOSE, ~0ULL, 0, 0, 0) != ERROR_SUCCESS) return 0;
+    EVENT_TRACE_LOGFILEW lf = { 0 };
+    lf.LoggerName = etwName;
+    lf.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD | PROCESS_TRACE_MODE_RAW_TIMESTAMP;   // QPC, not FILETIME
+    lf.EventRecordCallback = etw_ereignis;
+    etwSpur = OpenTraceW(&lf);
+    if (etwSpur != INVALID_PROCESSTRACE_HANDLE) ProcessTrace(&etwSpur, 1, 0, 0);   // returns when the session stops
+    return 0;
+}
+
+static void etw_start(void)
+{
+    QueryPerformanceFrequency(&qpcHz);
+    acpiTakt = qpcHz.QuadPart * ACPI_TAKT_MS / 1000;
+    HANDLE h = CreateThread(0, 0, etw_faden, 0, 0, 0);
+    if (h) CloseHandle(h);
+}
+
+static void etw_stopp(void)
+{
+    if (etwSitzung) ControlTraceW(etwSitzung, 0, etw_eigenschaften(), EVENT_TRACE_CONTROL_STOP);
+    if (etwSpur != INVALID_PROCESSTRACE_HANDLE) CloseTrace(etwSpur);
+}
+
+// waits while Windows' next query is due (at most ACPI_VOR_MS + ACPI_NACH_MS plus a timer tick); checks again after
+// each sleep, which can end a tick early or late
+static void acpi_fenster(void)
+{
+    for (int runde = 0; runde < 3; runde++) {
+        LONG64 t0 = acpiQpc, halb = acpiTakt / 2, f = qpcHz.QuadPart;
+        if (!t0 || halb <= 0) return;
+        LARGE_INTEGER jetzt; QueryPerformanceCounter(&jetzt);
+        LONG64 seit = jetzt.QuadPart - t0;
+        if (seit < 0 || seit > f * ACPI_ALT_MS / 1000) return;
+        LONG64 phase = seit % halb, vor = f * ACPI_VOR_MS / 1000, nach = f * ACPI_NACH_MS / 1000, warten = 0;
+        if (phase > halb - vor) warten = halb - phase + nach; else if (phase < nach) warten = nach - phase;
+        if (warten <= 0) return;
+        Sleep((DWORD)(warten * 1000 / f) + 1);
+    }
+}
+
+// ---------- reading through the BIOS WMI interface ----------
+// The BIOS offers root\WMI PowerSwitchInterface (DSDT \AMW0.WMAA); its methods reach the EC fields through Windows' own
+// EC driver, which serializes them with Windows' queries, so a read there can never collide (ACPI 13). Only READ
+// methods are used: GetHwTemp(1) = EC temperature (0x70), GetFanControl(1) = speeds of both CPU fans (0x35-0x38) in
+// one 32-bit value (L1 low word, L2 high word). Measured 13.11.2026: same values as the direct reads, 7-15 ms a call.
+// Control stays as it is (curve tables in the EC, written directly; the EC keeps regulating if this service stops);
+// the system fan speed (0x28/0x29) is not offered and stays a direct read, once a minute. WMI failing 3 times in a
+// row: direct reads as before.
+#define COBJMACROS
+#include <wbemidl.h>
+#pragma comment(lib, "wbemuuid.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "oleaut32.lib")
+static IWbemServices *wSvc;
+static IWbemClassObject *wCls;
+static BSTR wPath;   // the instance, e.g. PowerSwitchInterface.InstanceName="ACPI\PNP0C14\IP3POWERSWITCH_0"
+static int wmiOk, wmiFehl;
+
+static int wmi_init(void)
+{
+    IWbemLocator *loc = 0; IEnumWbemClassObject *en = 0; IWbemClassObject *o = 0; ULONG n = 0; VARIANT v;
+    HRESULT hr = CoInitializeEx(0, COINIT_MULTITHREADED);
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) return 0;
+    CoInitializeSecurity(0, -1, 0, 0, RPC_C_AUTHN_LEVEL_DEFAULT, RPC_C_IMP_LEVEL_IMPERSONATE, 0, EOAC_NONE, 0);
+    if (FAILED(CoCreateInstance(&CLSID_WbemLocator, 0, CLSCTX_INPROC_SERVER, &IID_IWbemLocator, (void **)&loc))) return 0;
+    BSTR ns = SysAllocString(L"ROOT\\WMI"), cls = SysAllocString(L"PowerSwitchInterface");
+    hr = IWbemLocator_ConnectServer(loc, ns, 0, 0, 0, 0, 0, 0, &wSvc);
+    IWbemLocator_Release(loc);
+    if (SUCCEEDED(hr)) CoSetProxyBlanket((IUnknown *)wSvc, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, 0, RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE, 0, EOAC_NONE);
+    if (SUCCEEDED(hr)) hr = IWbemServices_GetObject(wSvc, cls, 0, 0, &wCls, 0);
+    if (SUCCEEDED(hr)) hr = IWbemServices_CreateInstanceEnum(wSvc, cls, WBEM_FLAG_FORWARD_ONLY, 0, &en);
+    if (SUCCEEDED(hr) && IEnumWbemClassObject_Next(en, 3000, 1, &o, &n) == WBEM_S_NO_ERROR && n == 1) {
+        if (SUCCEEDED(IWbemClassObject_Get(o, L"__RELPATH", 0, &v, 0, 0)) && v.vt == VT_BSTR) wPath = v.bstrVal;
+        IWbemClassObject_Release(o);
+    }
+    if (en) IEnumWbemClassObject_Release(en);
+    SysFreeString(ns); SysFreeString(cls);
+    return wPath != 0;
+}
+
+// one read method with one UInt8 input; returns the named output (or -1)
+static long long wmi_lesen(const wchar_t *method, const wchar_t *in1, int v1, const wchar_t *out)
+{
+    IWbemClassObject *def = 0, *in = 0, *res = 0; long long r = -1; VARIANT v;
+    BSTR m = SysAllocString(method);
+    if (SUCCEEDED(IWbemClassObject_GetMethod(wCls, method, 0, &def, 0)) && def) {
+        IWbemClassObject_SpawnInstance(def, 0, &in);
+        VariantInit(&v); v.vt = VT_UI1; v.bVal = (BYTE)v1;
+        if (in) IWbemClassObject_Put(in, in1, 0, &v, 0);
+    }
+    LARGE_INTEGER t0, t1; QueryPerformanceCounter(&t0);
+    LONG nr = InterlockedIncrement(&wmiNr) % 16;
+    wmiBis[nr] = LLONG_MAX; wmiVon[nr] = t0.QuadPart;   // open span while the call runs
+    HRESULT hr = IWbemServices_ExecMethod(wSvc, wPath, m, 0, 0, in, &res, 0);
+    QueryPerformanceCounter(&t1); wmiBis[nr] = t1.QuadPart;
+    if (SUCCEEDED(hr) && res) {
+        VariantInit(&v);
+        if (SUCCEEDED(IWbemClassObject_Get(res, out, 0, &v, 0, 0)))
+            r = v.vt == VT_I4 ? (long long)(uint32_t)v.lVal : v.vt == VT_UI1 ? v.bVal : v.vt == VT_I2 ? v.iVal : -1;
+        VariantClear(&v);
+        IWbemClassObject_Release(res);
+    }
+    if (in) IWbemClassObject_Release(in);
+    if (def) IWbemClassObject_Release(def);
+    SysFreeString(m);
+    return r;
+}
+
+// a failed call counts; 3 in a row: back to direct reads for the rest of the run
+static void wmi_ergebnis(int ok)
+{
+    if (ok) { wmiFehl = 0; return; }
+    if (++wmiFehl >= 3 && wmiOk) {
+        wmiOk = 0;
+        event2(1, L_("wmi_weg", "BIOS-Schnittstelle (WMI) antwortet nicht mehr: EC-Temperatur und Drehzahlen wieder direkt"));
+    }
+}
+// EC temperature; 0x7FFFFFFF (the BIOS' answer for an unknown sensor), 0 or above 110 °C count as no reading
+// GetHwTemp(1) packs four EC bytes (DSDT): CPUT 0x70 (byte 0, the one used), GPUT 0x71, CPAD 0x72, GPAD 0x73 (all 0 on
+// the EVO-X2, 13.11.2026); only byte 0 counts, so a BIOS that fills the others changes nothing
+static int wmi_ec_temp(void)
+{
+    long long v = wmi_lesen(L"GetHwTemp", L"HwTempType", 1, L"Temp");
+    int t = v < 0 || v == 0x7FFFFFFF ? -1 : (int)(v & 0xFF), ok = t >= 10 && t <= 110;
+    wmi_ergebnis(ok);
+    return ok ? t : -1;
+}
+// speeds of both CPU fans: r[0] = L1, r[1] = L2
+static int wmi_rpm(int r[2])
+{
+    long long v = wmi_lesen(L"GetFanControl", L"FanNumber", 1, L"FanDuty");
+    int ok = v >= 0 && v != 0x7FFFFFFF && (v & 0xFFFF) < 10000 && (v >> 16 & 0xFFFF) < 10000;
+    wmi_ergebnis(ok);
+    if (!ok) return 0;
+    r[0] = (int)(v & 0xFFFF); r[1] = (int)(v >> 16 & 0xFFFF);
+    return 1;
+}
+
+// the window is checked while the mutex is held: another EC program (LibreHardwareMonitor ...) holding it up to 500 ms
+// would otherwise move our transaction into the query; it waits at most the window length, as during its own accesses
+static int ec_lock(void)
+{
+    if (WaitForSingleObject(mEc, 500) > WAIT_ABANDONED) return 0;
+    acpi_fenster();
+    LARGE_INTEGER t; QueryPerformanceCounter(&t);
+    zugriffe[InterlockedIncrement(&zugriffNr) % 64] = t.QuadPart;
+    return 1;
+}
 
 static int ec_read(uint8_t reg)
 {
@@ -471,6 +719,43 @@ static void acpi13_pruefen(void)
     }
     if (ctx) EvtClose(ctx);
     EvtClose(q);
+}
+
+// the queries noted by the ETW thread: off the beat, or an access of ours closer than ACPI_NAH_MS, one line each (at most
+// 20 in 10 minutes, with the time to the millisecond to put them next to an ACPI 13); every 10 minutes a summary
+static void abfragen_melden(int zusammenfassen)
+{
+    static int zahl[5], nah, zeilen; static float minZugriff = 1e9f, maxAbw;
+    LARGE_INTEGER jetzt; QueryPerformanceCounter(&jetzt);
+    FILETIME ftJetzt; GetSystemTimeAsFileTime(&ftJetzt);
+    ULONGLONG uJetzt = ((ULONGLONG)ftJetzt.dwHighDateTime << 32) | ftJetzt.dwLowDateTime;
+    LONG bis = abfrageNr;
+    if (bis - abfrageGelesen > 32) abfrageGelesen = bis - 32;
+    for (; abfrageGelesen < bis; abfrageGelesen++) {
+        Abfrage a = abfragen[abfrageGelesen % 32];
+        zahl[a.art]++;
+        if (a.art == ABFRAGE_EIGEN) continue;
+        if (a.art <= ABFRAGE_HALB && fabsf(a.abwMs) > maxAbw) maxAbw = fabsf(a.abwMs);
+        if (fabsf(a.zugriffMs) < fabsf(minZugriff)) minZugriff = a.zugriffMs;
+        int istNah = fabsf(a.zugriffMs) < ACPI_NAH_MS;
+        nah += istNah;
+        if ((a.art != ABFRAGE_AUSSER && !istNah) || zeilen >= 20) continue;
+        zeilen++;
+        ULONGLONG u = uJetzt - (ULONGLONG)((jetzt.QuadPart - a.t) * 10000000 / qpcHz.QuadPart);
+        FILETIME ft = { (DWORD)u, (DWORD)(u >> 32) }, lt; SYSTEMTIME st;
+        FileTimeToLocalFileTime(&ft, &lt); FileTimeToSystemTime(&lt, &st);
+        if (a.art == ABFRAGE_AUSSER)
+            event(L_("etw_ausser", "EC-Abfrage %02d:%02d:%02d.%03d außer Takt (%+.0f ms), unser nächster Zugriff %+.1f ms"),
+                  st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, a.abwMs, a.zugriffMs);
+        else
+            event(L_("etw_nah", "EC-Abfrage %02d:%02d:%02d.%03d im Takt (%+.1f ms), unser Zugriff nur %+.1f ms daneben"),
+                  st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, a.abwMs, a.zugriffMs);
+    }
+    if (!zusammenfassen) return;
+    event(L_("etw_10min2", "EC-Abfragen 10 min: %d Takt, %d halb, %d außer, %d neu, %d WMI; Zugriff nah %d, min %+.1f ms; Takt ±%.1f ms"),
+          zahl[ABFRAGE_TAKT], zahl[ABFRAGE_HALB], zahl[ABFRAGE_AUSSER], zahl[ABFRAGE_NEU], zahl[ABFRAGE_EIGEN], nah,
+          minZugriff > 1e8f ? 0.0f : minZugriff, maxAbw);
+    memset(zahl, 0, sizeof zahl); nah = zeilen = 0; minZugriff = 1e9f; maxAbw = 0;
 }
 
 static void csv_line(const char *line)
@@ -801,7 +1086,7 @@ static int cmp_float(const void *a, const void *b) { float x = *(const float *)a
 #define PRUEF_SEK 16
 #define MODUS_SEK 47
 // Everything the loop keeps from one second to the next.
-// Schedule within the loop (k = seconds): EC temperature k % 5 == 0; fan speeds k % 30 == 11-16; SSD temperature
+// Schedule within the loop (k = seconds): EC temperature k % 5 == 0; fan speeds k % 30 == 1-4, 6-9, 11; SSD temperature
 // k % 5 == 1; ACPI 13 lookup k % 30 == 25; settings check k % 5 == 0 (file time only); curve check
 // k % 300 == PRUEF_SEK, then one register a second (17-28); power mode k % 300 == MODUS_SEK (or the first second after a
 // quiet time); model saved and shown k % 60 == 0.
@@ -894,13 +1179,34 @@ static void messen(Regler *r, Messung *m)
         ReleaseMutex(mPci);
     }
     // as few EC reads as possible: EC temperature every 5 s (second emergency path and the slow curve anchor; Tctl comes
-    // every second), fan speeds every 30 s for the display, one register a second (seconds 11-16), never during the
-    // quiet time; a value that is not confirmed or impossible (case above 110 °C) keeps the last reading
-    static const uint8_t regs[7] = { REG_TEMP, REG_L1, REG_L1 + 1, REG_L2, REG_L2 + 1, REG_SYS, REG_SYS + 1 };
-    for (int i = 0; i < 7; i++) {
-        if (i == 0 ? k % 5 : k % 30 != 10 + i) continue;
-        if (ec_ruhig()) break;
-        int v = ec_read_sicher(regs[i], r->ec[i]); if (v >= 0 && !(i == 0 && v > 110)) r->ec[i] = v;
+    // every second), fan speeds every 30 s for the display, one register a second, never during the quiet time; a value
+    // that is not confirmed or impossible (case above 110 °C) keeps the last reading. A speed is two bytes read a second
+    // apart: high, low, high again (seconds 1-4, 6-9, 11); the pair counts only if both high bytes match, else a speed
+    // crossing a multiple of 256 in between gives a value off by up to 255 rpm.
+    // With WMI (see wmi_init) the EC temperature and both CPU fans come from there (fans in second 1 of 30), only the
+    // system fan is read directly, once a minute.
+    if (k % 5 == 0 && !ec_ruhig()) {
+        int v = wmiOk ? wmi_ec_temp() : -1;
+        if (v < 0 && !wmiOk) v = ec_read_sicher(REG_TEMP, r->ec[0]);
+        if (v >= 0 && v <= 110) r->ec[0] = v;
+    }
+    if (wmiOk && k % 30 == 1 && !ec_ruhig()) {
+        int rpm[2];
+        if (wmi_rpm(rpm)) { r->ec[1] = rpm[0] >> 8; r->ec[2] = rpm[0] & 0xFF; r->ec[3] = rpm[1] >> 8; r->ec[4] = rpm[1] & 0xFF; }
+    }
+    static const uint8_t sek[9] = { 1, 2, 3, 4, 6, 7, 8, 9, 11 }, regs[3] = { REG_L1, REG_L2, REG_SYS };
+    static int hoch[3] = { -1, -1, -1 }, tief[3] = { -1, -1, -1 };
+    for (int i = 0; i < 9; i++) {
+        if (k % 30 != sek[i] || ec_ruhig()) continue;
+        if (wmiOk && (i < 6 || k % 60 >= 30)) continue;   // CPU fans through WMI; system fan every other cycle
+        int l = i / 3, schritt = i % 3;
+        if (schritt == 0) { hoch[l] = ec_read(regs[l]); tief[l] = -1; }   // a step skipped in the quiet time leaves -1:
+        else if (schritt == 1) tief[l] = hoch[l] < 0 ? -1 : ec_read_sicher((uint8_t)(regs[l] + 1), r->ec[2 + 2 * l]);  // no mixing with bytes
+        else {                                                                 // from 30 s before; low byte confirmed
+            int v = hoch[l] < 0 || tief[l] < 0 ? -1 : ec_read(regs[l]);
+            if (v >= 0 && v == hoch[l]) { r->ec[1 + 2 * l] = v; r->ec[2 + 2 * l] = tief[l]; }
+            hoch[l] = tief[l] = -1;
+        }
     }
     m->Te = r->ec[0];
     // GPU every second while it works, every 2 s while it rests
@@ -1208,6 +1514,10 @@ static int run(void)
     hEc = pio_load(exeDir, L"LpcACPIEC");
     if (!hCpu || !hEc) { event(L_("pawnio", "PawnIO nicht erreichbar (Adminrechte? pawnio\\*.bin neben der exe?)")); return 1; }
     sh = shared_open();
+    etw_start();
+    wmiOk = !ohneEc && wmi_init();
+    event(wmiOk ? L_("wmi_lesen", "EC-Temperatur und CPU-Lüfterdrehzahl über die BIOS-Schnittstelle (WMI) gelesen, Steuerung weiter direkt")
+                : L_("wmi_lesen_aus", "BIOS-Schnittstelle (WMI) nicht verfügbar: alles direkt über den EC gelesen"));
 
     // safety: only control the EC we know (firmware 1.10 = bytes 01 0A at 0x00); a busy EC gets 3 s (ec_read_geduldig),
     // still unreadable or another version: read only. A stop during these reads ends the run before anything is done.
@@ -1216,7 +1526,7 @@ static int run(void)
     int v0 = ec_read_geduldig(REG_VERSION), v1 = ec_read_geduldig(REG_VERSION + 1), modus0 = ec_read_geduldig(REG_MODUS);
     if (WaitForSingleObject(stopEv, 0) == WAIT_OBJECT_0) {
         event(L_("stopp_start", "Stopp während des Starts: nichts verändert"));
-        CloseHandle(hCpu); CloseHandle(hEc); return 0;
+        etw_stopp(); CloseHandle(hCpu); CloseHandle(hEc); return 0;
     }
     if (!nurLesen && (v0 != 1 || v1 != 10)) { event(L_("ec_version", "EC-Version %d.%d unbekannt (erwartet 1.10): nur lesen"), v0, v1); nurLesen = 1; }
     uint8_t orig[12] = { 0 };
@@ -1262,6 +1572,11 @@ static int run(void)
         if (k == 0) { next += 1000; Sleep(1000); continue; }   // first round only primes the counters
         glaetten(r, &m);
         if (k % 30 == 25) acpi13_pruefen();
+        if (k % 30 == 26) abfragen_melden(k % 600 == 26);
+        if (k == 120) {
+            if (acpiZahl > 1) event(L_("etw_an", "Windows-EC-Abfragen sichtbar (Takt %.2f s): EC-Zugriffe weichen ihnen aus"), (double)acpiTakt / qpcHz.QuadPart);
+            else event(L_("etw_aus", "Windows-EC-Abfragen nicht sichtbar: EC-Zugriffe wie bisher"));
+        }
         if (k % 5 == 0) einstellungen_pruefen(r, &iniSeen);
         int lg = lastart(r, &m);
         if (WaitForSingleObject(stopEv, 0) == WAIT_OBJECT_0) break;   // stop requested: no more writes this second
@@ -1299,6 +1614,7 @@ static int run(void)
               ok ? L_("stopp_ok", "zurück") : L_("stopp_fehler", "NICHT vollständig zurück"), fn & F_TAKT ? sicherMhz : r->capNow);
     } else event(L_("stopp_nurlesen", "Stopp (nur lesen)"));
     if (csv) CloseHandle(csv);
+    etw_stopp();
     CloseHandle(hCpu); CloseHandle(hEc);
     return 0;
 }

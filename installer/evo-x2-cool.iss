@@ -2,7 +2,7 @@
 ; Installs both programs to Program Files, the PawnIO driver if it is missing, the controller as a service and
 ; optionally the window in the tray at logon. Uninstall puts the BIOS fan curve back and may keep the learned data.
 
-#define AppVer "0.6.11"
+#define AppVer "0.8.0"
 
 [Setup]
 AppId={{7464B3D3-23BC-4840-B095-EC3434E506D4}
@@ -10,8 +10,8 @@ AppName=EVO-X2-COOL
 AppVersion={#AppVer}
 AppVerName=EVO-X2-COOL {#AppVer}
 AppPublisher=Fabian Storck (inoffiziell / unofficial)
-AppPublisherURL=https://github.com/D3rPapts/evo-x2-cool
-AppSupportURL=https://github.com/D3rPapts/evo-x2-cool/issues
+AppPublisherURL=https://github.com/D3rPapst/evo-x2-cool
+AppSupportURL=https://github.com/D3rPapst/evo-x2-cool/issues
 DefaultDirName={autopf}\EVO-X2-COOL
 DefaultGroupName=EVO-X2-COOL
 DisableProgramGroupPage=yes

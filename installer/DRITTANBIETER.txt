@@ -10,4 +10,4 @@ PawnIO modules AMDFamily17.bin and LpcACPIEC.bin (folder pawnio\)
   Source: https://github.com/namazso/PawnIO.Modules
   Unchanged official release: https://github.com/namazso/PawnIO.Modules/releases/tag/0.2.11
 
-EVO-X2-COOL itself: GPL-3.0-or-later (LICENSE.txt), https://github.com/D3rPapts/evo-x2-cool
+EVO-X2-COOL itself: GPL-3.0-or-later (LICENSE.txt), https://github.com/D3rPapst/evo-x2-cool

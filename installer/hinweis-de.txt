@@ -9,4 +9,4 @@ Bitte vor der Installation lesen:
 - Beim Beenden und Deinstallieren kommt die BIOS-Lüfterkurve zurück. Den Notfall (Lüfter auf voll bei Überhitzung) kann man nicht abschalten.
 - Mit KI-Unterstützung (Claude Code) geschrieben und auf echter Hardware getestet.
 
-Lizenz: GPL-3.0-or-later. Quellcode: https://github.com/D3rPapts/evo-x2-cool
+Lizenz: GPL-3.0-or-later. Quellcode: https://github.com/D3rPapst/evo-x2-cool
